@@ -73,6 +73,10 @@ class Executor {
   private static final Logger logger = Logger.getLogger(Executor.class.getName());
 
   private static final int INCOMPLETE_EXIT_CODE = -1;
+  private static final String SCALAC_EXEC_NAME = "Scalac";
+  private static final String JAVAC_EXEC_NAME = "JavaBuilder";
+  static final String JAVABUILDER_JAR =
+  "external/remote_java_tools/java_tools/JavaBuilder_deploy.jar";
 
   private final WorkerContext workerContext;
   private final OperationContext operationContext;
@@ -435,13 +439,9 @@ class Executor {
     }
 
     boolean usePersistentWorker =
-        !limits.persistentWorkerKey.isEmpty() && !limits.persistentWorkerCommand.isEmpty();
+        !limits.persistentWorkerKey.isEmpty() && (getExecutionName(ImmutableList.copyOf(arguments)).compareTo("JavaBuilder") != 0);
 
     if (usePersistentWorker) {
-      logger.fine(
-          "usePersistentWorker; got persistentWorkerCommand of : "
-              + limits.persistentWorkerCommand);
-
       Tree execTree = workerContext.getQueuedOperation(operationContext.queueEntry).getTree();
 
       WorkFilesContext filesContext =
@@ -453,7 +453,6 @@ class Executor {
               ImmutableList.copyOf(operationContext.command.getOutputDirectoriesList()));
 
       return PersistentExecutor.runOnPersistentWorker(
-          limits.persistentWorkerCommand,
           filesContext,
           operationName,
           ImmutableList.copyOf(arguments),
@@ -586,5 +585,15 @@ class Executor {
     }
 
     return statusCode;
+  }
+
+  private static String getExecutionName(ImmutableList<String> argsList) {
+    boolean isScalac = argsList.size() > 1 && argsList.get(0).endsWith("scalac/scalac");
+    if (isScalac) {
+      return SCALAC_EXEC_NAME;
+    } else if (argsList.contains(JAVABUILDER_JAR)) {
+      return JAVAC_EXEC_NAME;
+    }
+    return "SomeOtherExec";
   }
 }
