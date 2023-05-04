@@ -302,9 +302,9 @@ public class ExecutionProperties {
   public static final String PERSISTENT_WORKER_KEY = "persistentWorkerKey";
 
   /**
-   * @field PERSISTENT_WORKER_COMMAND
+   * @field PERSISTENT_WORKER_MNEMONIC_WHITELIST
    * @brief Command string to start the persistent worker
    * @details See https://github.com/bazelbuild/bazel/issues/10091
    */
-  public static final String PERSISTENT_WORKER_COMMAND = "persistentWorkerCommand";
+  public static final String PERSISTENT_WORKER_MNEMONIC_WHITELIST = "persistentWorkerMnemonicWhitelist";
 }
