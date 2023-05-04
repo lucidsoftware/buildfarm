@@ -438,14 +438,12 @@ class Executor {
       return ExecutionDebugger.performBeforeExecutionDebug(processBuilder, limits, resultBuilder);
     }
 
+    String mnemonic = operationContext.queueEntry.getExecuteEntry().getRequestMetadata().getActionMnemonic();
+
     boolean usePersistentWorker =
-        !limits.persistentWorkerKey.isEmpty() && !limits.persistentWorkerCommand.isEmpty();
+        !limits.persistentWorkerKey.isEmpty() && limits.persistentWorkerMnemonicWhitelist.contains(mnemonic);
 
     if (usePersistentWorker) {
-      logger.fine(
-          "usePersistentWorker; got persistentWorkerCommand of : "
-              + limits.persistentWorkerCommand);
-
       Tree execTree = workerContext.getQueuedOperation(operationContext.queueEntry).getTree();
 
       WorkFilesContext filesContext =
@@ -457,7 +455,7 @@ class Executor {
               ImmutableList.copyOf(operationContext.command.getOutputDirectoriesList()));
 
       return PersistentExecutor.runOnPersistentWorker(
-          limits.persistentWorkerCommand,
+          mnemonic,
           filesContext,
           operationName,
           ImmutableList.copyOf(arguments),
