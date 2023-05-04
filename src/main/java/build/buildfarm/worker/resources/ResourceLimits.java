@@ -16,7 +16,9 @@ package build.buildfarm.worker.resources;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * @class ResourceLimits
@@ -164,9 +166,9 @@ public class ResourceLimits {
   public String persistentWorkerKey = "";
 
   /**
-   * @field persistentWorkerCommand
+   * @field persistentWorkerMnemonicWhitelist
    * @brief Command string to start the persistent worker
    * @details See https://github.com/bazelbuild/bazel/issues/10091
    */
-  public String persistentWorkerCommand = "";
+  public Set<String> persistentWorkerMnemonicWhitelist = new HashSet<String>();
 }

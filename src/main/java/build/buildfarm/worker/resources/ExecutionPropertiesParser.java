@@ -20,7 +20,9 @@ import build.buildfarm.common.ExecutionProperties;
 import build.buildfarm.common.MapUtils;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.BiConsumer;
 import org.json.simple.parser.JSONParser;
 import org.json.simple.parser.ParseException;
@@ -71,8 +73,8 @@ public class ExecutionPropertiesParser {
         ExecutionProperties.PERSISTENT_WORKER_KEY,
         ExecutionPropertiesParser::storePersistentWorkerKey);
     parser.put(
-        ExecutionProperties.PERSISTENT_WORKER_COMMAND,
-        ExecutionPropertiesParser::storePersistentWorkerCommand);
+        ExecutionProperties.PERSISTENT_WORKER_MNEMONIC_WHITELIST,
+        ExecutionPropertiesParser::storePersistentWorkerMnemonicWhitelist);
 
     ResourceLimits limits = new ResourceLimits();
     command
@@ -347,16 +349,20 @@ public class ExecutionPropertiesParser {
   }
 
   /**
-   * @brief Stores persistentWorkerCommand
-   * @details Parses and stores a String.
+   * @brief Stores persistentWorkerMnemonicWhitelist
+   * @details Parses and stores a set.
    * @param limits Current limits to apply changes to.
    * @param property The property to store.
    */
-  private static void storePersistentWorkerCommand(ResourceLimits limits, Property property) {
-    limits.persistentWorkerCommand = property.getValue();
-    ArrayList<String> xs = new ArrayList<>();
-    xs.add("persistentWorkerCommand");
-    describeChange(xs, "persistentWorkerCommand", property.getValue(), property);
+  private static void storePersistentWorkerMnemonicWhitelist(ResourceLimits limits, Property property) {
+    try {
+      JSONParser parser = new JSONParser();
+      ArrayList<String> whitelist = (ArrayList<String>) parser.parse(property.getValue());
+      limits.persistentWorkerMnemonicWhitelist.addAll(whitelist);
+      describeChange(limits.description, "mnemonic whitelist", String.join(",", whitelist), property);
+    } catch (ParseException pe) {
+      limits.description.add("emnemonic whitelist could not be set due to parsing error");
+    }
   }
 
   /**

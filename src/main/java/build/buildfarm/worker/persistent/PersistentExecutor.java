@@ -32,7 +32,7 @@ public class PersistentExecutor {
   // How many workers can exist at once for a given WorkerKey
   // There may be multiple WorkerKeys per mnemonic,
   //  e.g. if builds are run with different tool fingerprints
-  private static final int defaultMaxWorkersPerKey = 6;
+  private static final int defaultMaxWorkersPerKey = 16;
 
   private static final ProtoCoordinator coordinator =
       ProtoCoordinator.ofCommonsPool(getMaxWorkersPerKey());
@@ -66,7 +66,7 @@ public class PersistentExecutor {
    * Coordinator, passing it the required context 5) Passes output to the resultBuilder
    */
   public static Code runOnPersistentWorker(
-      String persistentWorkerInitCmd,
+      String mnemonic,
       WorkFilesContext context,
       String operationName,
       ImmutableList<String> argsList,
@@ -79,20 +79,16 @@ public class PersistentExecutor {
 
     logger.log(Level.FINE, "executeCommandOnPersistentWorker[" + operationName + "]");
 
-    ImmutableList<String> initCmd = parseInitCmd(persistentWorkerInitCmd, argsList);
+    ImmutableList.Builder<String> initCmdBuilder = ImmutableList.builder();
+    initCmdBuilder.add(argsList.get(0));
+    ImmutableList<String> initCmd = initCmdBuilder.build();
 
-    String executionName = getExecutionName(argsList);
-    if (executionName.isEmpty()) {
+    if (mnemonic.isEmpty()) {
       logger.log(Level.SEVERE, "Invalid Argument: " + argsList);
       return Code.INVALID_ARGUMENT;
     }
 
-    ImmutableMap<String, String> env;
-    if (executionName.equals(JAVAC_EXEC_NAME)) {
-      env = ImmutableMap.of();
-    } else {
-      env = envVars;
-    }
+    ImmutableMap<String, String> env = envVars;
 
     int requestArgsIdx = initCmd.size();
     ImmutableList<String> workerExecCmd = initCmd;
@@ -112,7 +108,7 @@ public class PersistentExecutor {
 
     WorkerKey key =
         Keymaker.make(
-            context.opRoot, workerExecCmd, workerInitArgs, env, executionName, workerFiles);
+            context.opRoot, workerExecCmd, workerInitArgs, env, mnemonic, workerFiles);
 
     coordinator.copyToolInputsIntoWorkerToolRoot(key, workerFiles);
 
@@ -192,52 +188,10 @@ public class PersistentExecutor {
             + "\n"
             + responseOut
             + "\n"
-            + executionName
+            + mnemonic
             + " inputs:\n"
             + ImmutableList.copyOf(
                 reqInputs.stream().map(Input::getPath).collect(Collectors.toList())));
     return Code.FAILED_PRECONDITION;
-  }
-
-  private static ImmutableList<String> parseInitCmd(String cmdStr, ImmutableList<String> argsList) {
-    if (!cmdStr.endsWith(PERSISTENT_WORKER_FLAG)) {
-      throw new IllegalArgumentException(
-          "Persistent Worker request must contain "
-              + PERSISTENT_WORKER_FLAG
-              + "\nGot: parseInitCmd["
-              + cmdStr
-              + "]"
-              + "\n"
-              + argsList);
-    }
-
-    String cmd =
-        cmdStr.trim().substring(0, (cmdStr.length() - PERSISTENT_WORKER_FLAG.length()) - 1);
-
-    // Parse init command into list of space-separated words, without the persistent worker flag
-    ImmutableList.Builder<String> initCmdBuilder = ImmutableList.builder();
-    for (String s : argsList) {
-      if (cmd.length() == 0) {
-        break;
-      }
-      cmd = cmd.substring(s.length()).trim();
-      initCmdBuilder.add(s);
-    }
-    ImmutableList<String> initCmd = initCmdBuilder.build();
-    // Check that the persistent worker init command matches the action command
-    if (!initCmd.equals(argsList.subList(0, initCmd.size()))) {
-      throw new IllegalArgumentException("parseInitCmd?![" + initCmd + "]" + "\n" + argsList);
-    }
-    return initCmd;
-  }
-
-  private static String getExecutionName(ImmutableList<String> argsList) {
-    boolean isScalac = argsList.size() > 1 && argsList.get(0).endsWith("scalac/scalac");
-    if (isScalac) {
-      return SCALAC_EXEC_NAME;
-    } else if (argsList.contains(JAVABUILDER_JAR)) {
-      return JAVAC_EXEC_NAME;
-    }
-    return "SomeOtherExec";
   }
 }
