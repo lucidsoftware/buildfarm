@@ -38,6 +38,7 @@ java_library(
         "@buildfarm_maven//:org_apache_commons_commons_pool2",
         "@buildfarm_maven//:org_jspecify_jspecify",
         "@buildfarm_maven//:org_projectlombok_lombok",
+        "@buildfarm_maven//:org_slf4j_jul_to_slf4j",
         "@buildfarm_maven//:org_threeten_threetenbp",
         "@buildfarm_maven//:redis_clients_jedis",
         "@googleapis//google/longrunning:longrunning_java_proto",

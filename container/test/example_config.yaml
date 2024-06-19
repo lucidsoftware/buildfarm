@@ -6,6 +6,9 @@ fileExistenceTests:
   shouldExist: true
 - name: logging.properties
   path: /app/build_buildfarm/src/main/java/build/buildfarm/logging.properties
+  shouldExist: false
+- name: logback.xml
+  path: /app/build_buildfarm/logback.xml
   shouldExist: true
 
 metadataTest:

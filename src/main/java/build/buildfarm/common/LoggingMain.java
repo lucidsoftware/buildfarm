@@ -1,7 +1,12 @@
 package build.buildfarm.common;
 
+import org.slf4j.bridge.SLF4JBridgeHandler;
+
 public abstract class LoggingMain {
   static {
+    // Ship all java.util.logging logs to SLF4J.
+    SLF4JBridgeHandler.removeHandlersForRootLogger();
+    SLF4JBridgeHandler.install();
     System.setProperty("java.util.logging.manager", WaitingLogManager.class.getName());
   }
 
