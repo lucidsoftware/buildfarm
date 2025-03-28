@@ -1,6 +1,7 @@
 package persistent.common;
 
 import java.io.IOException;
+import java.time.Duration;
 import org.apache.commons.pool2.BaseKeyedPooledObjectFactory;
 import org.apache.commons.pool2.impl.GenericKeyedObjectPoolConfig;
 
@@ -44,10 +45,9 @@ public class CommonsPool<K, V> extends CommonsObjPool<K, V> {
     // from JIT optimizations as much as possible.
     config.setLifo(true);
 
-    // Keep a fixed number of workers running per key.
+    // Set max number of workers running per key.
     config.setMaxIdlePerKey(max);
     config.setMaxTotalPerKey(max);
-    config.setMinIdlePerKey(max);
 
     // Don't limit the total number of worker processes, as otherwise the pool might be full of
     // workers for one WorkerKey and can't accommodate a worker for another WorkerKey.
@@ -61,8 +61,11 @@ public class CommonsPool<K, V> extends CommonsObjPool<K, V> {
     config.setTestOnCreate(true);
     config.setTestOnReturn(true);
 
-    // No eviction of idle workers.
-    config.setTimeBetweenEvictionRunsMillis(-1);
+    // Evict idle workers
+    config.setMinIdlePerKey(0);
+    config.setSoftMinEvictableIdleDuration(Duration.ofMinutes(10));
+    config.setTimeBetweenEvictionRuns(Duration.ofMinutes(5));
+
     return config;
   }
 }
