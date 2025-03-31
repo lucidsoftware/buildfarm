@@ -36,6 +36,8 @@ public abstract class CommonsSupervisor<K, V extends Destructable>
   public void destroyObject(K key, PooledObject<V> p) {
     V obj = p.getObject();
 
+    logger.info("Destroying PersistentWorker with key " + key);
+
     var maybeOverriddenLogger = getLogger();
     final var logLevel = Level.FINE;
     if (maybeOverriddenLogger.isLoggable(logLevel)) {
