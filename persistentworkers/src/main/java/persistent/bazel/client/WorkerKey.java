@@ -32,8 +32,8 @@ public final class WorkerKey {
   /**
    * In a remote persistent worker we don't want to eagerly throw away an existing worker if two
    * different clients have two different workers, so we include the tool inputs hash in the
-   * WorkerKey so that different clients with different implementations can each have their
-   * own remote persistent workers.
+   * WorkerKey so that different clients with different implementations can each have their own
+   * remote persistent workers.
    */
   @Getter @ToString.Include private final HashCode workerFilesCombinedHash;
 
@@ -131,6 +131,7 @@ public final class WorkerKey {
   private int calculateHashCode() {
     // Use the string representation of the protocolFormat because the hash of the same enum value
     // can vary across instances.
-    return Objects.hash(cmd, args, env, execRoot, mnemonic, cancellable, sandboxed, workerFilesCombinedHash);
+    return Objects.hash(
+        cmd, args, env, execRoot, mnemonic, cancellable, sandboxed, workerFilesCombinedHash);
   }
 }
