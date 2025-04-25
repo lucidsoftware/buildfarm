@@ -45,7 +45,7 @@ public class PersistentWorker implements Worker<WorkRequest, WorkResponse> {
     Files.createDirectories(execRoot);
 
     final var logLevel = Level.FINE;
-    if (logger.isLoggable(logLevel)){
+    if (logger.isLoggable(logLevel)) {
       Set<Path> workerFiles = ImmutableSet.copyOf(key.getWorkerFilesWithHashes().keySet());
       StringBuilder msg = new StringBuilder();
       msg.append("Starting Worker[");
