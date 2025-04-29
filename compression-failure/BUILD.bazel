@@ -1,0 +1,7 @@
+
+genrule(
+    name = "compression-failure",
+    srcs = ["en.js"],
+    outs = ["out.txt"],
+    cmd = "cp $(SRCS) $@",
+)
