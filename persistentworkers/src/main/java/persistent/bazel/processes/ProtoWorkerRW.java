@@ -42,24 +42,7 @@ public class ProtoWorkerRW {
     writeTo(req, this.writeStream);
   }
 
-  public WorkResponse waitAndRead() throws IOException, InterruptedException {
-    try {
-      waitForInput(processWrapper::isAlive, readStream);
-    } catch (IOException e) {
-      String stdErrMsg = processWrapper.getErrorString();
-      String stdOut = "";
-      try {
-        if (processWrapper.isAlive() && readStream.available() > 0) {
-          stdOut = IOUtils.toString(readStream, StandardCharsets.UTF_8);
-        } else {
-          stdOut = "no stream available";
-        }
-      } catch (IOException e2) {
-        stdOut = "Exception trying to read stdout: " + e2;
-      }
-      throw new IOException(
-          "IOException on waitForInput; stdErr: " + stdErrMsg + "\nStdout: " + stdOut, e);
-    }
+  public WorkResponse waitAndRead() throws IOException {
     return readResponse(readStream);
   }
 
@@ -78,25 +61,5 @@ public class ProtoWorkerRW {
 
   public static WorkRequest readRequest(InputStream inputStream) throws IOException {
     return WorkRequest.parseDelimitedFrom(inputStream);
-  }
-
-  public static void waitForInput(Supplier<Boolean> liveCheck, InputStream inputStream)
-      throws IOException, InterruptedException {
-    String workerDeathMsg = "Worker process for died while waiting for response";
-    // TODO can we do better than spinning? i.e. condition variable?
-    while (inputAvailable(inputStream, workerDeathMsg) == 0) {
-      Thread.sleep(10);
-      if (!liveCheck.get()) {
-        throw new IOException(workerDeathMsg + "\n");
-      }
-    }
-  }
-
-  private static int inputAvailable(InputStream inputStream, String errorMsg) throws IOException {
-    try {
-      return inputStream.available();
-    } catch (IOException e) {
-      throw new IOException(errorMsg, e);
-    }
   }
 }
