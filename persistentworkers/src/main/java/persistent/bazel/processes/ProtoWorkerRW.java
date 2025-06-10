@@ -85,7 +85,18 @@ public class ProtoWorkerRW {
     String workerDeathMsg = "Worker process for died while waiting for response";
     // TODO can we do better than spinning? i.e. condition variable?
     while (inputAvailable(inputStream, workerDeathMsg) == 0) {
-      Thread.sleep(10);
+      try {
+        Thread.sleep(10);
+      } catch (InterruptedException e) {
+        if (inputAvailable(inputStream, workerDeathMsg) > 0) {
+          // we were interrupted because the task is complete and we're still spinning: if there's a work response
+          // available, read it and ignore the interrupt
+          Thread.currentThread().interrupt();
+          return;
+        } else {
+          throw e;
+        }
+      }
       if (!liveCheck.get()) {
         throw new IOException(workerDeathMsg + "\n");
       }
