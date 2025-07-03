@@ -47,7 +47,8 @@ public class ProtoCoordinatorTest {
         ImmutableList.of("workerInitArgs"),
         ImmutableMap.of(),
         "executionName",
-        workerFiles);
+        workerFiles,
+        null);
   }
 
   private Path rootDir = null;
