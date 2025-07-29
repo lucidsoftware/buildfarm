@@ -168,14 +168,7 @@ public class PersistentExecutor {
     }
 
     BasicWorkerKey basicKey =
-        Keymaker.make(
-            context.opRoot,
-            workRootsDir,
-            workerExecCmd,
-            workerInitArgs,
-            env,
-            executionName,
-            workerFiles);
+        Keymaker.makeBasicKey(workerExecCmd, workerInitArgs, env, executionName);
 
     if (execOwnerPool != null) {
       Optional<PersistentWorkerAwareExecOwnerPool.Lease> newExecOwnerLease =
@@ -201,7 +194,9 @@ public class PersistentExecutor {
     ExecutionWrapperUtils.applyExecutionWrappers(
         wrapperArguments, executionPolicies, claim, platformProperties, false);
 
-    WorkerKey key = new WorkerKey(basicKey, claim.getOwner(), wrapperArguments.build());
+    WorkerKey key =
+        Keymaker.makeKey(
+            basicKey, claim.getOwner(), wrapperArguments.build(), workRootsDir, workerFiles);
 
     coordinator.copyToolInputsIntoWorkerToolRoot(key, workerFiles, key.getOwner());
 
