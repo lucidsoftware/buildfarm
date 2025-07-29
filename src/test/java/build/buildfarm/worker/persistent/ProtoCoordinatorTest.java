@@ -39,18 +39,17 @@ import persistent.bazel.client.WorkerKey;
 
 @RunWith(JUnit4.class)
 public class ProtoCoordinatorTest {
-  private WorkerKey makeWorkerKey(
-      WorkFilesContext ctx, WorkerInputs workerFiles, Path workRootsDir) {
-    return new WorkerKey(
-        Keymaker.make(
-            ctx.opRoot,
-            workRootsDir,
+  private WorkerKey makeWorkerKey(WorkerInputs workerFiles, Path workRootsDir) {
+    return Keymaker.makeKey(
+        Keymaker.makeBasicKey(
             ImmutableList.of("workerExecCmd"),
             ImmutableList.of("workerInitArgs"),
             ImmutableMap.of(),
-            "executionName",
-            workerFiles),
-        null);
+            "executionName"),
+        null,
+        ImmutableList.of(),
+        workRootsDir,
+        workerFiles);
   }
 
   private Path rootDir = null;
@@ -102,7 +101,7 @@ public class ProtoCoordinatorTest {
       Files.createFile(file);
     }
 
-    WorkerKey key = makeWorkerKey(ctx, workerFiles, fsRoot.resolve("workRootsDir"));
+    WorkerKey key = makeWorkerKey(workerFiles, fsRoot.resolve("workRootsDir"));
 
     Path workRoot = key.getExecRoot();
     Path toolsRoot = key.getToolRoot();

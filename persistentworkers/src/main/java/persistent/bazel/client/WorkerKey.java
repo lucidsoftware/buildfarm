@@ -36,23 +36,50 @@ public class WorkerKey {
   /** Execution wrapper arguments to be prepended to the worker command. */
   @Getter private final ImmutableList<String> wrapperArguments;
 
+  @Getter @ToString.Include private final Path execRoot;
+
+  /**
+   * In a remote persistent worker we don't want to eagerly throw away an existing worker if two
+   * different clients have two different workers, so we include the tool inputs hash in the
+   * WorkerKey so that different clients with different implementations can each have their own
+   * remote persistent workers.
+   */
+  @Getter @ToString.Include private final HashCode workerFilesCombinedHash;
+
+  @Getter private final Path toolRoot;
+
+  /**
+   * Worker files with the corresponding hash code.
+   *
+   * <p>These paths should be stable, so use relative paths (unless it's a universal absolute path
+   * like /tmp/my_tools/...)
+   */
+  @Getter private final SortedMap<Path, HashCode> workerFilesWithHashes;
+
   /**
    * Cached value for the hash of this key, because the value is expensive to calculate
    * (ImmutableMap and ImmutableList do not cache their hashcodes).
    */
   private final int hash;
 
-  public WorkerKey(BasicWorkerKey basicWorkerKey, @Nullable UserPrincipal owner) {
-    this(basicWorkerKey, owner, ImmutableList.of());
-  }
-
   public WorkerKey(
       BasicWorkerKey basicWorkerKey,
       @Nullable UserPrincipal owner,
-      ImmutableList<String> wrapperArguments) {
+      ImmutableList<String> wrapperArguments,
+      Path execRoot,
+      HashCode workerFilesCombinedHash,
+      SortedMap<Path, HashCode> workerFilesWithHashes) {
+    // Part of hash
     this.basicWorkerKey = Preconditions.checkNotNull(basicWorkerKey);
     this.owner = owner;
     this.wrapperArguments = Preconditions.checkNotNull(wrapperArguments);
+    this.execRoot = Preconditions.checkNotNull(execRoot);
+    this.workerFilesCombinedHash = Preconditions.checkNotNull(workerFilesCombinedHash);
+
+    // Not part of hash
+    this.workerFilesWithHashes = Preconditions.checkNotNull(workerFilesWithHashes);
+    this.toolRoot = execRoot.resolve(workerFilesCombinedHash.toString());
+
     this.hash = calculateHashCode();
   }
 
@@ -77,7 +104,15 @@ public class WorkerKey {
       return false;
     }
 
-    return wrapperArguments.equals(otherWorkerKey.wrapperArguments);
+    if (!wrapperArguments.equals(otherWorkerKey.wrapperArguments)) {
+      return false;
+    }
+
+    if (!execRoot.equals(otherWorkerKey.execRoot)) {
+      return false;
+    }
+
+    return workerFilesCombinedHash.equals(otherWorkerKey.workerFilesCombinedHash);
   }
 
   public ImmutableList<String> getArgs() {
@@ -92,24 +127,8 @@ public class WorkerKey {
     return basicWorkerKey.getEnv();
   }
 
-  public Path getExecRoot() {
-    return basicWorkerKey.getExecRoot();
-  }
-
   public String getMnemonic() {
     return basicWorkerKey.getMnemonic();
-  }
-
-  public HashCode getWorkerFilesCombinedHash() {
-    return basicWorkerKey.getWorkerFilesCombinedHash();
-  }
-
-  public SortedMap<Path, HashCode> getWorkerFilesWithHashes() {
-    return basicWorkerKey.getWorkerFilesWithHashes();
-  }
-
-  public Path getToolRoot() {
-    return basicWorkerKey.getToolRoot();
   }
 
   @Override
@@ -126,6 +145,6 @@ public class WorkerKey {
   }
 
   private int calculateHashCode() {
-    return Objects.hash(basicWorkerKey, owner, wrapperArguments);
+    return Objects.hash(basicWorkerKey, owner, wrapperArguments, execRoot, workerFilesCombinedHash);
   }
 }
