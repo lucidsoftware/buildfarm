@@ -79,13 +79,12 @@ public class PersistentWorkerAwareExecOwnerPool implements LocalResource {
         takenForPersistentWorkers.remove(ownerName);
       }
 
-      ownerNames.add(ownerName);
-
       if (ownerName == null) {
         pool.addAll(ownerNames);
 
         return Optional.empty();
       }
+      ownerNames.add(ownerName);
     }
 
     return Optional.of(new Lease(pool, stage, ownerNames));
