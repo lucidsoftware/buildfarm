@@ -15,12 +15,13 @@ public class WorkerUtils {
             initCmd,
             ImmutableList.of(),
             ImmutableMap.of(),
-            execDir,
             "TestOp-Adder",
-            HashCode.fromInt(0),
-            ImmutableSortedMap.of(),
             false,
             false),
-        null);
+        null,
+        ImmutableList.of(),
+        execDir,
+        HashCode.fromInt(0),
+        ImmutableSortedMap.of());
   }
 }
