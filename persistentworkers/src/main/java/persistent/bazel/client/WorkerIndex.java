@@ -1,11 +1,10 @@
 package persistent.bazel.client;
 
 import java.nio.file.attribute.UserPrincipal;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import javax.annotation.Nullable;
 
 /**
@@ -23,7 +22,7 @@ public class WorkerIndex {
   private final Map<BasicWorkerKey, Set<PersistentWorker>> workerIndex;
 
   public WorkerIndex() {
-    workerIndex = new HashMap<>();
+    workerIndex = new ConcurrentHashMap<>();
   }
 
   public @Nullable UserPrincipal getOwnerForIdleWorker(BasicWorkerKey workerKey) {
@@ -42,7 +41,7 @@ public class WorkerIndex {
 
   public void registerWorker(PersistentWorker worker) {
     workerIndex
-        .computeIfAbsent(worker.getKey().getBasicWorkerKey(), key -> new HashSet<>())
+        .computeIfAbsent(worker.getKey().getBasicWorkerKey(), key -> ConcurrentHashMap.newKeySet())
         .add(worker);
   }
 
