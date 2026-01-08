@@ -20,7 +20,6 @@ import static com.google.common.truth.Truth.assertThat;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
@@ -35,7 +34,6 @@ import build.bazel.remote.execution.v2.Platform.Property;
 import build.buildfarm.backplane.Backplane;
 import build.buildfarm.cas.ContentAddressableStorage;
 import build.buildfarm.common.Claim;
-import build.buildfarm.common.Dispenser;
 import build.buildfarm.common.InputStreamFactory;
 import build.buildfarm.common.config.BuildfarmConfigs;
 import build.buildfarm.common.config.ExecutionPolicy;
@@ -43,11 +41,12 @@ import build.buildfarm.common.config.Queue;
 import build.buildfarm.instance.Instance;
 import build.buildfarm.v1test.Digest;
 import build.buildfarm.v1test.QueueEntry;
-import build.buildfarm.worker.ExecFileSystem;
 import build.buildfarm.worker.MatchListener;
 import build.buildfarm.worker.WorkerContext;
+import build.buildfarm.worker.filesystem.ExecFileSystem;
+import build.buildfarm.worker.persistent.PersistentExecutor;
+import build.buildfarm.worker.persistent.PersistentWorkerAwareExecOwnerPool;
 import build.buildfarm.worker.resources.LocalResourceSet;
-import build.buildfarm.worker.resources.LocalResourceSet.PoolResource;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.common.jimfs.Jimfs;
@@ -55,6 +54,7 @@ import com.google.protobuf.Duration;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import org.junit.Before;
 import org.junit.Test;
@@ -143,9 +143,16 @@ public class ShardWorkerContextTest {
     when(backplane.dispatchOperation(any(List.class), any(LocalResourceSet.class)))
         .thenReturn(queueEntry)
         .thenReturn(null); // provide a match completion in failure case
+    ContentAddressableStorage storage = mock(ContentAddressableStorage.class);
+    when(execFileSystem.getStorage()).thenReturn(storage);
+
     MatchListener listener = mock(MatchListener.class);
     when(listener.onWaitStart()).thenReturn(true);
     context.match(listener);
+
+    // one readonly check for each iteration
+    verify(storage, times(2)).isReadOnly();
+    verifyNoMoreInteractions(storage);
     verify(listener, times(1)).onEntry(eq(queueEntry), any(Claim.class));
     verify(listener, times(1)).onWaitStart();
   }
@@ -163,9 +170,18 @@ public class ShardWorkerContextTest {
     when(backplane.dispatchOperation(any(List.class), any(LocalResourceSet.class)))
         .thenReturn(queueEntry)
         .thenReturn(null); // provide a match completion in failure case
+    ContentAddressableStorage storage = mock(ContentAddressableStorage.class);
+    when(execFileSystem.getStorage()).thenReturn(storage);
+
     MatchListener listener = mock(MatchListener.class);
     context.match(listener);
-    verify(listener, never()).onEntry(eq(queueEntry), any(Claim.class));
+
+    // one readonly check for each iteration
+    verify(storage, times(2)).isReadOnly();
+    verifyNoMoreInteractions(storage);
+    verify(listener, times(1)).onWaitStart();
+    verify(listener, times(1)).onEntry(null, null);
+    verifyNoMoreInteractions(listener);
   }
 
   @Test
@@ -182,9 +198,15 @@ public class ShardWorkerContextTest {
     when(backplane.dispatchOperation(any(List.class), any(LocalResourceSet.class)))
         .thenReturn(queueEntry)
         .thenReturn(null); // provide a match completion in failure case
+    ContentAddressableStorage storage = mock(ContentAddressableStorage.class);
+    when(execFileSystem.getStorage()).thenReturn(storage);
     MatchListener listener = mock(MatchListener.class);
     when(listener.onWaitStart()).thenReturn(true);
     context.match(listener);
+
+    // one readonly check for each iteration
+    verify(storage, times(2)).isReadOnly();
+    verifyNoMoreInteractions(storage);
     verify(listener, times(1)).onEntry(eq(queueEntry), any(Claim.class));
     verify(listener, times(1)).onWaitStart();
   }
@@ -212,9 +234,12 @@ public class ShardWorkerContextTest {
   @Test
   public void resourceExhaustedIgnoresEntryWithExecOwner() throws Exception {
     LocalResourceSet resourceSet = new LocalResourceSet();
-    resourceSet.poolResources.put(
-        ShardWorkerContext.EXEC_OWNER_RESOURCE_NAME,
-        new PoolResource(new Dispenser<>("exec-user-name"), REPORT_RESULT_STAGE));
+    resourceSet.resources.put(
+        LocalResourceSet.EXEC_OWNER_RESOURCE_NAME,
+        new PersistentWorkerAwareExecOwnerPool(
+            PersistentExecutor.workerIndex,
+            Collections.singleton("exec-user-name"),
+            REPORT_RESULT_STAGE));
     WorkerContext context = createTestContext(/* policies= */ ImmutableList.of(), resourceSet);
 
     Platform platform =
@@ -225,10 +250,16 @@ public class ShardWorkerContextTest {
     when(backplane.dispatchOperation(any(List.class), any(LocalResourceSet.class)))
         .thenReturn(queueEntry)
         .thenReturn(null); // provide a match completion in failure case
-    MatchListener listener = mock(MatchListener.class);
+    ContentAddressableStorage storage = mock(ContentAddressableStorage.class);
+    when(execFileSystem.getStorage()).thenReturn(storage);
 
+    MatchListener listener = mock(MatchListener.class);
     when(listener.onWaitStart()).thenReturn(true);
     context.match(listener);
+
+    // one readonly check for each iteration, 3 here
+    verify(storage, times(3)).isReadOnly();
+    verifyNoMoreInteractions(storage);
     verify(listener, times(1)).onEntry(null, null);
     // twice because there were 2 dequeues to complete queueEntry
     verify(listener, times(2)).onWaitStart();

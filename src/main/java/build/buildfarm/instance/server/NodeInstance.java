@@ -83,6 +83,7 @@ import build.buildfarm.common.resources.DownloadBlobRequest;
 import build.buildfarm.common.resources.ResourceParser;
 import build.buildfarm.instance.Instance;
 import build.buildfarm.instance.InstanceBase;
+import build.buildfarm.v1test.BatchWorkerProfilesResponse;
 import build.buildfarm.v1test.Digest;
 import build.buildfarm.v1test.GetClientStartTimeRequest;
 import build.buildfarm.v1test.GetClientStartTimeResult;
@@ -90,7 +91,6 @@ import build.buildfarm.v1test.PrepareWorkerForGracefulShutDownRequestResults;
 import build.buildfarm.v1test.QueuedOperation;
 import build.buildfarm.v1test.QueuedOperationMetadata;
 import build.buildfarm.v1test.Tree;
-import build.buildfarm.v1test.WorkerListMessage;
 import build.buildfarm.v1test.WorkerProfileMessage;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
@@ -413,6 +413,11 @@ public abstract class NodeInstance extends InstanceBase {
       RequestMetadata requestMetadata)
       throws IOException {
     return contentAddressableStorage.newInput(compressor, digest, offset);
+  }
+
+  @Override
+  public boolean isReadOnly() {
+    return contentAddressableStorage.isReadOnly();
   }
 
   @Override
@@ -1729,6 +1734,7 @@ public abstract class NodeInstance extends InstanceBase {
             ActionCacheUpdateCapabilities.newBuilder().setUpdateEnabled(true))
         .setMaxBatchTotalSizeBytes(Size.mbToBytes(4))
         .setSymlinkAbsolutePathStrategy(SymlinkAbsolutePathStrategy.Value.DISALLOWED)
+        .setMaxCasBlobSizeBytes(configs.getMaxEntrySizeBytes())
 
         // Compression support
         .addSupportedCompressors(Compressor.Value.IDENTITY)
@@ -1769,20 +1775,21 @@ public abstract class NodeInstance extends InstanceBase {
   }
 
   @Override
-  public WorkerProfileMessage getWorkerProfile() {
+  public ListenableFuture<WorkerProfileMessage> getWorkerProfile(String name) {
     throw new UnsupportedOperationException(
         "NodeInstance doesn't support getWorkerProfile() method.");
   }
 
   @Override
-  public WorkerListMessage getWorkerList() {
-    throw new UnsupportedOperationException("NodeInstance doesn't support getWorkerList() method.");
+  public ListenableFuture<BatchWorkerProfilesResponse> batchWorkerProfiles(Iterable<String> names) {
+    throw new UnsupportedOperationException(
+        "NodeInstance doesn't support batchWorkerProfiles() method.");
   }
 
   @Override
   public PrepareWorkerForGracefulShutDownRequestResults shutDownWorkerGracefully() {
     throw new UnsupportedOperationException(
-        "NodeInstance doesn't support drainWorkerPipeline() method.");
+        "NodeInstance doesn't support shutDownWorkerGracefully() method.");
   }
 
   @Override

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package build.buildfarm.worker;
+package build.buildfarm.worker.filesystem;
 
 import build.bazel.remote.execution.v2.Action;
 import build.bazel.remote.execution.v2.Command;
@@ -21,6 +21,8 @@ import build.bazel.remote.execution.v2.Directory;
 import build.buildfarm.cas.ContentAddressableStorage;
 import build.buildfarm.common.InputStreamFactory;
 import build.buildfarm.v1test.Digest;
+import build.buildfarm.v1test.WorkerExecutedMetadata;
+import com.google.common.util.concurrent.ListenableFuture;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
@@ -33,10 +35,10 @@ import java.util.function.Consumer;
 import javax.annotation.Nullable;
 
 public interface ExecFileSystem extends InputStreamFactory {
-  void start(Consumer<List<Digest>> onDigests, boolean skipLoad)
+  ListenableFuture<Void> start(Consumer<List<Digest>> onDigests, boolean skipLoad, boolean writable)
       throws IOException, InterruptedException;
 
-  void stop() throws InterruptedException;
+  void stop() throws IOException, InterruptedException;
 
   Path root();
 
@@ -50,7 +52,8 @@ public interface ExecFileSystem extends InputStreamFactory {
       DigestFunction.Value digestFunction,
       Action action,
       Command command,
-      @Nullable UserPrincipal owner)
+      @Nullable UserPrincipal owner,
+      WorkerExecutedMetadata.Builder workerExecutedMetadata)
       throws IOException, InterruptedException;
 
   void destroyExecDir(Path execDir) throws IOException, InterruptedException;
