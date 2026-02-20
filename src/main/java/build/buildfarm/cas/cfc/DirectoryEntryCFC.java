@@ -234,7 +234,14 @@ public class DirectoryEntryCFC extends CASFileCache {
           // ... or we just compute early and charge then, though we run the risk of evicting useful
           // blobs for this fetch
           try {
-            checkState(charge(key, blobSizeInBytes, new AtomicBoolean()), true);
+            boolean charged = charge(key, blobSizeInBytes, new AtomicBoolean());
+            if (!charged) {
+              // charge() returned false, meaning it found the key already in storage and
+              // already called referenceIfExists internally (incrementing the refcount).
+              // Just return success — do not call referenceIfExists again or we double-increment.
+              fetchers.invalidate(digest);
+              return immediateFuture(result);
+            }
           } catch (IOException e) {
             return immediateFailedFuture(e);
           }
