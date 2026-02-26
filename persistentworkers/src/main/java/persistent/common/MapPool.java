@@ -39,4 +39,9 @@ public class MapPool<K, V> implements ObjectPool<K, V> {
   public void release(K key, V obj) {
     map.put(key, obj);
   }
+
+  @Override
+  public void invalidate(K key, V obj) {
+    map.remove(key);
+  }
 }
