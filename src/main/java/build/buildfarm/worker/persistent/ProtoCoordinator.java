@@ -185,12 +185,14 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       WorkResponse response, PersistentWorker worker, RequestCtx request) throws IOException {
     PendingRequest pendingRequest = pendingReqs.remove(request);
 
-    if (pendingRequest != null) {
-      pendingRequest.task.cancel();
+    if (response == null) {
+      // Don't cancel the timeout here — it serves as a safety net to invalidate the worker
+      // if Coordinator.runRequest() also fails to clean up.
+      throw new RuntimeException("postWorkCleanup: WorkResponse was null!");
     }
 
-    if (response == null) {
-      throw new RuntimeException("postWorkCleanup: WorkResponse was null!");
+    if (pendingRequest != null) {
+      pendingRequest.task.cancel();
     }
 
     if (response.getExitCode() == 0) {
