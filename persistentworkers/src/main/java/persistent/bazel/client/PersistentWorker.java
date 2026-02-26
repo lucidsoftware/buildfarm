@@ -87,6 +87,9 @@ public class PersistentWorker implements Worker<WorkRequest, WorkResponse> {
       response = workerRW.waitAndRead();
 
       logIfBadResponse(response);
+    } catch (InterruptedException e) {
+      logger.severe("Interrupted during doWork: " + e.getMessage());
+      Thread.currentThread().interrupt();
     } catch (IOException e) {
       e.printStackTrace();
       logger.severe("IO Failing with : " + e.getMessage());
