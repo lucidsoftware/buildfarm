@@ -15,6 +15,7 @@
 package persistent.common;
 
 import java.io.IOException;
+import java.util.NoSuchElementException;
 import org.apache.commons.pool2.BaseKeyedPooledObjectFactory;
 import org.apache.commons.pool2.impl.GenericKeyedObjectPoolConfig;
 
@@ -35,6 +36,9 @@ public class CommonsPool<K, V> extends CommonsObjPool<K, V> {
       return super.borrowObject(key);
     } catch (IOException | InterruptedException checkedException) {
       throw checkedException;
+    } catch (NoSuchElementException e) {
+      // Thrown when maxWait expires and no worker is available
+      throw new IOException("Timed out waiting for a persistent worker from the pool", e);
     } catch (Throwable t) {
       throw new RuntimeException("unexpected@<borrowObject>", t);
     }
@@ -67,8 +71,11 @@ public class CommonsPool<K, V> extends CommonsObjPool<K, V> {
     // workers for one WorkerKey and can't accommodate a worker for another WorkerKey.
     config.setMaxTotal(-1);
 
-    // Wait for a worker to become ready when a thread needs one.
+    // Wait for a worker to become ready when a thread needs one, but not forever.
+    // Without a maxWait, threads block indefinitely in obtain() while holding an execution
+    // slot, which can lead to deadlock when there are more execution slots than workers.
     config.setBlockWhenExhausted(true);
+    config.setMaxWaitMillis(30_000);
 
     // Always test the liveliness of worker processes.
     config.setTestOnBorrow(true);
