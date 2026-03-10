@@ -290,6 +290,8 @@ class Executor {
       workingDirectory = workingDirectory.resolve(command.getWorkingDirectory());
     }
 
+    boolean usePersistentWorker = shouldRunOnPersistentWorker(limits);
+
     // similar to the policy selection here
     Map<String, Interpolator> interpolations =
         createInterpolations(
@@ -310,7 +312,8 @@ class Executor {
             executionContext.claim.owner(),
             arguments,
             executionContext.command,
-            workingDirectory)) {
+            workingDirectory,
+            usePersistentWorker)) {
       // Windows requires that relative command programs are absolutized
       Iterator<String> argumentItr = command.getArgumentsList().iterator();
       boolean absolutizeExe =

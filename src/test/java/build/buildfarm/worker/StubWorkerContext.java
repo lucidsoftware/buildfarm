@@ -205,7 +205,8 @@ class StubWorkerContext implements WorkerContext {
       UserPrincipal owner,
       ImmutableList.Builder<String> arguments,
       Command command,
-      Path workingDirectory) {
+      Path workingDirectory,
+      boolean skipAsNobody) {
     throw new UnsupportedOperationException();
   }
 
