@@ -3,7 +3,7 @@ package persistent.common;
 import java.util.HashMap;
 import java.util.function.Function;
 
-public class MapPool<K, V> implements ObjectPool<K, V> {
+public class MapPool<K, V extends Destructable> implements ObjectPool<K, V> {
   private final HashMap<K, V> map;
 
   private final Function<K, V> objFactory;
@@ -24,5 +24,11 @@ public class MapPool<K, V> implements ObjectPool<K, V> {
   @Override
   public void release(K key, V obj) {
     map.put(key, obj);
+  }
+
+  @Override
+  public void invalidate(K key, V obj) {
+    map.remove(key);
+    obj.destroy();
   }
 }
