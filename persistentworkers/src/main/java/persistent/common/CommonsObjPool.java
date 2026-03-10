@@ -33,4 +33,8 @@ public abstract class CommonsObjPool<K, V> extends GenericKeyedObjectPool<K, V>
   public void release(K key, V obj) {
     this.returnObject(key, obj);
   }
+
+  public void invalidate(K key, V obj) throws Exception {
+    this.invalidateObject(key, obj);
+  }
 }
