@@ -15,6 +15,7 @@
 package persistent.common;
 
 import java.io.IOException;
+import java.util.NoSuchElementException;
 import org.apache.commons.pool2.BaseKeyedPooledObjectFactory;
 import org.apache.commons.pool2.impl.GenericKeyedObjectPoolConfig;
 
@@ -35,6 +36,9 @@ public class CommonsPool<K, V> extends CommonsObjPool<K, V> {
       return super.borrowObject(key);
     } catch (IOException | InterruptedException checkedException) {
       throw checkedException;
+    } catch (NoSuchElementException e) {
+      // Thrown when maxWait expires and no worker is available
+      throw new IOException("Timed out waiting for a persistent worker from the pool", e);
     } catch (Throwable t) {
       throw new RuntimeException("unexpected@<borrowObject>", t);
     }

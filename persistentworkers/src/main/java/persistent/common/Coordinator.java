@@ -45,13 +45,24 @@ public abstract class Coordinator<
 
   public CO runRequest(K workerKey, CI reqWithCtx) throws Exception {
     W worker = workerPool.obtain(workerKey);
+    try {
+      I request = preWorkInit(workerKey, reqWithCtx, worker);
+      O workResponse = worker.doWork(request);
+      CO responseAfterCleanup = postWorkCleanup(workResponse, worker, reqWithCtx);
 
-    I request = preWorkInit(workerKey, reqWithCtx, worker);
-    O workResponse = worker.doWork(request);
-    CO responseAfterCLeanup = postWorkCleanup(workResponse, worker, reqWithCtx);
-
-    workerPool.release(workerKey, worker);
-    return responseAfterCLeanup;
+      workerPool.release(workerKey, worker);
+      return responseAfterCleanup;
+    } catch (Exception e) {
+      try {
+        workerPool.invalidate(workerKey, worker);
+      } catch (Exception invalidateEx) {
+        // Worker may have already been invalidated by timeout handler.
+        // Ensure the process is killed as a fallback.
+        e.addSuppressed(invalidateEx);
+        worker.destroy();
+      }
+      throw e;
+    }
   }
 
   public abstract I preWorkInit(K workerKey, CI request, W worker) throws IOException;
