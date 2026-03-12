@@ -310,7 +310,8 @@ class Executor {
             executionContext.claim.owner(),
             arguments,
             executionContext.command,
-            workingDirectory)) {
+            workingDirectory,
+            shouldRunOnPersistentWorker(limits))) {
       // Windows requires that relative command programs are absolutized
       Iterator<String> argumentItr = command.getArgumentsList().iterator();
       boolean absolutizeExe =
