@@ -25,7 +25,7 @@ import build.buildfarm.common.InputStreamFactory;
 import build.buildfarm.instance.Instance;
 import build.buildfarm.instance.stub.StubInstance;
 import build.buildfarm.v1test.Digest;
-import build.buildfarm.worker.filesystem.FuseCAS;
+import build.buildfarm.worker.FuseCAS;
 import com.google.protobuf.ByteString;
 import io.grpc.ManagedChannel;
 import java.io.IOException;
@@ -88,7 +88,7 @@ class Mount {
   }
 
   public static void main(String[] args) throws Exception {
-    if (args.length != 5) {
+    if (args.length != 6) {
       System.err.println("Usage: bf-mount <endpoint> <instance-name> <root> <digest> <name>");
       System.err.println("\nMount an REAPI directory specified by 'digest' at 'name' under 'root'");
       System.exit(1);

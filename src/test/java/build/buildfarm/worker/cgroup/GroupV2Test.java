@@ -31,6 +31,7 @@ import org.junit.runners.JUnit4;
 /** These test CGroups v2 behavior exclusively. */
 @RunWith(JUnit4.class)
 public class GroupV2Test {
+
   @Before
   public void setup() {
     Group.setVersionForTesting(CGroupVersion.CGROUPS_V2);

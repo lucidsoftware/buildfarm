@@ -37,7 +37,6 @@ import build.buildfarm.server.services.FetchService;
 import build.buildfarm.server.services.OperationQueueService;
 import build.buildfarm.server.services.OperationsService;
 import build.buildfarm.server.services.PublishBuildEventService;
-import build.buildfarm.server.services.WorkerProfileService;
 import io.grpc.ServerBuilder;
 import io.grpc.ServerInterceptor;
 import io.grpc.health.v1.HealthCheckResponse.ServingStatus;
@@ -162,7 +161,6 @@ public class BuildFarmServer extends LoggingMain {
         .addService(new FetchService(instance))
         .addService(ProtoReflectionService.newInstance())
         .addService(new PublishBuildEventService())
-        .addService(new WorkerProfileService(instance))
         .intercept(TransmitStatusRuntimeExceptionInterceptor.instance())
         .intercept(headersInterceptor);
     GrpcMetrics.handleGrpcMetricIntercepts(serverBuilder, configs.getServer().getGrpcMetrics());

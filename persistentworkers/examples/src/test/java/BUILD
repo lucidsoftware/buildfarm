@@ -11,7 +11,7 @@ java_test(
         "//persistentworkers/src/main/java/persistent/common:persistent-common",
         "//persistentworkers/src/main/protobuf:worker_protocol_java_proto",
         "//persistentworkers/src/test/java/persistent/testutil",
-        "@buildfarm_maven//:com_google_truth_truth",
-        "@buildfarm_maven//:org_mockito_mockito_core",
+        "@maven//:com_google_truth_truth",
+        "@maven//:org_mockito_mockito_core",
     ],
 )

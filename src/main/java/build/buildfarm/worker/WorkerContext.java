@@ -27,7 +27,6 @@ import build.buildfarm.common.Write;
 import build.buildfarm.common.config.ExecutionPolicy;
 import build.buildfarm.v1test.QueueEntry;
 import build.buildfarm.v1test.QueuedOperation;
-import build.buildfarm.v1test.WorkerExecutedMetadata;
 import build.buildfarm.worker.resources.ResourceLimits;
 import com.google.common.collect.ImmutableList;
 import com.google.longrunning.Operation;
@@ -66,10 +65,6 @@ public interface WorkerContext {
       Deadline deadline,
       Executor executor);
 
-  boolean inGracefulShutdown();
-
-  void prepareForGracefulShutdown();
-
   void match(MatchListener listener) throws InterruptedException;
 
   List<ExecutionPolicy> getExecutionPolicies(String name);
@@ -103,8 +98,7 @@ public interface WorkerContext {
       DigestFunction.Value digestFunction,
       Action action,
       Command command,
-      @Nullable UserPrincipal owner,
-      WorkerExecutedMetadata.Builder workerExecutedMetadata)
+      @Nullable UserPrincipal owner)
       throws IOException, InterruptedException;
 
   void destroyExecDir(Path execDir) throws IOException, InterruptedException;

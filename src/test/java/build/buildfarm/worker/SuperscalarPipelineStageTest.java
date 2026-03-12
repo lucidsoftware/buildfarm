@@ -52,8 +52,8 @@ public class SuperscalarPipelineStageTest {
       throw new UnsupportedOperationException();
     }
 
-    boolean hasOpenSlots() {
-      return !claims.isEmpty();
+    boolean isFull() {
+      return claims.size() == width;
     }
 
     @Override
@@ -78,7 +78,7 @@ public class SuperscalarPipelineStageTest {
     Thread interruptor =
         new Thread(
             () -> {
-              while (stage.hasOpenSlots()) {
+              while (!stage.isFull()) {
                 try {
                   MICROSECONDS.sleep(1);
                 } catch (InterruptedException e) {

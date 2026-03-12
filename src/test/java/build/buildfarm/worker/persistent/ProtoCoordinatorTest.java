@@ -34,21 +34,19 @@ import java.util.Set;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
-import persistent.bazel.client.WorkerIndex;
 import persistent.bazel.client.WorkerKey;
 
 @RunWith(JUnit4.class)
 public class ProtoCoordinatorTest {
-  private WorkerKey makeWorkerKey(WorkerInputs workerFiles, Path workRootsDir) {
-    return Keymaker.makeKey(
-        Keymaker.makeBasicKey(
-            ImmutableList.of("workerExecCmd"),
-            ImmutableList.of("workerInitArgs"),
-            ImmutableMap.of(),
-            "executionName"),
-        null,
-        ImmutableList.of(),
+  private WorkerKey makeWorkerKey(
+      WorkFilesContext ctx, WorkerInputs workerFiles, Path workRootsDir) {
+    return Keymaker.make(
+        ctx.opRoot,
         workRootsDir,
+        ImmutableList.of("workerExecCmd"),
+        ImmutableList.of("workerInitArgs"),
+        ImmutableMap.of(),
+        "executionName",
         workerFiles);
   }
 
@@ -70,8 +68,7 @@ public class ProtoCoordinatorTest {
 
   @Test
   public void testProtoCoordinator() throws Exception {
-    WorkerIndex workerIndex = new WorkerIndex();
-    ProtoCoordinator pc = ProtoCoordinator.ofCommonsPool(workerIndex, 4);
+    ProtoCoordinator pc = ProtoCoordinator.ofCommonsPool(4);
 
     Path fsRoot = jimFsRoot();
     Path opRoot = fsRoot.resolve("opRoot");
@@ -101,7 +98,7 @@ public class ProtoCoordinatorTest {
       Files.createFile(file);
     }
 
-    WorkerKey key = makeWorkerKey(workerFiles, fsRoot.resolve("workRootsDir"));
+    WorkerKey key = makeWorkerKey(ctx, workerFiles, fsRoot.resolve("workRootsDir"));
 
     Path workRoot = key.getExecRoot();
     Path toolsRoot = key.getToolRoot();
@@ -109,7 +106,7 @@ public class ProtoCoordinatorTest {
     // Assert: all Tools are copied into "/workRootsDir/*/<tool_inputs_hash>"
     assertThat(toolsRoot.toString()).startsWith(workRoot.toString());
     assertThat(toolsRoot.toString()).endsWith(key.getWorkerFilesCombinedHash().toString());
-    pc.copyToolInputsIntoWorkerToolRoot(key, workerFiles, key.getOwner());
+    pc.copyToolInputsIntoWorkerToolRoot(key, workerFiles);
 
     assertThat(Files.exists(workRoot)).isTrue();
     assertThat(Files.exists(toolsRoot)).isTrue();

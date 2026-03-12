@@ -36,7 +36,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.NoSuchFileException;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -258,14 +257,6 @@ public class MemoryCAS implements ContentAddressableStorage {
     }
     return count;
   }
-
-  @Override
-  public boolean isReadOnly() {
-    return false;
-  }
-
-  @Override
-  public void waitForWritable(Duration timeout) {}
 
   @Override
   public Write getWrite(

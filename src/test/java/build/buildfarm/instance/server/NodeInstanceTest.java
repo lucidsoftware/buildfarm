@@ -61,11 +61,11 @@ import build.buildfarm.common.Write.WriteCompleteException;
 import build.buildfarm.common.io.FeedbackOutputStream;
 import build.buildfarm.common.net.URL;
 import build.buildfarm.v1test.BackplaneStatus;
-import build.buildfarm.v1test.BatchWorkerProfilesResponse;
 import build.buildfarm.v1test.Digest;
 import build.buildfarm.v1test.GetClientStartTimeRequest;
 import build.buildfarm.v1test.GetClientStartTimeResult;
 import build.buildfarm.v1test.PrepareWorkerForGracefulShutDownRequestResults;
+import build.buildfarm.v1test.WorkerListMessage;
 import build.buildfarm.v1test.WorkerProfileMessage;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -207,13 +207,12 @@ public class NodeInstanceTest {
     }
 
     @Override
-    public ListenableFuture<WorkerProfileMessage> getWorkerProfile(String name) {
+    public WorkerProfileMessage getWorkerProfile() {
       throw new UnsupportedOperationException();
     }
 
     @Override
-    public ListenableFuture<BatchWorkerProfilesResponse> batchWorkerProfiles(
-        Iterable<String> names) {
+    public WorkerListMessage getWorkerList() {
       throw new UnsupportedOperationException();
     }
 

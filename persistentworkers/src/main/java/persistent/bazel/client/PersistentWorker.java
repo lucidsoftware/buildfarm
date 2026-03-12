@@ -54,16 +54,12 @@ public class PersistentWorker implements Worker<WorkRequest, WorkResponse> {
     this.key = key;
     this.execRoot = key.getExecRoot().resolve(workerDir);
     this.initCmd =
-        ImmutableList.<String>builder()
-            .addAll(key.getWrapperArguments())
-            .addAll(key.getCmd())
-            .addAll(key.getArgs())
-            .build();
+        ImmutableList.<String>builder().addAll(key.getCmd()).addAll(key.getArgs()).build();
 
     Files.createDirectories(execRoot);
 
     final var logLevel = Level.FINE;
-    if (logger.isLoggable(logLevel)) {
+    if (logger.isLoggable(logLevel)){
       Set<Path> workerFiles = ImmutableSet.copyOf(key.getWorkerFilesWithHashes().keySet());
       StringBuilder msg = new StringBuilder();
       msg.append("Starting Worker[");

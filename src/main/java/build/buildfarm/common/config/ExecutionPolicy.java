@@ -5,7 +5,6 @@ import lombok.Data;
 @Data
 public class ExecutionPolicy {
   private String name;
-  private boolean prioritized;
   private ExecutionWrapper executionWrapper;
 
   /** Required for snakeyaml to parse correctly */
