@@ -957,7 +957,8 @@ class ShardWorkerContext implements WorkerContext {
       @Nullable UserPrincipal owner,
       ImmutableList.Builder<String> arguments,
       Command command,
-      Path workingDirectory) {
+      Path workingDirectory,
+      boolean runsOnPersistentWorker) {
     ResourceLimits limits = commandExecutionSettings(command);
     IOResource resource;
     if (shouldLimitCoreUsage()) {
@@ -990,7 +991,11 @@ class ShardWorkerContext implements WorkerContext {
       addLinuxSandboxCli(arguments, options);
     }
 
-    if (configs.getWorker().getSandboxSettings().isAlwaysUseAsNobody() || limits.fakeUsername) {
+    // Skip as-nobody for persistent workers - buildfarm does not properly set ownership for
+    // persistent worker exec roots, further work is needed to support this.
+    if (!runsOnPersistentWorker
+        && (configs.getWorker().getSandboxSettings().isAlwaysUseAsNobody()
+            || limits.fakeUsername)) {
       arguments.add(configs.getExecutionWrappers().getAsNobody());
     }
     return resource;

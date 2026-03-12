@@ -315,7 +315,8 @@ class Executor {
             executionContext.claim.owner(),
             arguments,
             executionContext.command,
-            workingDirectory)) {
+            workingDirectory,
+            shouldRunOnPersistentWorker(limits))) {
       // Apply all other custom execution policies AFTER built-in wrappers
       for (ExecutionPolicy policy : policies) {
         if (!policy.isPrioritized() && policy.getExecutionWrapper() != null) {

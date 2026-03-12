@@ -140,7 +140,8 @@ public interface WorkerContext {
       @Nullable UserPrincipal owner,
       ImmutableList.Builder<String> arguments,
       Command command,
-      Path workingDirectory);
+      Path workingDirectory,
+      boolean runsOnPersistentWorker);
 
   int commandExecutionClaims(Command command);
 
