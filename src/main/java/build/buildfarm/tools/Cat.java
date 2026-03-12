@@ -33,7 +33,6 @@ import build.bazel.remote.execution.v2.DirectoryNode;
 import build.bazel.remote.execution.v2.ExecuteOperationMetadata;
 import build.bazel.remote.execution.v2.ExecuteResponse;
 import build.bazel.remote.execution.v2.ExecutedActionMetadata;
-import build.bazel.remote.execution.v2.ExecutionStage;
 import build.bazel.remote.execution.v2.FileNode;
 import build.bazel.remote.execution.v2.OutputDirectory;
 import build.bazel.remote.execution.v2.OutputFile;
@@ -46,17 +45,12 @@ import build.buildfarm.common.Write;
 import build.buildfarm.common.resources.UploadBlobRequest;
 import build.buildfarm.instance.Instance;
 import build.buildfarm.instance.stub.StubInstance;
-import build.buildfarm.v1test.BatchWorkerProfilesResponse;
 import build.buildfarm.v1test.Digest;
-import build.buildfarm.v1test.DispatchedOperation;
-import build.buildfarm.v1test.ExecuteEntry;
 import build.buildfarm.v1test.OperationTimesBetweenStages;
-import build.buildfarm.v1test.QueueEntry;
 import build.buildfarm.v1test.QueuedOperation;
 import build.buildfarm.v1test.QueuedOperationMetadata;
 import build.buildfarm.v1test.StageInformation;
 import build.buildfarm.v1test.Tree;
-import build.buildfarm.v1test.WorkerExecutedMetadata;
 import build.buildfarm.v1test.WorkerProfileMessage;
 import com.google.common.base.Stopwatch;
 import com.google.common.base.Strings;
@@ -223,16 +217,6 @@ class Cat {
     }
   }
 
-  private static void printWorkerMetadata(WorkerExecutedMetadata metadata, int indentLevel) {
-    indentOut(indentLevel, format("Fetched Bytes: %d", metadata.getFetchedBytes()));
-    if (metadata.getLinkedInputDirectoriesCount() > 0) {
-      indentOut(indentLevel, "Linked Input Directories:");
-    }
-    for (String linkedInputDirectory : metadata.getLinkedInputDirectoriesList()) {
-      indentOut(indentLevel + 1, linkedInputDirectory);
-    }
-  }
-
   private static void printExecutedActionMetadata(
       ExecutedActionMetadata metadata, int indentLevel) {
     if (!metadata.getWorker().isEmpty()) {
@@ -251,7 +235,7 @@ class Cat {
           indentLevel,
           "Input Fetch Start: " + Timestamps.toString(metadata.getInputFetchStartTimestamp()));
     }
-    if (metadata.hasInputFetchCompletedTimestamp()) {
+    if (metadata.hasQueuedTimestamp()) {
       indentOut(
           indentLevel,
           "Input Fetch Completed: "
@@ -282,21 +266,6 @@ class Cat {
       indentOut(
           indentLevel,
           "Worker Completed: " + Timestamps.toString(metadata.getWorkerCompletedTimestamp()));
-    }
-    if (metadata.getAuxiliaryMetadataCount() > 0) {
-      indentOut(indentLevel, "Auxiliary Metadata:");
-    }
-    for (Any auxiliary : metadata.getAuxiliaryMetadataList()) {
-      if (auxiliary.is(WorkerExecutedMetadata.class)) {
-        try {
-          printWorkerMetadata(auxiliary.unpack(WorkerExecutedMetadata.class), indentLevel + 1);
-        } catch (InvalidProtocolBufferException e) {
-          // unlikely
-          e.printStackTrace();
-        }
-      } else {
-        indentOut(indentLevel + 1, "Unrecognized Metadata: " + auxiliary);
-      }
     }
   }
 
@@ -626,15 +595,6 @@ class Cat {
     // FIXME server_logs
   }
 
-  private static ExecuteOperationMetadata executeEntryMetadata(
-      ExecuteEntry executeEntry, ExecutionStage.Value stage) {
-    return ExecuteOperationMetadata.newBuilder()
-        .setStage(stage)
-        .setActionDigest(DigestUtil.toDigest(executeEntry.getActionDigest()))
-        .setDigestFunction(executeEntry.getActionDigest().getDigestFunction())
-        .build();
-  }
-
   private static void printOperation(Operation operation) {
     System.out.println("Operation: " + operation.getName());
     if (operation.getDone()) {
@@ -649,39 +609,20 @@ class Cat {
             operation.getMetadata().unpack(QueuedOperationMetadata.class);
         metadata = queuedOperationMetadata.getExecuteOperationMetadata();
         requestMetadata = queuedOperationMetadata.getRequestMetadata();
-      } else if (operation.getMetadata().is(ExecuteEntry.class)) {
-        ExecuteEntry executeEntry = operation.getMetadata().unpack(ExecuteEntry.class);
-        metadata = executeEntryMetadata(executeEntry, ExecutionStage.Value.UNKNOWN);
-        requestMetadata = executeEntry.getRequestMetadata();
-      } else if (operation.getMetadata().is(QueueEntry.class)) {
-        QueueEntry queueEntry = operation.getMetadata().unpack(QueueEntry.class);
-        ExecuteEntry executeEntry = queueEntry.getExecuteEntry();
-        metadata = executeEntryMetadata(executeEntry, ExecutionStage.Value.QUEUED);
-        requestMetadata = executeEntry.getRequestMetadata();
-      } else if (operation.getMetadata().is(DispatchedOperation.class)) {
-        DispatchedOperation dispatchedOperation =
-            operation.getMetadata().unpack(DispatchedOperation.class);
-        ExecuteEntry executeEntry = dispatchedOperation.getQueueEntry().getExecuteEntry();
-        metadata =
-            executeEntryMetadata(
-                executeEntry, ExecutionStage.Value.QUEUED); // latest we can know about here
-        requestMetadata = executeEntry.getRequestMetadata();
       } else {
         metadata = operation.getMetadata().unpack(ExecuteOperationMetadata.class);
         requestMetadata = null;
       }
-      if (metadata != null) {
-        printExecutedActionMetadata(metadata.getPartialExecutionMetadata(), 1);
-        System.out.println("Metadata:");
-        System.out.println("  Stage: " + metadata.getStage());
-        digestFunction = metadata.getDigestFunction();
-        System.out.println(
-            "  Action: "
-                + DigestUtil.toString(
-                    DigestUtil.fromDigest(metadata.getActionDigest(), digestFunction)));
-        System.out.println("  Stdout Stream: " + metadata.getStdoutStreamName());
-        System.out.println("  Stderr Stream: " + metadata.getStderrStreamName());
-      }
+      printExecutedActionMetadata(metadata.getPartialExecutionMetadata(), 1);
+      System.out.println("Metadata:");
+      System.out.println("  Stage: " + metadata.getStage());
+      digestFunction = metadata.getDigestFunction();
+      System.out.println(
+          "  Action: "
+              + DigestUtil.toString(
+                  DigestUtil.fromDigest(metadata.getActionDigest(), digestFunction)));
+      System.out.println("  Stdout Stream: " + metadata.getStdoutStreamName());
+      System.out.println("  Stderr Stream: " + metadata.getStderrStreamName());
       if (requestMetadata != null) {
         printRequestMetadata(requestMetadata);
       }
@@ -746,29 +687,16 @@ class Cat {
     System.out.println(DigestUtil.toString(digest.get()));
   }
 
-  private static void batchWorkerProfiles(Instance instance, Iterable<String> names)
-      throws Exception {
-    BatchWorkerProfilesResponse responses = instance.batchWorkerProfiles(names).get();
-    for (BatchWorkerProfilesResponse.Response response : responses.getResponsesList()) {
-      System.out.println("Worker: " + response.getWorkerName());
-      int code = response.getStatus().getCode();
-      if (code == Code.OK.getNumber()) {
-        printWorkerProfile(response.getProfile());
-      } else {
-        System.out.println("Error: " + Code.forNumber(code));
-      }
-    }
-  }
-
-  private static void printWorkerProfile(WorkerProfileMessage workerProfile) {
+  private static void getWorkerProfile(Instance instance) {
+    WorkerProfileMessage response = instance.getWorkerProfile();
     System.out.println("\nWorkerProfile:");
     String strIntFormat = "%-50s : %d";
-    long entryCount = workerProfile.getCasEntryCount();
-    long unreferencedEntryCount = workerProfile.getCasUnreferencedEntryCount();
+    long entryCount = response.getCasEntryCount();
+    long unreferencedEntryCount = response.getCasUnreferencedEntryCount();
     System.out.printf((strIntFormat) + "%n", "Current Total Entry Count", entryCount);
-    System.out.printf((strIntFormat) + "%n", "Current Total Size", workerProfile.getCasSize());
-    System.out.printf((strIntFormat) + "%n", "Max Size", workerProfile.getCasMaxSize());
-    System.out.printf((strIntFormat) + "%n", "Max Entry Size", workerProfile.getCasMaxEntrySize());
+    System.out.printf((strIntFormat) + "%n", "Current Total Size", response.getCasSize());
+    System.out.printf((strIntFormat) + "%n", "Max Size", response.getCasMaxSize());
+    System.out.printf((strIntFormat) + "%n", "Max Entry Size", response.getCasMaxEntrySize());
     System.out.printf(
         (strIntFormat) + "%n", "Current Unreferenced Entry Count", unreferencedEntryCount);
     if (entryCount != 0) {
@@ -780,22 +708,20 @@ class Cat {
     System.out.printf(
         (strIntFormat) + "%n",
         "Current DirectoryEntry Count",
-        workerProfile.getCasDirectoryEntryCount());
+        response.getCasDirectoryEntryCount());
     System.out.printf(
-        (strIntFormat) + "%n",
-        "Number of Evicted Entries",
-        workerProfile.getCasEvictedEntryCount());
+        (strIntFormat) + "%n", "Number of Evicted Entries", response.getCasEvictedEntryCount());
     System.out.printf(
         (strIntFormat) + "%n",
         "Total Evicted Entries size in Bytes",
-        workerProfile.getCasEvictedEntrySize());
+        response.getCasEvictedEntrySize());
 
-    List<StageInformation> stages = workerProfile.getStagesList();
+    List<StageInformation> stages = response.getStagesList();
     for (StageInformation stage : stages) {
       printStageInformation(stage);
     }
 
-    List<OperationTimesBetweenStages> times = workerProfile.getTimesList();
+    List<OperationTimesBetweenStages> times = response.getTimesList();
     for (OperationTimesBetweenStages time : times) {
       printOperationTime(time);
     }
@@ -962,8 +888,8 @@ class Cat {
     }
 
     @Override
-    public void run(Instance instance, Iterable<String> args) throws Exception {
-      batchWorkerProfiles(instance, args);
+    public void run(Instance instance, Iterable<String> args) {
+      getWorkerProfile(instance);
     }
   }
 

@@ -27,7 +27,6 @@ import build.buildfarm.common.Write;
 import build.buildfarm.common.config.ExecutionPolicy;
 import build.buildfarm.v1test.QueueEntry;
 import build.buildfarm.v1test.QueuedOperation;
-import build.buildfarm.v1test.WorkerExecutedMetadata;
 import build.buildfarm.worker.resources.ResourceLimits;
 import com.google.common.collect.ImmutableList;
 import com.google.longrunning.Operation;
@@ -61,16 +60,6 @@ class StubWorkerContext implements WorkerContext {
       Runnable onFailure,
       Deadline deadline,
       Executor executor) {
-    throw new UnsupportedOperationException();
-  }
-
-  @Override
-  public boolean inGracefulShutdown() {
-    throw new UnsupportedOperationException();
-  }
-
-  @Override
-  public void prepareForGracefulShutdown() {
     throw new UnsupportedOperationException();
   }
 
@@ -146,8 +135,7 @@ class StubWorkerContext implements WorkerContext {
       DigestFunction.Value digestFunction,
       Action action,
       Command command,
-      UserPrincipal owner,
-      WorkerExecutedMetadata.Builder workerExecutedMetadata)
+      UserPrincipal owner)
       throws IOException, InterruptedException {
     throw new UnsupportedOperationException();
   }

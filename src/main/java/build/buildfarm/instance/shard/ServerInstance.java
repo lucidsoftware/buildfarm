@@ -34,9 +34,7 @@ import static com.google.common.util.concurrent.Futures.immediateFailedFuture;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
 import static com.google.common.util.concurrent.Futures.transform;
 import static com.google.common.util.concurrent.Futures.transformAsync;
-import static com.google.common.util.concurrent.Futures.whenAllComplete;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
-import static com.google.common.util.concurrent.MoreExecutors.listeningDecorator;
 import static java.lang.String.format;
 import static java.util.concurrent.Executors.newFixedThreadPool;
 import static java.util.concurrent.Executors.newSingleThreadExecutor;
@@ -94,7 +92,6 @@ import build.buildfarm.instance.server.Filter;
 import build.buildfarm.instance.server.NodeInstance;
 import build.buildfarm.instance.stub.StubInstance;
 import build.buildfarm.v1test.BackplaneStatus;
-import build.buildfarm.v1test.BatchWorkerProfilesResponse;
 import build.buildfarm.v1test.DispatchedOperation;
 import build.buildfarm.v1test.ExecuteEntry;
 import build.buildfarm.v1test.GetClientStartTimeRequest;
@@ -105,7 +102,6 @@ import build.buildfarm.v1test.QueueStatus;
 import build.buildfarm.v1test.QueuedOperation;
 import build.buildfarm.v1test.QueuedOperationMetadata;
 import build.buildfarm.v1test.Tree;
-import build.buildfarm.v1test.WorkerProfileMessage;
 import com.github.benmanes.caffeine.cache.AsyncCache;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
@@ -283,8 +279,6 @@ public class ServerInstance extends NodeInstance {
   private final boolean mergeExecutions;
   private final Scannable<Operation> indexKeys;
   private final Scannable<Operation> operations;
-  private final Scannable<ExecuteEntry> prequeuedOperations;
-  private final Scannable<Map.Entry<String, QueueEntry>> queuedOperations;
   private final Scannable<DispatchedOperation> dispatchedOperations;
   private final Scannable<String> correlatedInvocations;
   private final Scannable<String> toolInvocations;
@@ -447,7 +441,6 @@ public class ServerInstance extends NodeInstance {
             return result.getToken();
           }
         };
-    // we can probably just construct the scanner for this once
     this.dispatchedOperations =
         new Scannable<>() {
           @Override
@@ -462,39 +455,6 @@ public class ServerInstance extends NodeInstance {
             Backplane.ScanResult<DispatchedOperation> scanResult =
                 backplane.scanDispatchedOperations(pageToken, limit);
             scanResult.getResult().forEach(onDispatchedOperation);
-            return scanResult.getToken();
-          }
-        };
-    this.queuedOperations =
-        new Scannable<>() {
-          @Override
-          public String getName() {
-            return "queued";
-          }
-
-          @Override
-          public String scan(
-              int limit, String pageToken, Consumer<Map.Entry<String, QueueEntry>> onQueueEntry)
-              throws IOException {
-            Backplane.ScanResult<Map.Entry<String, QueueEntry>> scanResult =
-                backplane.scanQueuedOperations(pageToken, limit);
-            scanResult.getResult().forEach(onQueueEntry);
-            return scanResult.getToken();
-          }
-        };
-    this.prequeuedOperations =
-        new Scannable<>() {
-          @Override
-          public String getName() {
-            return "prequeued";
-          }
-
-          @Override
-          public String scan(int limit, String pageToken, Consumer<ExecuteEntry> onExecuteEntry)
-              throws IOException {
-            Backplane.ScanResult<ExecuteEntry> scanResult =
-                backplane.scanPrequeuedOperations(pageToken, limit);
-            scanResult.getResult().forEach(onExecuteEntry);
             return scanResult.getToken();
           }
         };
@@ -553,29 +513,6 @@ public class ServerInstance extends NodeInstance {
                   if (executeEntry == null) {
                     log.log(Level.SEVERE, "OperationQueuer: Got null from deprequeue...");
                     return immediateFuture(null);
-                  }
-                  if (executeEntry
-                      .getRequestMetadata()
-                      .getActionMnemonic()
-                      .equals("buildfarm:halt-on-deprequeue")) {
-                    return listeningDecorator(operationTransformService)
-                        .submit(
-                            () -> {
-                              try {
-                                backplane.putOperation(
-                                    Operation.newBuilder()
-                                        .setName(executeEntry.getOperationName())
-                                        .setDone(true)
-                                        .setMetadata(
-                                            Any.pack(ExecuteOperationMetadata.getDefaultInstance()))
-                                        .setResponse(Any.pack(ExecuteResponse.getDefaultInstance()))
-                                        .build(),
-                                    ExecutionStage.Value.COMPLETED);
-                              } catch (IOException e) {
-                                throw Status.fromThrowable(e).asRuntimeException();
-                              }
-                              return null;
-                            });
                   }
                   // half the watcher expiry, need to expose this from backplane
                   Poller poller = new Poller(Durations.fromSeconds(5));
@@ -1501,11 +1438,6 @@ public class ServerInstance extends NodeInstance {
   }
 
   @Override
-  public boolean isReadOnly() {
-    return false;
-  }
-
-  @Override
   public Write getBlobWrite(
       Compressor.Value compressor,
       build.buildfarm.v1test.Digest digest,
@@ -1863,34 +1795,10 @@ public class ServerInstance extends NodeInstance {
             .setPlatform(queuedOperation.getCommand().getPlatform())
             .build();
     return transform(
-        retryWriteBlobFuture(
-            queuedOperationDigest,
-            queuedOperationBlob,
-            executeEntry.getRequestMetadata(),
-            timeout,
-            5),
+        writeBlobFuture(
+            queuedOperationDigest, queuedOperationBlob, executeEntry.getRequestMetadata(), timeout),
         (committedSize) -> new QueuedOperationResult(entry, metadata),
         service);
-  }
-
-  private ListenableFuture<Long> retryWriteBlobFuture(
-      build.buildfarm.v1test.Digest digest,
-      ByteString content,
-      RequestMetadata requestMetadata,
-      Duration timeout,
-      int maxRetries)
-      throws EntryLimitException {
-    ListenableFuture<Long> future = writeBlobFuture(digest, content, requestMetadata, timeout);
-    return catchingAsync(
-        future,
-        Throwable.class,
-        t -> {
-          if (maxRetries == 0 && SHARD_IS_RETRIABLE.test(Status.fromThrowable(t))) {
-            return immediateFailedFuture(t);
-          }
-          return retryWriteBlobFuture(digest, content, requestMetadata, timeout, maxRetries - 1);
-        },
-        directExecutor());
   }
 
   private ListenableFuture<Long> writeBlobFuture(
@@ -2484,14 +2392,7 @@ public class ServerInstance extends NodeInstance {
             .build();
     Operation operation =
         Operation.newBuilder().setName(executionName).setMetadata(Any.pack(metadata)).build();
-    if (requestMetadata.getActionMnemonic().equals("buildfarm:halt-on-execute")) {
-      operation =
-          operation.toBuilder()
-              .setDone(true)
-              .setMetadata(Any.pack(ExecuteOperationMetadata.getDefaultInstance()))
-              .setResponse(Any.pack(ExecuteResponse.getDefaultInstance()))
-              .build();
-    } else if (inDenyList(requestMetadata)) {
+    if (inDenyList(requestMetadata)) {
       operation =
           operation.toBuilder()
               .setDone(true)
@@ -2836,8 +2737,8 @@ public class ServerInstance extends NodeInstance {
                   profiledQueuedMetadata.getQueuedOperationMetadata().getQueuedOperationDigest();
               long startUploadUSecs = stopwatch.elapsed(MICROSECONDS);
               return transform(
-                  retryWriteBlobFuture(
-                      queuedOperationDigest, queuedOperationBlob, requestMetadata, timeout, 5),
+                  writeBlobFuture(
+                      queuedOperationDigest, queuedOperationBlob, requestMetadata, timeout),
                   (committedSize) ->
                       profiledQueuedMetadata
                           .setUploadedIn(
@@ -2935,13 +2836,6 @@ public class ServerInstance extends NodeInstance {
   public boolean putOperation(Operation operation) {
     if (isErrored(operation)) {
       try {
-        ExecuteOperationMetadata metadata = expectExecuteOperationMetadata(operation);
-        if (metadata != null) {
-          ActionKey actionKey =
-              DigestUtil.asActionKey(
-                  DigestUtil.fromDigest(metadata.getActionDigest(), metadata.getDigestFunction()));
-          backplane.unmergeExecution(actionKey);
-        }
         return backplane.putOperation(operation, ExecutionStage.Value.COMPLETED);
       } catch (IOException e) {
         throw Status.fromThrowable(e).asRuntimeException();
@@ -3121,100 +3015,34 @@ public class ServerInstance extends NodeInstance {
     }
   }
 
-  private Scannable<Operation> dispatchedOperationsScannable() {
-    return new Scannable<>() {
-      @Override
-      public String getName() {
-        return dispatchedOperations.getName();
-      }
-
-      @Override
-      public String scan(int limit, String pageToken, Consumer<Operation> onOperation)
-          throws IOException {
-        return dispatchedOperations.scan(
-            limit,
-            pageToken,
-            dispatchedOperation -> {
-              ExecuteEntry executeEntry = dispatchedOperation.getQueueEntry().getExecuteEntry();
-              onOperation.accept(
-                  Operation.newBuilder()
-                      .setName(executeEntry.getOperationName())
-                      .setMetadata(Any.pack(dispatchedOperation))
-                      .build());
-            });
-      }
-    };
-  }
-
-  private Scannable<Operation> prequeuedOperationsScannable() {
-    return new Scannable<>() {
-      @Override
-      public String getName() {
-        return prequeuedOperations.getName();
-      }
-
-      @Override
-      public String scan(int limit, String pageToken, Consumer<Operation> onOperation)
-          throws IOException {
-        // fancier things later with queue
-        return prequeuedOperations.scan(
-            limit,
-            pageToken,
-            executeEntry -> {
-              onOperation.accept(
-                  Operation.newBuilder()
-                      .setName(executeEntry.getOperationName())
-                      .setMetadata(Any.pack(executeEntry))
-                      .build());
-            });
-      }
-    };
-  }
-
-  private Scannable<Operation> queuedOperationsScannable() {
-    return new Scannable<>() {
-      @Override
-      public String getName() {
-        return queuedOperations.getName();
-      }
-
-      @Override
-      public String scan(int limit, String pageToken, Consumer<Operation> onOperation)
-          throws IOException {
-        // fancier things later with queue
-        return queuedOperations.scan(
-            limit,
-            pageToken,
-            entry -> {
-              ExecuteEntry executeEntry = entry.getValue().getExecuteEntry();
-              onOperation.accept(
-                  Operation.newBuilder()
-                      .setName(executeEntry.getOperationName())
-                      .setMetadata(Any.pack(entry.getValue()))
-                      .build());
-            });
-      }
-    };
-  }
-
   Filter<Operation> parseOperationsFilter(String filter) {
     if (filter.startsWith("toolInvocationId=")) {
       return new Filter<>(
           ImmutableList.of(new ToolInvocationExecutionsBounds(filter.split("=")[1])));
     }
-    if (filter.startsWith("status=")) {
-      Scannable scannable = null;
-      if (filter.equals("status=dispatched")) {
-        // could create this once per object
-        scannable = dispatchedOperationsScannable();
-      } else if (filter.equals("status=queued")) {
-        scannable = queuedOperationsScannable();
-      } else if (filter.equals("status=prequeued")) {
-        scannable = prequeuedOperationsScannable();
-      }
-      if (scannable != null) {
-        return new Filter<>(ImmutableList.of(scannable));
-      }
+    if (filter.equals("status=dispatched")) {
+      return new Filter<>(
+          ImmutableList.of(
+              new Scannable<>() {
+                @Override
+                public String getName() {
+                  return dispatchedOperations.getName();
+                }
+
+                @Override
+                public String scan(int limit, String pageToken, Consumer<Operation> onOperation)
+                    throws IOException {
+                  return dispatchedOperations.scan(
+                      limit,
+                      pageToken,
+                      dispatchedOperation -> {
+                        ExecuteEntry executeEntry =
+                            dispatchedOperation.getQueueEntry().getExecuteEntry();
+                        onOperation.accept(
+                            OperationNameScannable.toOperation(executeEntry.getOperationName()));
+                      });
+                }
+              }));
     }
     // more?
     return new Filter<>(ImmutableList.of(operations));
@@ -3297,10 +3125,7 @@ public class ServerInstance extends NodeInstance {
         CountingConsumer<T> onCounting = new CountingConsumer<>(onResult);
         token = location.scan(pageSize, token, onCounting);
         checkState(
-            token.equals(Scannable.SENTINEL_PAGE_TOKEN) || onCounting.getCount() == pageSize,
-            format(
-                "%s was not %s or %d != %d",
-                token, Scannable.SENTINEL_PAGE_TOKEN, onCounting.getCount(), pageSize));
+            token.equals(Scannable.SENTINEL_PAGE_TOKEN) || onCounting.getCount() == pageSize);
         pageSize -= onCounting.getCount();
         if (pageSize > 0) {
           locationName = null;
@@ -3376,37 +3201,6 @@ public class ServerInstance extends NodeInstance {
     return super.getCacheCapabilities().toBuilder()
         .setSymlinkAbsolutePathStrategy(symlinkAbsolutePathStrategy)
         .build();
-  }
-
-  @Override
-  public ListenableFuture<WorkerProfileMessage> getWorkerProfile(String name) {
-    return workerStub(name).getWorkerProfile(name);
-  }
-
-  @Override
-  public ListenableFuture<BatchWorkerProfilesResponse> batchWorkerProfiles(Iterable<String> names) {
-    Iterable<ListenableFuture<WorkerProfileMessage>> profiles =
-        Iterables.transform(names, this::getWorkerProfile);
-    return whenAllComplete(profiles)
-        .call(
-            () -> {
-              Iterator<String> iter = names.iterator();
-              Iterator<ListenableFuture<WorkerProfileMessage>> profileIter = profiles.iterator();
-              BatchWorkerProfilesResponse.Builder response =
-                  BatchWorkerProfilesResponse.newBuilder();
-              while (iter.hasNext() && profileIter.hasNext()) {
-                ListenableFuture<WorkerProfileMessage> profileFuture = profileIter.next();
-                BatchWorkerProfilesResponse.Response.Builder builder =
-                    response.addResponsesBuilder().setWorkerName(iter.next());
-                try {
-                  builder.setProfile(profileFuture.get());
-                } catch (Exception e) {
-                  builder.setStatus(StatusProto.fromThrowable(e));
-                }
-              }
-              return response.build();
-            },
-            directExecutor());
   }
 
   public String indexCorrelatedInvocations(URI uri) throws IOException {

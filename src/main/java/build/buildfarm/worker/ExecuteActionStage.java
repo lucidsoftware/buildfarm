@@ -14,8 +14,6 @@
 
 package build.buildfarm.worker;
 
-import build.buildfarm.worker.filesystem.ExecFileSystem;
-import build.buildfarm.worker.persistent.PersistentWorkerAwareExecOwnerPool;
 import build.buildfarm.worker.resources.ResourceLimits;
 import io.prometheus.client.Gauge;
 import io.prometheus.client.Histogram;
@@ -23,7 +21,6 @@ import java.io.IOException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-import javax.annotation.Nullable;
 import lombok.extern.java.Log;
 
 @Log
@@ -38,32 +35,15 @@ public class ExecuteActionStage extends SuperscalarPipelineStage {
           .help("Execution stall time in ms.")
           .register();
 
-  private final ExecFileSystem execFileSystem;
-  private final @Nullable PersistentWorkerAwareExecOwnerPool execOwnerPool;
   private final AtomicInteger executorClaims = new AtomicInteger(0);
 
   public ExecuteActionStage(
-      WorkerContext workerContext,
-      PipelineStage output,
-      PipelineStage error,
-      ExecFileSystem execFileSystem,
-      @Nullable PersistentWorkerAwareExecOwnerPool execOwnerPool) {
-    this(
-        workerContext,
-        output,
-        error,
-        workerContext.getExecuteStageWidth(),
-        execFileSystem,
-        execOwnerPool);
+      WorkerContext workerContext, PipelineStage output, PipelineStage error) {
+    this(workerContext, output, error, workerContext.getExecuteStageWidth());
   }
 
   public ExecuteActionStage(
-      WorkerContext workerContext,
-      PipelineStage output,
-      PipelineStage error,
-      int width,
-      ExecFileSystem execFileSystem,
-      @Nullable PersistentWorkerAwareExecOwnerPool execOwnerPool) {
+      WorkerContext workerContext, PipelineStage output, PipelineStage error, int width) {
     super(
         "ExecuteActionStage",
         "executor",
@@ -71,9 +51,6 @@ public class ExecuteActionStage extends SuperscalarPipelineStage {
         output,
         createDestroyExecDirStage(workerContext, error),
         width);
-
-    this.execFileSystem = execFileSystem;
-    this.execOwnerPool = execOwnerPool;
   }
 
   static PipelineStage createDestroyExecDirStage(
@@ -129,14 +106,9 @@ public class ExecuteActionStage extends SuperscalarPipelineStage {
 
   @Override
   protected void iterate() throws InterruptedException {
-    if (!workerContext.inGracefulShutdown() && isPaused()) {
-      return;
-    }
     ExecutionContext executionContext = take();
     ResourceLimits limits = workerContext.commandExecutionSettings(executionContext.command);
-    Executor actionExecutor =
-        new Executor(
-            workerContext, executionContext, this, pollerExecutor, execFileSystem, execOwnerPool);
+    Executor actionExecutor = new Executor(workerContext, executionContext, this, pollerExecutor);
 
     synchronized (this) {
       int slotUsage = executorClaims.addAndGet(limits.cpu.claimed);

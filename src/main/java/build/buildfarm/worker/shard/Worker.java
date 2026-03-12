@@ -21,7 +21,6 @@ import static build.buildfarm.common.io.Utils.formatIOError;
 import static build.buildfarm.common.io.Utils.getUser;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
-import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static java.util.concurrent.Executors.newSingleThreadExecutor;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static java.util.logging.Level.INFO;
@@ -38,6 +37,7 @@ import build.buildfarm.cas.cfc.LegacyDirectoryCFC;
 import build.buildfarm.common.BuildfarmExecutors;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.DigestUtil.HashFunction;
+import build.buildfarm.common.Dispenser;
 import build.buildfarm.common.EmptyInputStreamFactory;
 import build.buildfarm.common.FailoverInputStreamFactory;
 import build.buildfarm.common.InputStreamFactory;
@@ -59,10 +59,13 @@ import build.buildfarm.instance.shard.WorkerStubs;
 import build.buildfarm.instance.stub.StubInstance;
 import build.buildfarm.metrics.prometheus.PrometheusPublisher;
 import build.buildfarm.v1test.Digest;
-import build.buildfarm.v1test.PipelineChange;
 import build.buildfarm.v1test.ShardWorker;
+import build.buildfarm.worker.CFCExecFileSystem;
+import build.buildfarm.worker.CFCLinkExecFileSystem;
+import build.buildfarm.worker.ExecFileSystem;
 import build.buildfarm.worker.ExecuteActionStage;
 import build.buildfarm.worker.ExecutionContext;
+import build.buildfarm.worker.FuseCAS;
 import build.buildfarm.worker.InputFetchStage;
 import build.buildfarm.worker.MatchStage;
 import build.buildfarm.worker.Pipeline;
@@ -71,23 +74,14 @@ import build.buildfarm.worker.PutOperationStage;
 import build.buildfarm.worker.ReportResultStage;
 import build.buildfarm.worker.SuperscalarPipelineStage;
 import build.buildfarm.worker.cgroup.Group;
-import build.buildfarm.worker.filesystem.CFCExecFileSystem;
-import build.buildfarm.worker.filesystem.CFCLinkExecFileSystem;
-import build.buildfarm.worker.filesystem.ExecFileSystem;
-import build.buildfarm.worker.filesystem.FuseCAS;
-import build.buildfarm.worker.persistent.PersistentExecutor;
-import build.buildfarm.worker.persistent.PersistentWorkerAwareExecOwnerPool;
 import build.buildfarm.worker.resources.LocalResourceSet;
+import build.buildfarm.worker.resources.LocalResourceSet.PoolResource;
 import build.buildfarm.worker.resources.LocalResourceSetUtils;
 import com.google.common.base.Strings;
 import com.google.common.cache.LoadingCache;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.google.common.util.concurrent.FutureCallback;
-import com.google.common.util.concurrent.Futures;
-import com.google.common.util.concurrent.ListenableFuture;
 import com.google.longrunning.Operation;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Duration;
@@ -97,18 +91,17 @@ import io.grpc.Status;
 import io.grpc.Status.Code;
 import io.grpc.health.v1.HealthCheckResponse.ServingStatus;
 import io.grpc.protobuf.services.HealthStatusManager;
-import io.grpc.protobuf.services.ProtoReflectionServiceV1;
+import io.grpc.protobuf.services.ProtoReflectionService;
 import io.prometheus.client.Counter;
 import io.prometheus.client.Gauge;
 import java.io.File;
 import java.io.IOException;
-import java.net.InetAddress;
 import java.nio.file.FileSystem;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.UserPrincipal;
-import java.util.Collections;
+import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Random;
 import java.util.UUID;
@@ -154,6 +147,7 @@ public final class Worker extends LoggingMain {
 
   private static BuildfarmConfigs configs = BuildfarmConfigs.getInstance();
 
+  private boolean inGracefulShutdown = false;
   private boolean isPaused = false;
 
   private WorkerInstance instance;
@@ -163,15 +157,10 @@ public final class Worker extends LoggingMain {
   private Server server;
   private Path root;
   private ExecFileSystem execFileSystem;
-  private @Nullable PersistentWorkerAwareExecOwnerPool execOwnerIndexResource;
   private Pipeline pipeline;
-  private PipelineStage matchStage;
-  private ShardWorkerContext context;
   private Backplane backplane;
   private LoadingCache<String, StubInstance> workerStubs;
   private AtomicBoolean released = new AtomicBoolean(true);
-  private AtomicBoolean shutdownInitiated = new AtomicBoolean(false);
-  private boolean startWritable = true;
 
   /**
    * The method will prepare the worker for graceful shutdown when the worker is ready. Note on
@@ -184,10 +173,11 @@ public final class Worker extends LoggingMain {
           "Graceful Shutdown is not enabled. Worker is shutting down without finishing executions"
               + " in progress.");
     } else {
+      inGracefulShutdown = true;
       log.info(
           "Graceful Shutdown - The current worker will not be registered again and should be"
               + " shutdown gracefully!");
-      context.prepareForGracefulShutdown();
+      pipeline.stopMatchingOperations();
       int scanRate = 30; // check every 30 seconds
       int timeWaited = 0;
       int timeOut = configs.getWorker().getGracefulShutdownSeconds();
@@ -241,15 +231,51 @@ public final class Worker extends LoggingMain {
 
   private Server createServer(
       ServerBuilder<?> serverBuilder,
+      @Nullable CASFileCache storage,
       Instance instance,
-      WorkerProfileService workerProfileService) {
+      Pipeline pipeline,
+      ShardWorkerContext context) {
     serverBuilder.addService(healthStatusManager.getHealthService());
     serverBuilder.addService(new ContentAddressableStorageService(instance));
     serverBuilder.addService(new ByteStreamService(instance));
-    serverBuilder.addService(new WorkerControl(this));
-    serverBuilder.addService(ProtoReflectionServiceV1.newInstance());
-    serverBuilder.addService(workerProfileService);
+    serverBuilder.addService(new ShutDownWorkerGracefully(this));
+    serverBuilder.addService(ProtoReflectionService.newInstance());
 
+    // We will build a worker's server based on it's capabilities.
+    // A worker that is capable of execution will construct an execution pipeline.
+    // It will use various execution phases for it's profile service.
+    // On the other hand, a worker that is only capable of CAS storage does not need a pipeline.
+    if (configs.getWorker().getCapabilities().isExecution()) {
+      // all claims should be released upon pipeline completion, but it is safe to ensure that
+      // they are whether empty or not, so do so.
+      PutOperationStage completeStage =
+          new ReleaseClaimStage(operation -> context.deactivate(operation.getName()));
+      PipelineStage errorStage = completeStage; /* new ErrorStage(); */
+      SuperscalarPipelineStage reportResultStage =
+          new ReportResultStage(context, completeStage, errorStage);
+      SuperscalarPipelineStage executeActionStage =
+          new ExecuteActionStage(context, reportResultStage, errorStage);
+      PipelineStage releaseClaimAndRequeueStage = new ReleaseClaimStage(context::requeue);
+      SuperscalarPipelineStage inputFetchStage =
+          new InputFetchStage(context, executeActionStage, releaseClaimAndRequeueStage);
+      PipelineStage matchStage =
+          new MatchStage(context, inputFetchStage, releaseClaimAndRequeueStage);
+
+      pipeline.add(matchStage, 4);
+      pipeline.add(inputFetchStage, 3);
+      pipeline.add(executeActionStage, 2);
+      pipeline.add(reportResultStage, 1);
+
+      serverBuilder.addService(
+          new WorkerProfileService(
+              storage,
+              matchStage,
+              inputFetchStage,
+              executeActionStage,
+              reportResultStage,
+              completeStage,
+              backplane));
+    }
     GrpcMetrics.handleGrpcMetricIntercepts(serverBuilder, configs.getWorker().getGrpcMetrics());
     serverBuilder.intercept(new ServerHeadersInterceptor(meta -> {}));
     if (configs.getServer().getMaxInboundMessageSizeBytes() != 0) {
@@ -314,7 +340,7 @@ public final class Worker extends LoggingMain {
     }
   }
 
-  private void initializeExecFileSystem(
+  private ExecFileSystem createExecFileSystem(
       InputStreamFactory remoteInputStreamFactory,
       ExecutorService removeDirectoryService,
       ExecutorService accessRecorder,
@@ -327,6 +353,7 @@ public final class Worker extends LoggingMain {
     checkState(storage != null, "no exec fs cas specified");
     if (storage instanceof CASFileCache cfc) {
       FileSystem fileSystem = cfc.getRoot().getFileSystem();
+      PoolResource execOwnerIndexResource = null;
       ImmutableMap<String, UserPrincipal> owners = ImmutableMap.of();
       // there's some sense that ownerNames might be specifiable as 1, but not 2, and 3 being the
       // minimum passing the config validation
@@ -334,10 +361,7 @@ public final class Worker extends LoggingMain {
         if (!Strings.isNullOrEmpty(ownerName)) {
           owners = ImmutableMap.of(ownerName, getOwner(ownerName, fileSystem));
           execOwnerIndexResource =
-              new PersistentWorkerAwareExecOwnerPool(
-                  PersistentExecutor.workerIndex,
-                  Collections.singleton(ownerName),
-                  REPORT_RESULT_STAGE);
+              new PoolResource(new Dispenser<>(ownerName), REPORT_RESULT_STAGE);
         }
       } else {
         ImmutableMap.Builder<String, UserPrincipal> builder = ImmutableMap.builder();
@@ -350,20 +374,18 @@ public final class Worker extends LoggingMain {
         }
         owners = builder.build();
         execOwnerIndexResource =
-            new PersistentWorkerAwareExecOwnerPool(
-                PersistentExecutor.workerIndex, owners.keySet(), REPORT_RESULT_STAGE);
+            new PoolResource(new ArrayDeque<>(owners.keySet()), REPORT_RESULT_STAGE);
       }
       if (execOwnerIndexResource != null) {
-        resourceSet.resources.put(
-            LocalResourceSet.EXEC_OWNER_RESOURCE_NAME, execOwnerIndexResource);
+        resourceSet.poolResources.put(
+            ShardWorkerContext.EXEC_OWNER_RESOURCE_NAME, execOwnerIndexResource);
       }
 
-      execFileSystem =
-          createCFCExecFileSystem(
-              removeDirectoryService, accessRecorder, fetchService, cfc, owners);
+      return createCFCExecFileSystem(
+          removeDirectoryService, accessRecorder, fetchService, cfc, owners);
     } else {
       // FIXME not the only fuse backing capacity...
-      execFileSystem = createFuseExecFileSystem(remoteInputStreamFactory, storage);
+      return createFuseExecFileSystem(remoteInputStreamFactory, storage);
     }
   }
 
@@ -596,7 +618,7 @@ public final class Worker extends LoggingMain {
                   if (pausedFile.exists() && !isPaused) {
                     isPaused = true;
                     log.log(Level.INFO, "The current worker is paused from taking on new work!");
-                    context.prepareForGracefulShutdown();
+                    pipeline.stopMatchingOperations();
                     workerPausedMetric.inc();
                   }
                 } catch (Exception e) {
@@ -608,7 +630,7 @@ public final class Worker extends LoggingMain {
               void registerIfExpired() {
                 long now = System.currentTimeMillis();
                 if (now >= workerRegistrationExpiresAt
-                    && !context.inGracefulShutdown()
+                    && !inGracefulShutdown
                     && !isWorkerPausedFromNewWork()) {
                   // worker must be registered to match
                   addWorker(nextRegistration(now));
@@ -714,15 +736,16 @@ public final class Worker extends LoggingMain {
             zstdBufferPool,
             configs.getWorker().getStorages());
     // may modify resourceSet to provide additional resources
-    initializeExecFileSystem(
-        remoteInputStreamFactory,
-        removeDirectoryService,
-        accessRecorder,
-        fetchService,
-        storage,
-        resourceSet,
-        configs.getWorker().getExecOwner(),
-        execOwners);
+    execFileSystem =
+        createExecFileSystem(
+            remoteInputStreamFactory,
+            removeDirectoryService,
+            accessRecorder,
+            fetchService,
+            storage,
+            resourceSet,
+            configs.getWorker().getExecOwner(),
+            execOwners);
 
     instance = new WorkerInstance(configs.getWorker().getPublicName(), backplane, storage);
 
@@ -735,7 +758,7 @@ public final class Worker extends LoggingMain {
       writer = new LocalCasWriter(execFileSystem);
     }
 
-    context =
+    ShardWorkerContext context =
         new ShardWorkerContext(
             configs.getWorker().getPublicName(),
             Duration.newBuilder().setSeconds(configs.getWorker().getOperationPollPeriod()).build(),
@@ -763,72 +786,18 @@ public final class Worker extends LoggingMain {
             writer);
 
     pipeline = new Pipeline();
-    SuperscalarPipelineStage inputFetchStage = null;
-    SuperscalarPipelineStage executeActionStage = null;
-    SuperscalarPipelineStage reportResultStage = null;
-    PutOperationStage completeStage = null;
-    if (configs.getWorker().getCapabilities().isExecution()) {
-      // all claims should be released upon pipeline completion, but it is safe to ensure that
-      // they are whether empty or not, so do so.
-      completeStage = new ReleaseClaimStage(operation -> context.deactivate(operation.getName()));
-      PipelineStage errorStage = completeStage; /* new ErrorStage(); */
-      reportResultStage = new ReportResultStage(context, completeStage, errorStage);
-      executeActionStage =
-          new ExecuteActionStage(
-              context, reportResultStage, errorStage, execFileSystem, execOwnerIndexResource);
-      // FIXME this implies and requires that context::requeue performs the context::deactivate
-      // function
-      PipelineStage releaseClaimAndRequeueStage = new ReleaseClaimStage(context::requeue);
-      inputFetchStage =
-          new InputFetchStage(context, executeActionStage, releaseClaimAndRequeueStage);
-      matchStage = new MatchStage(context, inputFetchStage, releaseClaimAndRequeueStage);
-
-      pipeline.add(matchStage, 4);
-      pipeline.add(inputFetchStage, 3);
-      pipeline.add(executeActionStage, 2);
-      pipeline.add(reportResultStage, 1);
-    }
-
-    String workerName = InetAddress.getLocalHost().getHostName();
-
-    WorkerProfileService workerProfileService =
-        new WorkerProfileService(
-            workerName,
-            configs.getWorker().getPublicName(),
-            (CASFileCache) storage,
-            matchStage,
-            inputFetchStage,
-            executeActionStage,
-            reportResultStage,
-            completeStage);
-    server = createServer(serverBuilder, instance, workerProfileService);
+    server = createServer(serverBuilder, (CASFileCache) storage, instance, pipeline, context);
 
     removeWorker(configs.getWorker().getPublicName());
 
     boolean skipLoad = configs.getWorker().getStorages().getFirst().isSkipLoad();
-    ListenableFuture<Void> fileSystemStarted =
-        execFileSystem.start(
-            (digests) -> addBlobsLocation(digests, configs.getWorker().getPublicName()),
-            skipLoad,
-            startWritable);
+    execFileSystem.start(
+        (digests) -> addBlobsLocation(digests, configs.getWorker().getPublicName()), skipLoad);
 
     server.start();
-    Futures.addCallback(
-        fileSystemStarted,
-        new FutureCallback<>() {
-          @Override
-          public void onSuccess(Void result) {
-            healthStatusManager.setStatus(
-                HealthStatusManager.SERVICE_NAME_ALL_SERVICES, ServingStatus.SERVING);
-            PrometheusPublisher.startHttpServer(configs.getPrometheusPort());
-          }
-
-          @Override
-          public void onFailure(Throwable t) {
-            log.log(SEVERE, "execFileSystem start failure", t);
-          }
-        },
-        directExecutor());
+    healthStatusManager.setStatus(
+        HealthStatusManager.SERVICE_NAME_ALL_SERVICES, ServingStatus.SERVING);
+    PrometheusPublisher.startHttpServer(configs.getPrometheusPort());
     startFailsafeRegistration();
 
     pipeline.start();
@@ -848,58 +817,16 @@ public final class Worker extends LoggingMain {
 
   private void awaitTermination() throws InterruptedException {
     pipeline.join();
-    if (server != null && !server.isTerminated()) {
-      int retries = 5;
-      while (retries > 0) {
-        if (shutdownInitiated.get()) {
-          server.shutdown();
-          retries--;
-        }
-        if (server.awaitTermination(shutdownWaitTimeInSeconds, SECONDS)) {
-          retries = 1;
-          break;
-        }
-      }
-      if (retries == 0) {
-        server.shutdownNow();
-        server.awaitTermination();
-      }
-    }
-  }
-
-  public Iterable<PipelineChange> pipelineChange(Iterable<PipelineChange> changes) {
-    for (PipelineChange change : changes) {
-      for (PipelineStage stage : pipeline) {
-        if (change.getStage().equals(stage.getName())) {
-          stage.setPaused(change.getPaused());
-          if (change.getWidth() > 0) {
-            stage.setWidth(change.getWidth());
-          }
-        }
-      }
-    }
-
-    return Iterables.transform(
-        pipeline,
-        stage ->
-            PipelineChange.newBuilder()
-                .setStage(stage.getName())
-                .setPaused(stage.isPaused())
-                .setWidth(stage.getWidth())
-                .build());
+    server.awaitTermination();
   }
 
   public void initiateShutdown() {
-    if (context != null) {
-      context.prepareForGracefulShutdown();
-    }
     if (pipeline != null) {
-      pipeline.interrupt(matchStage);
+      pipeline.stopMatchingOperations();
     }
     if (server != null) {
       server.shutdown();
     }
-    shutdownInitiated.set(true);
   }
 
   private synchronized void awaitRelease() throws InterruptedException {
@@ -940,11 +867,7 @@ public final class Worker extends LoggingMain {
     inputFetchSlotsTotal.set(0);
     if (execFileSystem != null) {
       log.info("Stopping exec filesystem");
-      try {
-        execFileSystem.stop();
-      } catch (IOException e) {
-        log.log(SEVERE, "error shutting down exec filesystem", e);
-      }
+      execFileSystem.stop();
       execFileSystem = null;
     }
     if (server != null) {

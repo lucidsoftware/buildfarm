@@ -33,7 +33,6 @@ import build.buildfarm.common.ProxyDirectoriesIndex;
 import build.buildfarm.v1test.ExecuteEntry;
 import build.buildfarm.v1test.QueuedOperation;
 import build.buildfarm.v1test.Tree;
-import build.buildfarm.worker.filesystem.ExecDirException;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Stopwatch;
 import com.google.common.collect.Iterables;
@@ -63,19 +62,6 @@ public class InputFetcher implements Runnable {
   private final InputFetchStage owner;
   private final Executor pollerExecutor;
   private boolean success = false;
-  private boolean polling = false;
-  private volatile boolean stalled = false;
-
-  private class StallState implements AutoCloseable {
-    StallState() {
-      stalled = true;
-    }
-
-    @Override
-    public void close() {
-      stalled = false;
-    }
-  }
 
   InputFetcher(
       WorkerContext workerContext,
@@ -126,13 +112,10 @@ public class InputFetcher implements Runnable {
         Thread.currentThread()::interrupt,
         Deadline.after(workerContext.getInputFetchDeadline(), SECONDS),
         pollerExecutor);
-    polling = true;
     try {
       return fetchPolled(stopwatch);
     } finally {
-      if (polling) {
-        executionContext.poller.pause();
-      }
+      executionContext.poller.pause();
     }
   }
 
@@ -250,8 +233,7 @@ public class InputFetcher implements Runnable {
               executionContext.queueEntry.getExecuteEntry().getActionDigest().getDigestFunction(),
               queuedOperation.getAction(),
               queuedOperation.getCommand(),
-              executionContext.claim.getOwner(),
-              executionContext.workerExecutedMetadata);
+              executionContext.claim.owner());
     } catch (IOException e) {
       Status.Builder status = Status.newBuilder().setMessage("Error creating exec dir");
       if (e instanceof ExecDirException execDirEx) {
@@ -301,13 +283,6 @@ public class InputFetcher implements Runnable {
     }
   }
 
-  public boolean isStalled() {
-    return stalled;
-  }
-
-  @SuppressWarnings(
-      "PMD.UnusedLocalVariable") // PMD thinks that the try-with-resources is not used. See
-  // https://github.com/pmd/pmd/issues/5747
   private void proceedToOutput(Action action, Command command, Path execDir, Tree tree)
       throws InterruptedException {
     // switch poller to disable deadline
@@ -320,6 +295,7 @@ public class InputFetcher implements Runnable {
         Thread.currentThread()::interrupt,
         Deadline.after(10, DAYS),
         pollerExecutor);
+
     ExecutionContext fetchedExecutionContext =
         executionContext.toBuilder()
             .setExecDir(execDir)
@@ -327,11 +303,7 @@ public class InputFetcher implements Runnable {
             .setCommand(command)
             .setTree(tree)
             .build();
-    boolean claimed;
-    // PMD exemption false positive: unused variable
-    try (StallState state = new StallState()) {
-      claimed = owner.output().claim(fetchedExecutionContext);
-    }
+    boolean claimed = owner.output().claim(fetchedExecutionContext);
     executionContext.poller.pause();
     if (claimed) {
       try {
@@ -346,7 +318,6 @@ public class InputFetcher implements Runnable {
 
       owner.error().put(fetchedExecutionContext);
     }
-    polling = false;
   }
 
   @Override

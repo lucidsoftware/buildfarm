@@ -222,7 +222,7 @@ server:
 | workersHashName                    | String, _Workers_                        |                 |                       | Redis key used to store a hash of registered workers                                                                                                                                         |
 | workerChannel                      | String, _WorkerChannel_                  |                 |                       | Redis pubsub channel key where changes of the cluster membership are announced                                                                                                               |
 | actionCachePrefix                  | String, _ActionCache_                    |                 |                       | Redis key prefix for all ActionCache entries                                                                                                                                                 |
-| actionCacheExpire                  | Integer, _2419200_                       |                 |                       | The TTL maintained for ActionCache entries, refreshed on getActionResult hit                                                                                                             |
+| actionCacheExpire                  | Integer, _2419200_                       |                 |                       | The TTL maintained for ActionCache entries, not refreshed on getActionResult hit                                                                                                             |
 | actionBlacklistPrefix              | String, _ActionBlacklist_                |                 |                       | Redis key prefix for all blacklisted actions, which are rejected                                                                                                                             |
 | actionBlacklistExpire              | Integer, _3600_                          |                 |                       | The TTL maintained for action blacklist entries                                                                                                                                              |
 | invocationBlacklistPrefix          | String, _InvocationBlacklist_            |                 |                       | Redis key prefix for blacklisted invocations, suffixed with a a tool invocation ID                                                                                                           |
@@ -239,7 +239,7 @@ server:
 | dispatchedOperationsHashName       | String, _DispatchedOperations_           |                 |                       | Redis key of a hash of operation names to the worker lease for its execution, which are monitored by the dispatched monitor                                                                  |
 | operationChannelPrefix             | String, _OperationChannel_               |                 |                       | Redis pubsub channel prefix suffixed by an operation name                                                                                                                                    |
 | casPrefix                          | String, _ContentAddressableStorage_      |                 |                       | Redis key prefix suffixed with a blob digest that maps to a set of workers with that blob's availability                                                                                     |
-| casExpire                          | Integer, _604800_                        |                 |                       | The TTL maintained for CAS entries, which is refreshed on any read access of the blob                                                                                                    |
+| casExpire                          | Integer, _604800_                        |                 |                       | The TTL maintained for CAS entries, which is not refreshed on any read access of the blob                                                                                                    |
 | subscribeToBackplane               | boolean, _true_                          |                 |                       | Enable an agent of the backplane client which subscribes to worker channel and operation channel events. If disabled, responsiveness of watchers and CAS are reduced                         |
 | runFailsafeOperation               | boolean, _true_                          |                 |                       | Enable an agent in the backplane client which monitors watched operations and ensures they are in a known maintained, or expirable state                                                     |
 | maxQueueDepth                      | Integer, _100000_                        |                 |                       | Maximum length that the ready to run queue is allowed to reach to control an arrival flow for execution                                                                                      |
@@ -248,7 +248,6 @@ server:
 | timeout                            | Integer, _10000_                         |                 |                       | Default timeout                                                                                                                                                                              |
 | maxInvocationIdTimeout             | Integer, _604800_                        |                 |                       | Maximum TTL (Time-to-Live in second) of invocationId keys in RedisBackplane                                                                                                                  |
 | maxAttempts                        | Integer, _20_                            |                 |                       | Maximum number of execution attempts                                                                                                                                                         |
-| connectionValidatedOnBorrow        | boolean, _false_                         |                 |                       | Whether to validate Redis connections when borrowing from the pool                                                                                                                                                         |
 
 
 Example:
@@ -309,7 +308,7 @@ backplane:
 | allowBringYourOwnContainer        | boolean, _false_              |                       | Enable execution in a custom Docker container                                                                                                                                                                                                                                                                            |
 | errorOperationRemainingResources  | boolean, _false_              |                       |                                                                                                                                                                                                                                                                                                                          |
 | errorOperationOutputSizeExceeded  | boolean, _false_              |                       | Operations which produce single output files which exceed maxEntrySizeBytes will fail with a violation type which implies a user error. When disabled, the violation will indicate a transient error, with the action blacklisted.                                                                                       |
-| linkedInputDirectories            | List of Strings, _^(?!external$).*$_ |                       | A list of regular expressions matching input directories which will be subject to the effects of linkInputDirectories setting |
+| realInputDirectories              | List of Strings, _external_   |                       | A list of paths that will not be subject to the effects of linkInputDirectories setting, may also be used to provide writable directories as input roots for actions which expect to be able to write to an input location and will fail if they cannot                                                                  |
 | gracefulShutdownSeconds           | Integer, 0                    |                       | Time in seconds to allow for operations in flight to finish when shutdown signal is received                                                                                                                                                                                                                             |
 | createSymlinkOutputs              | boolean, _false_              |                       | Creates SymlinkNodes for symbolic links discovered in output paths for actions. No verification of the symlink target path occurs. Buildstream, for example, requires this.                                                                                                                                              |
 | zstdBufferPoolSize                | Integer, _2048_               |                       | Specifies the maximum number of zstd data buffers that may be in use concurrently by the filesystem CAS. Increase to improve compressed blob throughput, decrease to reduce memory usage.                                                                                                                                |
@@ -319,8 +318,8 @@ backplane:
 worker:
   port: 8981
   publicName: "localhost:8981"
-  linkedInputDirectories:
-    - "^path/to/common/directory"
+  realInputDirectories:
+    - "external"
 ```
 
 ### Capabilities
@@ -460,7 +459,6 @@ worker:
 | Configuration    | Accepted and _Default_ Values                              | Description                                                         |
 |------------------|------------------------------------------------------------|---------------------------------------------------------------------|
 | name             | String                                                     | Execution policy name                                               |
-| prioritized      | Boolean, _false_                                           | If true, policy will run before built-in policies                   |
 | executionWrapper | Execution wrapper, containing a path and list of arguments | Execution wrapper, its path and a list of arguments for the wrapper |
 
 Example:
@@ -468,40 +466,15 @@ Example:
 ```yaml
 worker:
   executionPolicies:
-    - name: as-nobody
-      prioritized: true
-      executionWrapper:
-        path: /app/build_buildfarm/as-nobody
-        arguments:
-          - "-u"
-          - "<exec-owner>"
-    - name: unshare
-      executionWrapper:
-        path: /usr/bin/unshare
-        arguments:
-          - "-n"
-          - "-r"
-    - name: linux-sandbox
-      executionWrapper:
-        path: /app/build_buildfarm/linux-sandbox
-        arguments:
-          # use "--" to signal the end of linux-sandbox args. "--" should always be last!
-          - "--"
     - name: test
       executionWrapper:
-        path: /YOUR/WRAPPER
+        path: /
         arguments:
           - arg1
           - arg2
           - "<platform-property-name>"
 ```
 
-`arg1` and `arg2` are interpreted literally. `<platform-property-value>` will be substituted with the value of a property named `"platform-property-name"` from a Command's Platform _or_ the requested pool resources for the execution. If a matching property or pool resource is not found for a specified name, the entire wrapper will be discarded and have no effect on the execution.
+_arg1_ and _arg2_ are interpreted literally. _<platform-property-value>_ will be substituted with the value of a property named `"platform-property-name"` from a Command's Platform _or_ the requested pool resources for the execution. If a matching property or pool resource is not found for a specified name, the entire wrapper will be discarded and have no effect on the execution.
 
-`<exec-owner>` is an automatically provided pool resource when `execOwner` or `execOwners` is specified, and will contain the value of the execution's owner selected for exec tree creation.
-
-An execution with `as-nobody`, `unshare`, and `linux-sandbox` execution policies enabled would produce a command line like:
-```sh
-/app/build_buildfarm/as-nobody -u <exec-owner> /usr/bin/unshare -n -r /app/build_buildfarm/linux-sandbox -- /YOUR/WRAPPER arg1 arg2 <platform-property-name> ACTION
-```
-where ACTION is the Command from remote execution action.
+_<exec-owner>_ is an automatically provided pool resource when `execOwner` or `execOwners` is specified, and will contain the value of the execution's owner selected for exec tree creation.

@@ -8,23 +8,18 @@ import org.apache.commons.pool2.impl.DefaultPooledObject;
 import persistent.common.CommonsSupervisor;
 
 public abstract class WorkerSupervisor extends CommonsSupervisor<WorkerKey, PersistentWorker> {
+  public static WorkerSupervisor simple() {
+    return new WorkerSupervisor() {
+      @Override
+      public PersistentWorker create(WorkerKey workerKey) throws Exception {
+        return new PersistentWorker(workerKey, "");
+      }
+    };
+  }
+
   private final Logger logger = Logger.getLogger(this.getClass().getName());
-  private final WorkerIndex workerIndex;
 
-  public WorkerSupervisor(WorkerIndex workerIndex) {
-    this.workerIndex = workerIndex;
-  }
-
-  public abstract PersistentWorker createUnderlying(WorkerKey workerKey) throws Exception;
-
-  public final PersistentWorker create(WorkerKey key) throws Exception {
-    PersistentWorker worker = createUnderlying(key);
-
-    // The worker is about to be entered into the pool, so add it to the index
-    workerIndex.registerWorker(worker);
-
-    return worker;
-  }
+  public abstract PersistentWorker create(WorkerKey workerKey) throws Exception;
 
   @Override
   public PooledObject<PersistentWorker> wrap(PersistentWorker persistentWorker) {

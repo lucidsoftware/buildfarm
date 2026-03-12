@@ -1,3 +1,11 @@
-backplane: !include "backplane.yml"
-server: !include "server.yml"
-worker: !include "worker.yml"
+backplane:
+  redisUri: redis://localhost:6379
+  queues:
+  - name: cpu
+    properties:
+    - name: '*'
+      value: '*'
+worker:
+  publicName: localhost:8981
+  dequeueMatchSettings:
+    allowUnmatched: true

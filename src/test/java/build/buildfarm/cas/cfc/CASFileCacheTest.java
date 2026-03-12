@@ -47,6 +47,7 @@ import build.buildfarm.cas.ContentAddressableStorage.Blob;
 import build.buildfarm.cas.DigestMismatchException;
 import build.buildfarm.cas.cfc.CASFileCache.CancellableOutputStream;
 import build.buildfarm.cas.cfc.CASFileCache.Entry;
+import build.buildfarm.cas.cfc.CASFileCache.StartupCacheResults;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.DigestUtil.HashFunction;
 import build.buildfarm.common.InputStreamFactory;
@@ -196,7 +197,7 @@ class CASFileCacheTest {
     ByteString blob = ByteString.copyFromUtf8("Hello, World");
     Digest blobDigest = DIGEST_UTIL.compute(blob);
     blobs.put(blobDigest, blob);
-    Path path = fileCache.put(blobDigest, false).path();
+    Path path = fileCache.put(blobDigest, false);
     assertThat(Files.exists(path)).isTrue();
   }
 
@@ -220,7 +221,7 @@ class CASFileCacheTest {
     ByteString blob = ByteString.copyFromUtf8("executable");
     Digest blobDigest = DIGEST_UTIL.compute(blob);
     blobs.put(blobDigest, blob);
-    Path path = fileCache.put(blobDigest, true).path();
+    Path path = fileCache.put(blobDigest, true);
     assertThat(Files.isExecutable(path)).isTrue();
   }
 
@@ -300,7 +301,7 @@ class CASFileCacheTest {
     ByteString bigBlob = ByteString.copyFrom(bigData);
     Digest bigDigest = DIGEST_UTIL.compute(bigBlob);
     blobs.put(bigDigest, bigBlob);
-    Path bigPath = fileCache.put(bigDigest, false).path();
+    Path bigPath = fileCache.put(bigDigest, false);
 
     decrementReference(bigPath);
 
@@ -308,23 +309,28 @@ class CASFileCacheTest {
     ByteString strawBlob = ByteString.copyFrom(strawData);
     Digest strawDigest = DIGEST_UTIL.compute(strawBlob);
     blobs.put(strawDigest, strawBlob);
-    Path strawPath = fileCache.put(strawDigest, false).path();
+    Path strawPath = fileCache.put(strawDigest, false);
 
     assertThat(Files.exists(bigPath)).isFalse();
     assertThat(Files.exists(strawPath)).isTrue();
   }
 
   @Test
-  public void startEmptyCas() throws Exception {
+  public void startEmptyCas() throws IOException, InterruptedException {
     // start the file cache with no files.
     // the cache should start without any initial files in the cache.
-    fileCache.start(false).get();
+    StartupCacheResults results = fileCache.start(false);
 
-    assertThat(storage).isEmpty();
+    // check the startuo results to ensure no files were processed
+    assertThat(results.load().loadSkipped()).isFalse();
+    assertThat(results.load().scan().computeDirs().size()).isEqualTo(0);
+    assertThat(results.load().scan().deleteFiles().size()).isEqualTo(0);
+    assertThat(results.load().scan().fileKeys().size()).isEqualTo(0);
+    assertThat(results.load().invalidDirectories().size()).isEqualTo(0);
   }
 
   @Test
-  public void startCasAssumeDirectory() throws Exception {
+  public void startCasAssumeDirectory() throws IOException, InterruptedException {
     // create a "_dir" file on the root
     Path path = root.resolve("foobar_dir");
     ByteString blob = ByteString.copyFromUtf8("content");
@@ -332,15 +338,18 @@ class CASFileCacheTest {
 
     // start the CAS with a file whose name indicates its a directory
     // the cache should start and consider it a compute directory
-    fileCache.start(false).get();
+    StartupCacheResults results = fileCache.start(false);
 
-    // check the current state to ensure no files were processed
-    assertThat(Files.exists(path)).isFalse();
-    assertThat(storage.isEmpty());
+    // check the startup results to ensure no files were processed
+    assertThat(results.load().loadSkipped()).isFalse();
+    assertThat(results.load().scan().computeDirs().size()).isEqualTo(0);
+    assertThat(results.load().scan().deleteFiles().size()).isEqualTo(1);
+    assertThat(results.load().scan().fileKeys().size()).isEqualTo(0);
+    assertThat(results.load().invalidDirectories().size()).isEqualTo(0);
   }
 
   @Test
-  public void startLoadsExistingBlob() throws Exception {
+  public void startLoadsExistingBlob() throws IOException, InterruptedException {
     FileStore fileStore = Files.getFileStore(root);
     ByteString blob = ByteString.copyFromUtf8("blob");
     Digest blobDigest = DIGEST_UTIL.compute(blob);
@@ -351,19 +360,24 @@ class CASFileCacheTest {
     Files.write(execPath, blob.toByteArray());
     EvenMoreFiles.setReadOnlyPerms(execPath, true, fileStore);
 
-    fileCache.start(false).get();
+    StartupCacheResults results = fileCache.start(false);
 
-    assertThat(storage.size()).isEqualTo(2);
+    // check the startup results to ensure our two files were processed
+    assertThat(results.load().loadSkipped()).isFalse();
+    assertThat(results.load().scan().computeDirs().size()).isEqualTo(0);
+    assertThat(results.load().scan().deleteFiles().size()).isEqualTo(0);
+    assertThat(results.load().scan().fileKeys().size()).isEqualTo(2);
+    assertThat(results.load().invalidDirectories().size()).isEqualTo(0);
 
     // explicitly not providing blob via blobs, this would throw if fetched from factory
     //
     // FIXME https://github.com/google/truth/issues/285 assertThat(Path) is ambiguous
-    assertThat(fileCache.put(blobDigest, false).path().equals(path)).isTrue();
-    assertThat(fileCache.put(blobDigest, true).path().equals(execPath)).isTrue();
+    assertThat(fileCache.put(blobDigest, false).equals(path)).isTrue();
+    assertThat(fileCache.put(blobDigest, true).equals(execPath)).isTrue();
   }
 
   @Test
-  public void startSkipsLoadingExistingBlob() throws Exception {
+  public void startSkipsLoadingExistingBlob() throws IOException, InterruptedException {
     FileStore fileStore = Files.getFileStore(root);
     ByteString blob = ByteString.copyFromUtf8("blob");
     Digest blobDigest = DIGEST_UTIL.compute(blob);
@@ -374,16 +388,18 @@ class CASFileCacheTest {
     Files.write(execPath, blob.toByteArray());
     EvenMoreFiles.setReadOnlyPerms(execPath, true, fileStore);
 
-    fileCache.start(/* skipLoad= */ true).get();
+    StartupCacheResults results = fileCache.start(/* skipLoad= */ true);
 
-    // check the current state to ensure our two files were processed
-    assertThat(storage).isEmpty();
-    assertThat(Files.exists(path));
-    assertThat(Files.exists(execPath));
+    // check the startup results to ensure our two files were processed
+    assertThat(results.load().loadSkipped()).isTrue();
+    assertThat(results.load().scan().computeDirs().size()).isEqualTo(0);
+    assertThat(results.load().scan().deleteFiles().size()).isEqualTo(0);
+    assertThat(results.load().scan().fileKeys().size()).isEqualTo(0);
+    assertThat(results.load().invalidDirectories().size()).isEqualTo(0);
   }
 
   @Test
-  public void startRemovesInvalidEntries() throws Exception {
+  public void startRemovesInvalidEntries() throws IOException, InterruptedException {
     Path tooFewComponents = root.resolve("00").resolve("toofewcomponents");
     Path tooManyComponents = root.resolve("00").resolve("too_many_components_here");
     Path invalidDigest = root.resolve("00").resolve("digest");
@@ -397,7 +413,7 @@ class CASFileCacheTest {
     Files.write(
         invalidExec, validBlob.toByteArray()); // content would match but for invalid exec field
 
-    fileCache.start(/* skipLoad= */ false).get();
+    fileCache.start(/* skipLoad= */ false);
 
     assertThat(Files.exists(tooFewComponents)).isFalse();
     assertThat(Files.exists(tooManyComponents)).isFalse();
@@ -433,7 +449,7 @@ class CASFileCacheTest {
     ByteString bigContent = ByteString.copyFrom(bigData);
     Digest bigDigest = DIGEST_UTIL.compute(bigContent);
     blobs.put(bigDigest, bigContent);
-    Path bigPath = fileCache.put(bigDigest, /* isExecutable= */ false).path();
+    Path bigPath = fileCache.put(bigDigest, /* isExecutable= */ false);
 
     AtomicBoolean started = new AtomicBoolean(false);
     ExecutorService service = newSingleThreadExecutor();
@@ -463,9 +479,7 @@ class CASFileCacheTest {
   }
 
   @Test
-  public void containsRecordsAccess() throws Exception {
-    fileCache.start(false).get();
-
+  public void containsRecordsAccess() throws IOException, InterruptedException {
     ByteString contentOne = ByteString.copyFromUtf8("one");
     Digest digestOne = DIGEST_UTIL.compute(contentOne);
     blobs.put(digestOne, contentOne);
@@ -476,21 +490,19 @@ class CASFileCacheTest {
     Digest digestThree = DIGEST_UTIL.compute(contentThree);
     blobs.put(digestThree, contentThree);
 
-    String pathOne =
-        fileCache.put(digestOne, /* isExecutable= */ false).path().getFileName().toString();
-    String pathTwo =
-        fileCache.put(digestTwo, /* isExecutable= */ false).path().getFileName().toString();
+    String pathOne = fileCache.put(digestOne, /* isExecutable= */ false).getFileName().toString();
+    String pathTwo = fileCache.put(digestTwo, /* isExecutable= */ false).getFileName().toString();
     String pathThree =
-        fileCache.put(digestThree, /* isExecutable= */ false).path().getFileName().toString();
+        fileCache.put(digestThree, /* isExecutable= */ false).getFileName().toString();
     fileCache.decrementReferences(
         ImmutableList.of(pathOne, pathTwo, pathThree),
         ImmutableList.of(),
         DIGEST_UTIL.getDigestFunction());
-    /* sentinel <- three <- two <- one <- sentinel */
+    /* three -> two -> one */
     assertThat(storage.get(pathOne).after).isEqualTo(storage.get(pathTwo));
     assertThat(storage.get(pathTwo).after).isEqualTo(storage.get(pathThree));
 
-    /* sentinel <- one <- three <- two <- sentinel */
+    /* one -> three -> two */
     assertThat(
             fileCache.findMissingBlobs(
                 ImmutableList.of(DigestUtil.toDigest(digestOne)), digestOne.getDigestFunction()))
@@ -888,14 +900,12 @@ class CASFileCacheTest {
     }
     blobs.put(expiringBlob.getDigest(), expiringBlob.getData());
     decrementReference(
-        fileCache
-            .put(expiringBlob.getDigest(), /* isExecutable= */ false)
-            .path()); // expected eviction
+        fileCache.put(expiringBlob.getDigest(), /* isExecutable= */ false)); // expected eviction
     blobs.clear();
     decrementReference(
-        fileCache
-            .put(expiringBlob.getDigest(), /* isExecutable= */ true)
-            .path()); // should be fed from storage directly, not through delegate
+        fileCache.put(
+            expiringBlob.getDigest(),
+            /* isExecutable= */ true)); // should be fed from storage directly, not through delegate
 
     fileCache.put(new Blob(ByteString.copyFromUtf8("Hello, World"), DIGEST_UTIL));
 
@@ -1195,7 +1205,7 @@ class CASFileCacheTest {
     ByteString blob = ByteString.copyFromUtf8("Flaky Entry");
     Digest blobDigest = DIGEST_UTIL.compute(blob);
     blobs.put(blobDigest, blob);
-    Path path = flakyExternalCAS.put(blobDigest, false).path();
+    Path path = flakyExternalCAS.put(blobDigest, false);
     assertThat(Files.exists(path)).isTrue(); // would not have been created if not valid
   }
 

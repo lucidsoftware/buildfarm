@@ -20,9 +20,7 @@ import com.google.devtools.build.lib.worker.WorkerProtocol.Input;
 import com.google.protobuf.ByteString;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.nio.file.attribute.UserPrincipal;
 import java.util.List;
-import javax.annotation.Nullable;
 import lombok.extern.java.Log;
 
 @Log
@@ -67,9 +65,9 @@ public class WorkerInputs {
     return newRoot.resolve(opRoot.relativize(input));
   }
 
-  public void copyInputFile(Path from, Path to, @Nullable UserPrincipal owner) throws IOException {
+  public void copyInputFile(Path from, Path to) throws IOException {
     checkFileIsInput("copyInputFile()", from);
-    FileAccessUtils.copyFile(from, to, owner);
+    FileAccessUtils.copyFile(from, to);
   }
 
   public void deleteInputFileIfExists(Path workerExecRoot, Path opPathInput) throws IOException {

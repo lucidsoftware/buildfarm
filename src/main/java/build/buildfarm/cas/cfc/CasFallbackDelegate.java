@@ -45,11 +45,11 @@ public class CasFallbackDelegate {
       @Nullable ContentAddressableStorage delegate,
       Consumer<Digest> onStartPut,
       ExecutorService removeDirectoryService,
-      boolean skipLoad,
-      boolean readonly) {
+      boolean skipLoad)
+      throws IOException, InterruptedException {
     // start delegate if we specifically have a CASFileCache
     if (delegate instanceof CASFileCache fileCacheDelegate) {
-      fileCacheDelegate.start(onStartPut, removeDirectoryService, skipLoad, readonly);
+      fileCacheDelegate.start(onStartPut, removeDirectoryService, skipLoad);
     }
   }
 
