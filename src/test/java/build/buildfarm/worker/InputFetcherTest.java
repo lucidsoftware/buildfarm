@@ -34,9 +34,7 @@ import build.buildfarm.v1test.Digest;
 import build.buildfarm.v1test.ExecuteEntry;
 import build.buildfarm.v1test.QueueEntry;
 import build.buildfarm.v1test.QueuedOperation;
-import build.buildfarm.v1test.WorkerExecutedMetadata;
-import build.buildfarm.worker.filesystem.ExecDirException;
-import build.buildfarm.worker.filesystem.ExecDirException.ViolationException;
+import build.buildfarm.worker.ExecDirException.ViolationException;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import com.google.longrunning.Operation;
@@ -100,8 +98,7 @@ public class InputFetcherTest {
               DigestFunction.Value digestFunction,
               Action action,
               Command command,
-              UserPrincipal owner,
-              WorkerExecutedMetadata.Builder workerExecutedMetadata)
+              UserPrincipal owner)
               throws IOException {
             Path root = Path.of(operationName);
             throw new ExecDirException(

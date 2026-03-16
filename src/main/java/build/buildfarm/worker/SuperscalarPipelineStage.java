@@ -14,8 +14,6 @@
 
 package build.buildfarm.worker;
 
-import static com.google.common.base.Preconditions.checkState;
-
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -29,10 +27,9 @@ import lombok.Getter;
 public abstract class SuperscalarPipelineStage extends PipelineStage {
   private final BlockingQueue<ExecutionContext> queue = new ArrayBlockingQueue<>(1);
   protected Set<String> operationNames = new HashSet<>();
-  @Getter protected int width;
+  @Getter protected final int width;
 
   protected final BlockingQueue<Object> claims;
-  private int suppressReleases = 0;
 
   protected final ThreadPoolExecutor executor;
   protected final ThreadPoolExecutor pollerExecutor;
@@ -51,12 +48,7 @@ public abstract class SuperscalarPipelineStage extends PipelineStage {
       int width) {
     super(name, workerContext, output, error);
     this.width = width;
-    claims = new LinkedBlockingQueue<>();
-    Object handle = new Object();
-    for (int i = 0; i < width; i++) {
-      claims.offer(handle);
-    }
-    checkState(claims.size() == width);
+    claims = new ArrayBlockingQueue<>(width);
     executor =
         new ThreadPoolExecutor(
             width,
@@ -169,16 +161,11 @@ public abstract class SuperscalarPipelineStage extends PipelineStage {
   }
 
   protected synchronized void releaseClaim(String operationName, int slots) {
-    Object handle = new Object();
     // clear interrupted flag for take
     boolean interrupted = Thread.interrupted();
     try {
       for (int i = 0; i < slots; i++) {
-        if (suppressReleases > 0) {
-          suppressReleases--;
-        } else {
-          claims.put(handle);
-        }
+        claims.take();
       }
     } catch (InterruptedException e) {
       catastrophic = true;
@@ -198,38 +185,27 @@ public abstract class SuperscalarPipelineStage extends PipelineStage {
     }
   }
 
-  @Override
-  public synchronized void setWidth(int width) {
-    int difference = width - this.width;
-    if (difference > 0) {
-      releaseClaim("stage width increase", difference);
-    } else {
-      suppressReleases -= difference;
-    }
-    this.width = width;
-  }
-
   protected String getUsage(int size) {
     return String.format("%s/%d", size, width);
   }
 
   @SuppressWarnings("unchecked")
   private boolean claim(int count) throws InterruptedException {
+    Object handle = new Object();
     int claimed = 0;
     synchronized (claimLock) {
       while (count > 0 && !isClosed()) {
         try {
-          if (claims.poll(10, TimeUnit.MILLISECONDS) != null) {
+          if (claims.offer(handle, 10, TimeUnit.MILLISECONDS)) {
             claimed++;
             count--;
           }
         } catch (InterruptedException e) {
           boolean interrupted = Thread.interrupted();
-          Object handle = new Object();
           while (claimed != 0) {
             interrupted = Thread.interrupted() || interrupted;
             try {
-              claims.put(handle);
+              claims.take();
               claimed--;
             } catch (InterruptedException intEx) {
               // ignore, we must release our claims
@@ -258,7 +234,7 @@ public abstract class SuperscalarPipelineStage extends PipelineStage {
 
   @Override
   protected boolean isClaimed() {
-    return claims.size() + suppressReleases != width;
+    return !claims.isEmpty();
   }
 
   @Override

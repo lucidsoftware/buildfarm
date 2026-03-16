@@ -107,7 +107,7 @@ public class DigestUtilTest {
   @Test
   public void computeEmptyIsCachedEmpty() {
     DigestUtil digestUtil = new DigestUtil(HashFunction.BLAKE3);
-    Digest digest = digestUtil.compute(ByteString.EMPTY);
+    Digest digest = digestUtil.compute(ByteString.empty());
     // reference comparison
     assertThat(digest == digestUtil.empty()).isTrue();
   }

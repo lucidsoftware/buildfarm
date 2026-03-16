@@ -14,8 +14,11 @@
 
 package build.buildfarm.worker.shard;
 
+import build.buildfarm.backplane.Backplane;
 import build.buildfarm.cas.cfc.CASFileCache;
 import build.buildfarm.v1test.StageInformation;
+import build.buildfarm.v1test.WorkerListMessage;
+import build.buildfarm.v1test.WorkerListRequest;
 import build.buildfarm.v1test.WorkerProfileGrpc;
 import build.buildfarm.v1test.WorkerProfileMessage;
 import build.buildfarm.v1test.WorkerProfileRequest;
@@ -25,35 +28,34 @@ import build.buildfarm.worker.PutOperationStage.OperationStageDurations;
 import build.buildfarm.worker.SuperscalarPipelineStage;
 import com.google.common.base.Strings;
 import io.grpc.stub.StreamObserver;
+import java.io.IOException;
 import javax.annotation.Nullable;
 
 public class WorkerProfileService extends WorkerProfileGrpc.WorkerProfileImplBase {
-  private final String name;
-  private final String endpoint;
   private final @Nullable CASFileCache storage;
-  private final @Nullable PipelineStage matchStage;
-  private final @Nullable SuperscalarPipelineStage inputFetchStage;
-  private final @Nullable SuperscalarPipelineStage executeActionStage;
-  private final @Nullable SuperscalarPipelineStage reportResultStage;
-  private final @Nullable PutOperationStage completeStage;
+  private final PipelineStage matchStage;
+  private final SuperscalarPipelineStage inputFetchStage;
+  private final SuperscalarPipelineStage executeActionStage;
+  private final SuperscalarPipelineStage reportResultStage;
+  private final PutOperationStage completeStage;
+  private final Backplane backplane;
 
   public WorkerProfileService(
-      String name,
-      String endpoint,
       @Nullable CASFileCache storage,
-      @Nullable PipelineStage matchStage,
-      @Nullable SuperscalarPipelineStage inputFetchStage,
-      @Nullable SuperscalarPipelineStage executeActionStage,
-      @Nullable SuperscalarPipelineStage reportResultStage,
-      @Nullable PutOperationStage completeStage) {
-    this.name = name;
-    this.endpoint = endpoint;
+      PipelineStage matchStage,
+      SuperscalarPipelineStage inputFetchStage,
+      SuperscalarPipelineStage executeActionStage,
+      SuperscalarPipelineStage reportResultStage,
+      PutOperationStage completeStage,
+      Backplane backplane) {
+    super();
     this.storage = storage;
     this.matchStage = matchStage;
     this.inputFetchStage = inputFetchStage;
     this.executeActionStage = executeActionStage;
     this.reportResultStage = reportResultStage;
     this.completeStage = (PutOperationStage) completeStage;
+    this.backplane = backplane;
   }
 
   private StageInformation unaryStageInformation(String name, @Nullable String operationName) {
@@ -78,8 +80,7 @@ public class WorkerProfileService extends WorkerProfileGrpc.WorkerProfileImplBas
   public void getWorkerProfile(
       WorkerProfileRequest request, StreamObserver<WorkerProfileMessage> responseObserver) {
     // get usage of CASFileCache
-    WorkerProfileMessage.Builder replyBuilder =
-        WorkerProfileMessage.newBuilder().setName(name).setEndpoint(endpoint);
+    WorkerProfileMessage.Builder replyBuilder = WorkerProfileMessage.newBuilder();
 
     // FIXME deliver full local storage chain
     if (storage != null) {
@@ -100,34 +101,40 @@ public class WorkerProfileService extends WorkerProfileGrpc.WorkerProfileImplBas
     // produce: slots that are not consistent with operations, operations
     // in multiple stages even in reverse due to claim progress
     // in short: this is for monitoring, not for guaranteed consistency checks
-    if (matchStage != null
-        && inputFetchStage != null
-        && executeActionStage != null
-        && reportResultStage != null) {
-      String matchOperation = matchStage.getOperationName();
-      replyBuilder
-          .addStages(superscalarStageInformation(reportResultStage))
-          .addStages(superscalarStageInformation(executeActionStage))
-          .addStages(superscalarStageInformation(inputFetchStage))
-          .addStages(unaryStageInformation(matchStage.getName(), matchOperation));
-    }
+    String matchOperation = matchStage.getOperationName();
+    replyBuilder
+        .addStages(superscalarStageInformation(reportResultStage))
+        .addStages(superscalarStageInformation(executeActionStage))
+        .addStages(superscalarStageInformation(inputFetchStage))
+        .addStages(unaryStageInformation(matchStage.getName(), matchOperation));
 
     // get average time costs on each stage
-    if (completeStage != null) {
-      OperationStageDurations[] durations = completeStage.getAverageTimeCostPerStage();
-      for (OperationStageDurations duration : durations) {
-        replyBuilder
-            .addTimesBuilder()
-            .setQueuedToMatch(duration.queuedToMatch)
-            .setMatchToInputFetchStart(duration.matchToInputFetchStart)
-            .setInputFetchStartToComplete(duration.inputFetchStartToComplete)
-            .setInputFetchCompleteToExecutionStart(duration.inputFetchCompleteToExecutionStart)
-            .setExecutionStartToComplete(duration.executionStartToComplete)
-            .setExecutionCompleteToOutputUploadStart(duration.executionCompleteToOutputUploadStart)
-            .setOutputUploadStartToComplete(duration.outputUploadStartToComplete)
-            .setOperationCount(duration.operationCount)
-            .setPeriod(duration.period);
-      }
+    OperationStageDurations[] durations = completeStage.getAverageTimeCostPerStage();
+    for (OperationStageDurations duration : durations) {
+      replyBuilder
+          .addTimesBuilder()
+          .setQueuedToMatch(duration.queuedToMatch)
+          .setMatchToInputFetchStart(duration.matchToInputFetchStart)
+          .setInputFetchStartToComplete(duration.inputFetchStartToComplete)
+          .setInputFetchCompleteToExecutionStart(duration.inputFetchCompleteToExecutionStart)
+          .setExecutionStartToComplete(duration.executionStartToComplete)
+          .setExecutionCompleteToOutputUploadStart(duration.executionCompleteToOutputUploadStart)
+          .setOutputUploadStartToComplete(duration.outputUploadStartToComplete)
+          .setOperationCount(duration.operationCount)
+          .setPeriod(duration.period);
+    }
+    responseObserver.onNext(replyBuilder.build());
+    responseObserver.onCompleted();
+  }
+
+  @Override
+  public void getWorkerList(
+      WorkerListRequest request, StreamObserver<WorkerListMessage> responseObserver) {
+    WorkerListMessage.Builder replyBuilder = WorkerListMessage.newBuilder();
+    try {
+      replyBuilder.addAllWorkers(backplane.getStorageWorkers());
+    } catch (IOException e) {
+      responseObserver.onError(e);
     }
     responseObserver.onNext(replyBuilder.build());
     responseObserver.onCompleted();

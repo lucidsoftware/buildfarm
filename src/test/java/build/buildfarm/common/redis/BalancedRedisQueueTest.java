@@ -461,7 +461,7 @@ public class BalancedRedisQueueTest {
     Visitor<BalancedQueueEntry> visitor =
         new Visitor<>() {
           public void visit(BalancedQueueEntry entry) {
-            visited.add(entry.value());
+            visited.add(entry.getValue());
           }
         };
     queue.visit(jedis, visitor);
@@ -501,7 +501,7 @@ public class BalancedRedisQueueTest {
     Visitor<BalancedQueueEntry> visitor =
         new Visitor<>() {
           public void visit(BalancedQueueEntry entry) {
-            visited.add(entry.value());
+            visited.add(entry.getValue());
           }
         };
     queue.visit(jedis, visitor);

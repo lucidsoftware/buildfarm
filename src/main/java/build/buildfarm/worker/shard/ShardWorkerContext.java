@@ -30,7 +30,6 @@ import build.bazel.remote.execution.v2.Directory;
 import build.bazel.remote.execution.v2.ExecutionStage;
 import build.bazel.remote.execution.v2.Platform;
 import build.buildfarm.backplane.Backplane;
-import build.buildfarm.cas.ContentAddressableStorage;
 import build.buildfarm.common.Claim;
 import build.buildfarm.common.CommandUtils;
 import build.buildfarm.common.DigestPath;
@@ -55,8 +54,8 @@ import build.buildfarm.instance.Instance;
 import build.buildfarm.v1test.Digest;
 import build.buildfarm.v1test.QueueEntry;
 import build.buildfarm.v1test.QueuedOperation;
-import build.buildfarm.v1test.WorkerExecutedMetadata;
 import build.buildfarm.worker.DequeueMatchEvaluator;
+import build.buildfarm.worker.ExecFileSystem;
 import build.buildfarm.worker.ExecutionPolicies;
 import build.buildfarm.worker.MatchListener;
 import build.buildfarm.worker.RetryingMatchListener;
@@ -65,7 +64,6 @@ import build.buildfarm.worker.cgroup.CGroupVersion;
 import build.buildfarm.worker.cgroup.Cpu;
 import build.buildfarm.worker.cgroup.Group;
 import build.buildfarm.worker.cgroup.Mem;
-import build.buildfarm.worker.filesystem.ExecFileSystem;
 import build.buildfarm.worker.resources.LocalResourceSet;
 import build.buildfarm.worker.resources.ResourceDecider;
 import build.buildfarm.worker.resources.ResourceLimits;
@@ -104,6 +102,9 @@ import lombok.extern.java.Log;
 
 @Log
 class ShardWorkerContext implements WorkerContext {
+  static final String EXEC_OWNER_RESOURCE_NAME = "exec-owner";
+  private static final Platform.Property EXEC_OWNER_PROPERTY =
+      Platform.Property.newBuilder().setName(EXEC_OWNER_RESOURCE_NAME).setValue("1").build();
   private static final String PROVISION_CORES_NAME = "cores";
 
   private static final Counter completedOperations =
@@ -140,11 +141,6 @@ class ShardWorkerContext implements WorkerContext {
   private final LocalResourceSet resourceSet;
   private final boolean errorOperationOutputSizeExceeded;
   private final boolean provideOwnedClaim;
-  private boolean inGracefulShutdown = false;
-  private boolean pauseMatch = false;
-  private boolean pauseInputFetch = false;
-  private boolean pauseExecute = false;
-  private boolean pauseReportResult = false;
 
   static SetMultimap<String, String> getMatchProvisions(
       Iterable<ExecutionPolicy> policies, String name, int executeStageWidth) {
@@ -207,8 +203,7 @@ class ShardWorkerContext implements WorkerContext {
     this.resourceSet = resourceSet;
     this.writer = writer;
 
-    provideOwnedClaim =
-        this.resourceSet.resources.containsKey(LocalResourceSet.EXEC_OWNER_RESOURCE_NAME);
+    provideOwnedClaim = this.resourceSet.poolResources.containsKey(EXEC_OWNER_RESOURCE_NAME);
   }
 
   private static Retrier createBackplaneRetrier() {
@@ -220,16 +215,6 @@ class ShardWorkerContext implements WorkerContext {
             /*options.experimentalRemoteRetryJitter=*/ 0.1,
             /*options.experimentalRemoteRetryMaxAttempts=*/ 5),
         Retrier.REDIS_IS_RETRIABLE);
-  }
-
-  @Override
-  public boolean inGracefulShutdown() {
-    return inGracefulShutdown;
-  }
-
-  @Override
-  public void prepareForGracefulShutdown() {
-    inGracefulShutdown = true;
   }
 
   @Override
@@ -307,10 +292,11 @@ class ShardWorkerContext implements WorkerContext {
   }
 
   // FIXME make OwnedClaim with owner
+  // how will this play out with persistent workers, should we have one per user?
   private @Nullable Claim acquireClaim(Platform platform) {
     // expand platform requirements with exec owner
     if (provideOwnedClaim) {
-      platform = platform.toBuilder().addProperties(LocalResourceSet.EXEC_OWNER_PROPERTY).build();
+      platform = platform.toBuilder().addProperties(EXEC_OWNER_PROPERTY).build();
     }
 
     Claim claim = DequeueMatchEvaluator.acquireClaim(matchProvisions, resourceSet, platform);
@@ -318,13 +304,39 @@ class ShardWorkerContext implements WorkerContext {
     // a little awkward wrapping with the early return here to preserve effective final
     if (claim != null && provideOwnedClaim) {
       // enforced by exec owner property value of "1"
-      for (Entry<String, List<?>> pool : claim.getPools()) {
-        if (!pool.getKey().equals(LocalResourceSet.EXEC_OWNER_RESOURCE_NAME)) {
+      for (Entry<String, List<Object>> pool : claim.getPools()) {
+        if (!pool.getKey().equals(EXEC_OWNER_RESOURCE_NAME)) {
           continue;
         }
         String name = (String) Iterables.getOnlyElement(pool.getValue());
 
-        claim.setOwner(execFileSystem.getOwner(name));
+        return new Claim() {
+          UserPrincipal owner = execFileSystem.getOwner(name);
+
+          @Override
+          public void release(Claim.Stage stage) {
+            claim.release(stage);
+          }
+
+          @Override
+          public void release() {
+            owner = null;
+            claim.release();
+          }
+
+          @Override
+          public UserPrincipal owner() {
+            if (owner != null) {
+              return owner;
+            }
+            return claim.owner();
+          }
+
+          @Override
+          public Iterable<Entry<String, List<Object>>> getPools() {
+            return claim.getPools();
+          }
+        };
       }
       // claim was not provided with owner name value
     }
@@ -370,18 +382,6 @@ class ShardWorkerContext implements WorkerContext {
     }
     listener.onWaitEnd();
     return queueEntry;
-  }
-
-  /** wait until matching should occur, false return indicates that we are shutting down */
-  private boolean waitToMatch() throws InterruptedException {
-    ContentAddressableStorage storage = execFileSystem.getStorage();
-    synchronized (storage) {
-      // we may want to get interrupted when match is paused
-      while (!inGracefulShutdown && storage.isReadOnly()) {
-        storage.waitForWritable(java.time.Duration.ofSeconds(1));
-      }
-    }
-    return !inGracefulShutdown;
   }
 
   @Override
@@ -443,7 +443,7 @@ class ShardWorkerContext implements WorkerContext {
             throw new RuntimeException(t);
           }
         };
-    while (waitToMatch() && !dedupMatchListener.isMatched()) {
+    while (!dedupMatchListener.isMatched()) {
       try {
         matchInterruptible(dedupMatchListener);
       } catch (IOException e) {
@@ -758,17 +758,10 @@ class ShardWorkerContext implements WorkerContext {
       DigestFunction.Value digestFunction,
       Action action,
       Command command,
-      @Nullable UserPrincipal owner,
-      WorkerExecutedMetadata.Builder workerExecutedMetadata)
+      @Nullable UserPrincipal owner)
       throws IOException, InterruptedException {
     return execFileSystem.createExecDir(
-        operationName,
-        directoriesIndex,
-        digestFunction,
-        action,
-        command,
-        owner,
-        workerExecutedMetadata);
+        operationName, directoriesIndex, digestFunction, action, command, owner);
   }
 
   // might want to split for removeDirectory and decrement references to avoid removing for streamed
@@ -827,7 +820,10 @@ class ShardWorkerContext implements WorkerContext {
 
   void createOperationExecutionLimits() {
     try {
-      if (executeStageWidth < SystemProcessors.get()) {
+      int availableProcessors = SystemProcessors.get();
+      Preconditions.checkState(availableProcessors >= executeStageWidth);
+      executionsGroup.getCpu().setMaxCpu(executeStageWidth);
+      if (executeStageWidth < availableProcessors) {
         /* only divide up our cfs quota if we need to limit below the available processors for executions */
         executionsGroup.getCpu().setMaxCpu(executeStageWidth);
       }
@@ -891,7 +887,8 @@ class ShardWorkerContext implements WorkerContext {
       @Nullable UserPrincipal owner,
       ImmutableList.Builder<String> arguments,
       Command command,
-      Path workingDirectory) {
+      Path workingDirectory,
+      boolean runsOnPersistentWorker) {
     ResourceLimits limits = commandExecutionSettings(command);
     IOResource resource;
     if (shouldLimitCoreUsage()) {
@@ -924,7 +921,11 @@ class ShardWorkerContext implements WorkerContext {
       addLinuxSandboxCli(arguments, options);
     }
 
-    if (configs.getWorker().getSandboxSettings().isAlwaysUseAsNobody() || limits.fakeUsername) {
+    // Skip as-nobody for persistent workers - buildfarm does not properly set ownership for
+    // persistent worker exec roots, further work is needed to support this.
+    if (!runsOnPersistentWorker
+        && (configs.getWorker().getSandboxSettings().isAlwaysUseAsNobody()
+            || limits.fakeUsername)) {
       arguments.add(configs.getExecutionWrappers().getAsNobody());
     }
 

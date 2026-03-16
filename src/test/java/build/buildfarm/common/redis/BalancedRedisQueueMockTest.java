@@ -122,7 +122,7 @@ public class BalancedRedisQueueMockTest {
     BalancedQueueEntry entry = queue.take(redis, service);
 
     // ASSERT
-    assertThat(entry.value()).isEqualTo("foo");
+    assertThat(entry.getValue()).isEqualTo("foo");
     service.shutdown();
     assertThat(service.awaitTermination(1, SECONDS)).isTrue();
   }
@@ -145,7 +145,7 @@ public class BalancedRedisQueueMockTest {
     BalancedQueueEntry entry = queue.take(redis, service);
 
     // ASSERT
-    assertThat(entry.value()).isEqualTo("foo");
+    assertThat(entry.getValue()).isEqualTo("foo");
     service.shutdown();
     assertThat(service.awaitTermination(1, SECONDS)).isTrue();
   }
@@ -266,7 +266,7 @@ public class BalancedRedisQueueMockTest {
     Visitor<BalancedQueueEntry> visitor =
         new Visitor<>() {
           public void visit(BalancedQueueEntry entry) {
-            visited.add(entry.value());
+            visited.add(entry.getValue());
           }
         };
     queue.visit(redis, visitor);
@@ -310,7 +310,7 @@ public class BalancedRedisQueueMockTest {
     Visitor<BalancedQueueEntry> visitor =
         new Visitor<>() {
           public void visit(BalancedQueueEntry entry) {
-            visited.add(entry.value());
+            visited.add(entry.getValue());
           }
         };
     queue.visitDequeue(redis, visitor);

@@ -20,7 +20,7 @@ import build.buildfarm.v1test.AdminGrpc;
 import build.buildfarm.v1test.DisableScaleInProtectionRequest;
 import build.buildfarm.v1test.PrepareWorkerForGracefulShutDownRequest;
 import build.buildfarm.v1test.ShutDownWorkerGracefullyRequest;
-import build.buildfarm.v1test.WorkerControlGrpc;
+import build.buildfarm.v1test.ShutDownWorkerGrpc;
 import io.grpc.ManagedChannel;
 
 class GracefulShutdown {
@@ -57,9 +57,9 @@ class GracefulShutdown {
     String workerIpWithPort = args[1];
     System.out.println("Inform worker " + workerIpWithPort + " to prepare for shutdown!");
     ManagedChannel channel = createChannel(workerIpWithPort);
-    WorkerControlGrpc.WorkerControlBlockingStub workerControlBlockingStub =
-        WorkerControlGrpc.newBlockingStub(channel);
-    workerControlBlockingStub.prepareWorkerForGracefulShutdown(
+    ShutDownWorkerGrpc.ShutDownWorkerBlockingStub shutDownWorkerBlockingStub =
+        ShutDownWorkerGrpc.newBlockingStub(channel);
+    shutDownWorkerBlockingStub.prepareWorkerForGracefulShutdown(
         PrepareWorkerForGracefulShutDownRequest.newBuilder().build());
     System.out.println("Worker " + workerIpWithPort + " informed!");
   }

@@ -22,7 +22,6 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
 import lombok.Getter;
-import lombok.Setter;
 
 public abstract class PipelineStage implements Runnable {
   @Getter protected final String name;
@@ -35,7 +34,6 @@ public abstract class PipelineStage implements Runnable {
   private Thread tickThread = null;
   private boolean tickCancelledFlag = false;
   private String operationName = null;
-  @Getter @Setter private boolean paused = false;
 
   PipelineStage(
       String name, WorkerContext workerContext, PipelineStage output, PipelineStage error) {
@@ -43,10 +41,6 @@ public abstract class PipelineStage implements Runnable {
     this.workerContext = workerContext;
     this.output = output;
     this.error = error;
-  }
-
-  public boolean isStalled() {
-    return false;
   }
 
   protected void runInterruptible() throws InterruptedException {
@@ -101,11 +95,9 @@ public abstract class PipelineStage implements Runnable {
     return true;
   }
 
-  public int getWidth() {
-    return 1;
+  public String name() {
+    return name;
   }
-
-  public void setWidth(int width) {}
 
   protected void cancelTick() {
     // if we are not in a tick, this has no effect
