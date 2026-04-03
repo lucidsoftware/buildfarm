@@ -259,7 +259,12 @@ use_repo(
 )
 
 # this is *only* required for bazel and should not be used in our repository
-bazel_dep(name = "rules_proto", version = "6.0.2")
+bazel_dep(name = "rules_proto", version = "7.1.0")
+
+# bazel_jar_jar isn't used by Buildfarm. This bazel_dep is here because `bazel mod deps` fails
+# without this version override. This bazel_dep can be removed when `bazel mod deps` passes
+# without it. That will likely happen when grpc-java updates their version of bazel_jar_jar.
+bazel_dep(name = "bazel_jar_jar", version = "0.1.12")
 
 find_rpm = use_extension("@rules_pkg//toolchains/rpm:rpmbuild_configure.bzl", "find_system_rpmbuild_bzlmod")
 use_repo(find_rpm, "rules_pkg_rpmbuild")
