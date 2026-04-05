@@ -30,6 +30,7 @@ import build.bazel.remote.execution.v2.DirectoryNode;
 import build.bazel.remote.execution.v2.FileNode;
 import build.buildfarm.cas.cfc.CASFileCache;
 import build.buildfarm.cas.cfc.CASFileCache.PathResult;
+import build.buildfarm.common.CommandUtils;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.io.Directories;
 import build.buildfarm.v1test.Digest;
@@ -40,6 +41,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.ListenableFuture;
 import java.io.IOException;
 import java.nio.file.FileVisitResult;
@@ -380,6 +382,16 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
                     linkedDirectories(directoriesIndex, DigestUtil.toDigest(inputRootDigest)),
                     execDir::resolve))
             : ImmutableSet.of(); // does this work on windows with / separators?
+
+    // When output_paths is used (REAPI >= 2.1), output directories are indistinguishable from
+    // output files. Exclude them from linking so they remain writable for the action.
+    if (command.getOutputPathsCount() != 0 && !linkedInputDirectories.isEmpty()) {
+      Set<Path> outputPaths =
+          ImmutableSet.copyOf(
+              CommandUtils.getResolvedOutputPaths(
+                  command, execDir.resolve(command.getWorkingDirectory())));
+      linkedInputDirectories = Sets.difference(linkedInputDirectories, outputPaths).immutableCopy();
+    }
 
     log.log(Level.FINER, operationName + " walking execTree");
     ExecTree execTree = new ExecTree(directoriesIndex);
