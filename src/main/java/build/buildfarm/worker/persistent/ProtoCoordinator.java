@@ -240,18 +240,34 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       throws IOException {
     Path opRoot = context.opRoot;
 
-    for (String outputDir : context.outputDirectories) {
-      Path outputDirPath = Path.of(outputDir);
-      Files.createDirectories(outputDirPath);
-    }
+    // REAPI >= 2.1: output_paths supersedes output_files and output_directories.
+    if (!context.outputPaths.isEmpty()) {
+      for (String relOutput : context.outputPaths) {
+        Path execOutputPath = workerExecRoot.resolve(relOutput);
+        Path opOutputPath = opRoot.resolve(relOutput);
+        if (Files.isDirectory(execOutputPath)) {
+          FileAccessUtils.moveDirectory(execOutputPath, opOutputPath);
+        } else if (Files.exists(execOutputPath)) {
+          FileAccessUtils.moveFile(execOutputPath, opOutputPath);
+        }
+      }
+    } else {
+      for (String outputDir : context.outputDirectories) {
+        Path execOutputPath = workerExecRoot.resolve(outputDir);
+        Path opOutputPath = opRoot.resolve(outputDir);
+        if (Files.exists(execOutputPath) && Files.isDirectory(execOutputPath)) {
+          FileAccessUtils.moveDirectory(execOutputPath, opOutputPath);
+        }
+      }
 
-    for (String relOutput : context.outputFiles) {
-      Path execOutputPath = workerExecRoot.resolve(relOutput);
-      Path opOutputPath = opRoot.resolve(relOutput);
-      // Don't fail here if the action failed to produce a file.
-      // The missing file will be handled just like it is for non-worker actions.
-      if (Files.exists(execOutputPath)) {
-        FileAccessUtils.moveFile(execOutputPath, opOutputPath);
+      for (String relOutput : context.outputFiles) {
+        Path execOutputPath = workerExecRoot.resolve(relOutput);
+        Path opOutputPath = opRoot.resolve(relOutput);
+        // Don't fail here if the action failed to produce a file.
+        // The missing file will be handled just like it is for non-worker actions.
+        if (Files.exists(execOutputPath)) {
+          FileAccessUtils.moveFile(execOutputPath, opOutputPath);
+        }
       }
     }
   }

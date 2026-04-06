@@ -135,4 +135,112 @@ public class ProtoCoordinatorTest {
     assertThat(workRootPaths).containsAtLeastElementsIn(expectedToolInputs);
     assertThat(workRootPaths).containsNoneIn(expectedOpRootFiles);
   }
+
+  @Test
+  public void moveOutputsToOperationRoot_handlesOutputPaths() throws Exception {
+    Path fsRoot = jimFsRoot();
+    Path opRoot = fsRoot.resolve("opRoot_outputPaths");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot");
+    Files.createDirectory(workerExecRoot);
+
+    // Command with ONLY output_paths (REAPI >= 2.1 style)
+    ImmutableList<String> outputPaths = ImmutableList.of("output_file", "out_subdir/out_subfile");
+    Command command = Command.newBuilder().addAllOutputPaths(outputPaths).build();
+
+    Tree tree =
+        WorkerTestUtils.makeTree(
+            opRoot.toString(), ImmutableList.of(new TreeFile("dummy", "content")));
+    WorkFilesContext workFilesContext = WorkFilesContext.fromContext(opRoot, tree, command);
+
+    // Verify precondition: output_paths set, output_files/output_directories empty
+    assertThat(workFilesContext.outputPaths).isNotEmpty();
+    assertThat(workFilesContext.outputFiles).isEmpty();
+    assertThat(workFilesContext.outputDirectories).isEmpty();
+
+    for (String relOutput : outputPaths) {
+      Path execFile = workerExecRoot.resolve(relOutput);
+      Files.createDirectories(execFile.getParent());
+      Files.write(execFile, "output content".getBytes());
+    }
+
+    ProtoCoordinator protoCoordinator = ProtoCoordinator.ofCommonsPool(4);
+    protoCoordinator.moveOutputsToOperationRoot(workFilesContext, workerExecRoot);
+
+    for (String relOutput : outputPaths) {
+      assertThat(Files.exists(opRoot.resolve(relOutput))).isTrue();
+      assertThat(Files.exists(workerExecRoot.resolve(relOutput))).isFalse();
+    }
+  }
+
+  @Test
+  public void moveOutputsToOperationRoot_movesOutputPathDirectoryContents() throws Exception {
+    Path fsRoot = jimFsRoot();
+    Path opRoot = fsRoot.resolve("opRoot_outputPathDirs");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_dirs");
+    Files.createDirectory(workerExecRoot);
+
+    // output_paths with both a file and a directory (tree artifact) entry
+    ImmutableList<String> outputPaths = ImmutableList.of("output.jar", "output_dir");
+    Command command = Command.newBuilder().addAllOutputPaths(outputPaths).build();
+
+    Tree tree =
+        WorkerTestUtils.makeTree(
+            opRoot.toString(), ImmutableList.of(new TreeFile("dummy", "content")));
+    WorkFilesContext workFilesContext = WorkFilesContext.fromContext(opRoot, tree, command);
+
+    Files.write(workerExecRoot.resolve("output.jar"), "jar content".getBytes());
+    Path outputDir = workerExecRoot.resolve("output_dir");
+    Files.createDirectories(outputDir.resolve("subdir"));
+    Files.write(outputDir.resolve("file1.txt"), "file1".getBytes());
+    Files.write(outputDir.resolve("subdir/file2.txt"), "file2".getBytes());
+
+    ProtoCoordinator protoCoordinator = ProtoCoordinator.ofCommonsPool(4);
+    protoCoordinator.moveOutputsToOperationRoot(workFilesContext, workerExecRoot);
+
+    assertThat(Files.exists(opRoot.resolve("output.jar"))).isTrue();
+    assertThat(Files.exists(workerExecRoot.resolve("output.jar"))).isFalse();
+
+    assertThat(Files.isDirectory(opRoot.resolve("output_dir"))).isTrue();
+    assertThat(Files.exists(opRoot.resolve("output_dir/file1.txt"))).isTrue();
+    assertThat(Files.exists(opRoot.resolve("output_dir/subdir/file2.txt"))).isTrue();
+    assertThat(Files.exists(workerExecRoot.resolve("output_dir"))).isFalse();
+  }
+
+  @Test
+  public void moveOutputsToOperationRoot_movesOutputDirectoryContents() throws Exception {
+    Path fsRoot = jimFsRoot();
+    Path opRoot = fsRoot.resolve("opRoot_outputDirs");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_outputDirs");
+    Files.createDirectory(workerExecRoot);
+
+    // Legacy command with output_directories (pre-REAPI 2.1)
+    Command command =
+        Command.newBuilder()
+            .addOutputFiles("output_file")
+            .addOutputDirectories("output_dir")
+            .build();
+
+    Tree tree =
+        WorkerTestUtils.makeTree(
+            opRoot.toString(), ImmutableList.of(new TreeFile("dummy", "content")));
+    WorkFilesContext workFilesContext = WorkFilesContext.fromContext(opRoot, tree, command);
+
+    Files.write(workerExecRoot.resolve("output_file"), "file content".getBytes());
+    Path outputDir = workerExecRoot.resolve("output_dir");
+    Files.createDirectories(outputDir.resolve("subdir"));
+    Files.write(outputDir.resolve("file1.txt"), "file1".getBytes());
+    Files.write(outputDir.resolve("subdir/file2.txt"), "file2".getBytes());
+
+    ProtoCoordinator protoCoordinator = ProtoCoordinator.ofCommonsPool(4);
+    protoCoordinator.moveOutputsToOperationRoot(workFilesContext, workerExecRoot);
+
+    assertThat(Files.exists(opRoot.resolve("output_file"))).isTrue();
+
+    assertThat(Files.isDirectory(opRoot.resolve("output_dir"))).isTrue();
+    assertThat(Files.exists(opRoot.resolve("output_dir/file1.txt"))).isTrue();
+    assertThat(Files.exists(opRoot.resolve("output_dir/subdir/file2.txt"))).isTrue();
+  }
 }

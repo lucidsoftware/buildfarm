@@ -93,13 +93,10 @@ public class WorkerTestUtils {
   public static Command makeCommand() {
     ImmutableList<String> outputFiles = ImmutableList.of("output_file", "out_subdir/out_subfile");
     ImmutableList<String> outputDirs = ImmutableList.of("out_subdir");
-    ImmutableList<String> outputPaths =
-        ImmutableList.<String>builder().addAll(outputFiles).addAll(outputDirs).build();
 
     return Command.newBuilder()
         .addAllOutputFiles(outputFiles)
         .addAllOutputDirectories(outputDirs)
-        .addAllOutputPaths(outputPaths)
         .build();
   }
 

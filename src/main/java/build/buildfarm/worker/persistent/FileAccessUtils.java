@@ -19,8 +19,11 @@ import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
 
 import com.google.common.collect.ImmutableSet;
 import java.io.IOException;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFilePermission;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -112,12 +115,52 @@ public final class FileAccessUtils {
                 addPosixOwnerWrite(absTo);
                 return null;
               } catch (IOException e) {
-                return new IOException("copyFile() could not set writeable: " + absTo, e);
+                return new IOException("moveFile() could not set writeable: " + absTo, e);
               }
             });
     if (ioException != null) {
       throw ioException;
     }
+  }
+
+  /**
+   * Moves a directory and all its contents, creating necessary directories at the destination.
+   * Individual files are moved using {@link #moveFile}, preserving thread-safety guarantees.
+   *
+   * @param from source directory
+   * @param to destination directory
+   * @throws IOException if the source doesn't exist or any file move fails
+   */
+  public static void moveDirectory(Path from, Path to) throws IOException {
+    if (!Files.isDirectory(from)) {
+      throw new IOException("moveDirectory: source is not a directory: " + from);
+    }
+    Files.walkFileTree(
+        from,
+        new SimpleFileVisitor<>() {
+          @Override
+          public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs)
+              throws IOException {
+            Files.createDirectories(to.resolve(from.relativize(dir)));
+            return FileVisitResult.CONTINUE;
+          }
+
+          @Override
+          public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
+              throws IOException {
+            moveFile(file, to.resolve(from.relativize(file)));
+            return FileVisitResult.CONTINUE;
+          }
+
+          @Override
+          public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+            if (exc != null) {
+              throw exc;
+            }
+            deleteFileIfExists(dir);
+            return FileVisitResult.CONTINUE;
+          }
+        });
   }
 
   /**
