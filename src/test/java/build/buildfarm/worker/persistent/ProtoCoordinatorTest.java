@@ -25,12 +25,18 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.common.jimfs.Configuration;
 import com.google.common.jimfs.Jimfs;
+import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
+import com.google.protobuf.Duration;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import org.junit.After;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
@@ -38,6 +44,22 @@ import persistent.bazel.client.WorkerKey;
 
 @RunWith(JUnit4.class)
 public class ProtoCoordinatorTest {
+  private final List<ProtoCoordinator> coordinators = new ArrayList<>();
+
+  private ProtoCoordinator newCoordinator() {
+    ProtoCoordinator protoCoordinator = ProtoCoordinator.ofCommonsPool(4);
+    coordinators.add(protoCoordinator);
+    return protoCoordinator;
+  }
+
+  @After
+  public void shutdownSchedulers() {
+    for (ProtoCoordinator protoCoordinator : coordinators) {
+      protoCoordinator.timeoutScheduler.shutdownNow();
+    }
+    coordinators.clear();
+  }
+
   private WorkerKey makeWorkerKey(
       WorkFilesContext ctx, WorkerInputs workerFiles, Path workRootsDir) {
     return Keymaker.make(
@@ -206,6 +228,46 @@ public class ProtoCoordinatorTest {
     assertThat(Files.exists(opRoot.resolve("output_dir/file1.txt"))).isTrue();
     assertThat(Files.exists(opRoot.resolve("output_dir/subdir/file2.txt"))).isTrue();
     assertThat(Files.exists(workerExecRoot.resolve("output_dir"))).isFalse();
+  }
+
+  /**
+   * Create a request that is NOT in pendingReqs in order to cause a null to be encountered in the
+   * handler's run() function
+   */
+  private RequestCtx createRequestDontAddToPendingRequests() {
+    return new RequestCtx(
+        WorkRequest.getDefaultInstance(), null, null, Duration.newBuilder().setSeconds(10).build());
+  }
+
+  @Test
+  public void runTimeoutHandler_requestAlreadyRemoved_doesNotThrow() throws Exception {
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    RequestCtx request = createRequestDontAddToPendingRequests();
+
+    // Make sure the handler's run() function doesn't throw an exception
+    Runnable task = protoCoordinator.new RequestTimeoutHandler(request);
+    task.run();
+  }
+
+  @Test
+  public void timeoutScheduler_afterRequestAlreadyRemoved_keepsScheduling() throws Exception {
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    RequestCtx request = createRequestDontAddToPendingRequests();
+
+    Runnable task = protoCoordinator.new RequestTimeoutHandler(request);
+
+    // Schedule the timeout handler to fire immediately. We want to be sure that the scheduler
+    // survives after encountering a null inside of run().
+    ScheduledFuture<?> future =
+        protoCoordinator.timeoutScheduler.schedule(task, 0, TimeUnit.MILLISECONDS);
+    future.get(2, TimeUnit.SECONDS);
+
+    // Verify the scheduler is still alive by scheduling a second task.
+    CountDownLatch latch = new CountDownLatch(1);
+    protoCoordinator.timeoutScheduler.schedule(latch::countDown, 0, TimeUnit.MILLISECONDS);
+    assertThat(latch.await(2, TimeUnit.SECONDS)).isTrue();
   }
 
   @Test

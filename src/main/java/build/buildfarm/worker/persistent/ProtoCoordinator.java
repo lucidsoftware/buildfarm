@@ -16,16 +16,20 @@ package build.buildfarm.worker.persistent;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
 import com.google.protobuf.util.Durations;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Timer;
-import java.util.TimerTask;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import lombok.extern.java.Log;
 import persistent.bazel.client.CommonsWorkerPool;
@@ -47,12 +51,30 @@ import persistent.bazel.client.WorkerSupervisor;
 public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, CommonsWorkerPool> {
   private static final String WORKER_INIT_LOG_SUFFIX = ".initargs.log";
 
-  private record PendingRequest(PersistentWorker worker, RequestTimeoutHandler task) {}
+  private record PendingRequest(PersistentWorker worker, RequestTimeoutHandler task) {
+    private PendingRequest {
+      Objects.requireNonNull(worker);
+      Objects.requireNonNull(task);
+    }
+  }
 
   private static final ConcurrentHashMap<RequestCtx, PendingRequest> pendingReqs =
       new ConcurrentHashMap<>();
 
-  private final Timer timeoutScheduler = new Timer("persistent-worker-timeout", true);
+  @VisibleForTesting final ScheduledExecutorService timeoutScheduler = createTimeoutScheduler();
+
+  private static ScheduledExecutorService createTimeoutScheduler() {
+    ScheduledThreadPoolExecutor executor =
+        new ScheduledThreadPoolExecutor(
+            1,
+            runnable -> {
+              Thread thread = new Thread(runnable, "persistent-worker-timeout");
+              thread.setDaemon(true);
+              return thread;
+            });
+    executor.setRemoveOnCancelPolicy(true);
+    return executor;
+  }
 
   // Synchronize writes to the tool input directory per WorkerKey
   // TODO: We only need a Set of WorkerKeys to synchronize on, but no ConcurrentHashSet
@@ -66,16 +88,6 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
 
   public ProtoCoordinator(CommonsWorkerPool workerPool) {
     super(workerPool);
-
-    timeoutScheduler.scheduleAtFixedRate(
-        new TimerTask() {
-          @Override
-          public void run() {
-            timeoutScheduler.purge();
-          }
-        },
-        10000,
-        10000);
   }
 
   private ProtoCoordinator(WorkerSupervisor supervisor, int maxWorkersPerKey) {
@@ -159,7 +171,8 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
   public WorkRequest preWorkInit(WorkerKey key, RequestCtx request, PersistentWorker worker)
       throws IOException {
     checkNotNull(request.timeout);
-    PendingRequest pendingRequest = new PendingRequest(worker, new RequestTimeoutHandler(request));
+    RequestTimeoutHandler task = new RequestTimeoutHandler(request);
+    PendingRequest pendingRequest = new PendingRequest(worker, task);
     PendingRequest alreadyPendingRequest = pendingReqs.putIfAbsent(request, pendingRequest);
     // null means that this request was not in pendingReqs (the expected case)
     if (alreadyPendingRequest != null) {
@@ -171,7 +184,8 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
             "Got the same request for the same worker while it's running: " + request.request);
       }
     }
-    timeoutScheduler.schedule(pendingRequest.task, Durations.toMillis(request.timeout));
+    task.future =
+        timeoutScheduler.schedule(task, Durations.toMillis(request.timeout), TimeUnit.MILLISECONDS);
 
     // Symlinking should hypothetically be faster+leaner than copying inputs, but it's buggy.
     copyNontoolInputs(request.workerInputs, worker.getExecRoot());
@@ -185,8 +199,8 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       WorkResponse response, PersistentWorker worker, RequestCtx request) throws IOException {
     PendingRequest pendingRequest = pendingReqs.remove(request);
 
-    if (pendingRequest != null) {
-      pendingRequest.task.cancel();
+    if (pendingRequest != null && pendingRequest.task.future != null) {
+      pendingRequest.task.future.cancel(false);
     }
 
     if (response == null) {
@@ -281,16 +295,29 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     }
   }
 
-  private final class RequestTimeoutHandler extends TimerTask {
+  @VisibleForTesting
+  final class RequestTimeoutHandler implements Runnable {
     private final RequestCtx request;
+    volatile ScheduledFuture<?> future;
 
-    private RequestTimeoutHandler(RequestCtx request) {
+    @VisibleForTesting
+    RequestTimeoutHandler(RequestCtx request) {
       this.request = request;
     }
 
     @Override
     public void run() {
-      onTimeout(this.request, pendingReqs.get(this.request).worker);
+      try {
+        PendingRequest pendingRequest = pendingReqs.remove(this.request);
+        if (pendingRequest != null) {
+          onTimeout(this.request, pendingRequest.worker);
+        }
+      } catch (Throwable t) {
+        log.log(
+            Level.SEVERE,
+            "Exception in persistent worker timeout handler for request: " + this.request.request,
+            t);
+      }
     }
   }
 
