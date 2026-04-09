@@ -61,6 +61,11 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
   private static final ConcurrentHashMap<RequestCtx, PendingRequest> pendingReqs =
       new ConcurrentHashMap<>();
 
+  @VisibleForTesting
+  static boolean hasPendingRequest(RequestCtx request) {
+    return pendingReqs.containsKey(request);
+  }
+
   @VisibleForTesting final ScheduledExecutorService timeoutScheduler = createTimeoutScheduler();
 
   private static ScheduledExecutorService createTimeoutScheduler() {
@@ -184,11 +189,20 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
             "Got the same request for the same worker while it's running: " + request.request);
       }
     }
-    task.future =
-        timeoutScheduler.schedule(task, Durations.toMillis(request.timeout), TimeUnit.MILLISECONDS);
+    try {
+      task.future =
+          timeoutScheduler.schedule(
+              task, Durations.toMillis(request.timeout), TimeUnit.MILLISECONDS);
 
-    // Symlinking should hypothetically be faster+leaner than copying inputs, but it's buggy.
-    copyNontoolInputs(request.workerInputs, worker.getExecRoot());
+      // Symlinking should hypothetically be faster+leaner than copying inputs, but it's buggy.
+      copyNontoolInputs(request.workerInputs, worker.getExecRoot());
+    } catch (Exception e) {
+      pendingReqs.remove(request);
+      if (task.future != null) {
+        task.future.cancel(false);
+      }
+      throw e;
+    }
 
     return request.request;
   }

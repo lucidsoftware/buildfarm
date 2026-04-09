@@ -15,6 +15,9 @@
 package build.buildfarm.worker.persistent;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import build.bazel.remote.execution.v2.Command;
 import build.buildfarm.v1test.Tree;
@@ -22,11 +25,14 @@ import build.buildfarm.worker.util.WorkerTestUtils;
 import build.buildfarm.worker.util.WorkerTestUtils.TreeFile;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.jimfs.Configuration;
 import com.google.common.jimfs.Jimfs;
+import com.google.devtools.build.lib.worker.WorkerProtocol.Input;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
 import com.google.protobuf.Duration;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -40,6 +46,7 @@ import org.junit.After;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
+import persistent.bazel.client.PersistentWorker;
 import persistent.bazel.client.WorkerKey;
 
 @RunWith(JUnit4.class)
@@ -268,6 +275,40 @@ public class ProtoCoordinatorTest {
     CountDownLatch latch = new CountDownLatch(1);
     protoCoordinator.timeoutScheduler.schedule(latch::countDown, 0, TimeUnit.MILLISECONDS);
     assertThat(latch.await(2, TimeUnit.SECONDS)).isTrue();
+  }
+
+  @Test
+  public void preWorkInit_cleansUpPendingReqsOnCopyFailure() throws Exception {
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path opRoot = fsRoot.resolve("opRoot_leakTest");
+    Files.createDirectory(opRoot);
+
+    // Create a worker inputs with a non-tool input that doesn't exist on disk.
+    // copyNontoolInputs will try to copy it and throw an IOException.
+    Path nonExistentInput = opRoot.resolve("non_existent_input");
+    Input input = Input.newBuilder().setPath("non_existent_input").build();
+    WorkerInputs workerInputs =
+        new WorkerInputs(
+            opRoot, ImmutableSet.of(), ImmutableSet.of(), ImmutableMap.of(nonExistentInput, input));
+
+    RequestCtx request =
+        new RequestCtx(
+            WorkRequest.getDefaultInstance(),
+            null,
+            workerInputs,
+            Duration.newBuilder().setSeconds(10).build());
+
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(fsRoot.resolve("workerExecRoot"));
+
+    // Make sure that we actually caused the error we wanted to.
+    assertThrows(IOException.class, () -> protoCoordinator.preWorkInit(null, request, mockWorker));
+
+    // Make sure that, despite the error, the request is cleaned up from the map of pending
+    // requests
+    assertThat(ProtoCoordinator.hasPendingRequest(request)).isFalse();
   }
 
   @Test
