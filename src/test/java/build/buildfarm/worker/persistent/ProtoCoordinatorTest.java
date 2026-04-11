@@ -31,6 +31,7 @@ import com.google.common.jimfs.Configuration;
 import com.google.common.jimfs.Jimfs;
 import com.google.devtools.build.lib.worker.WorkerProtocol.Input;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
+import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
 import com.google.protobuf.Duration;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -345,5 +346,166 @@ public class ProtoCoordinatorTest {
     assertThat(Files.isDirectory(opRoot.resolve("output_dir"))).isTrue();
     assertThat(Files.exists(opRoot.resolve("output_dir/file1.txt"))).isTrue();
     assertThat(Files.exists(opRoot.resolve("output_dir/subdir/file2.txt"))).isTrue();
+  }
+
+  @Test
+  public void postWorkCleanup_movesOutputsOnNonZeroExitCode() throws Exception {
+    Path fsRoot = jimFsRoot();
+    Path opRoot = fsRoot.resolve("opRoot_nonzeroExitCodeOutputs");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_nonzeroExitCodeOutputs");
+    Files.createDirectory(workerExecRoot);
+
+    // Set up a command with declared output files
+    Command command = Command.newBuilder().addOutputFiles("output_file").build();
+    Tree tree =
+        WorkerTestUtils.makeTree(
+            opRoot.toString(), ImmutableList.of(new TreeFile("dummy", "content")));
+    WorkFilesContext workFilesContext = WorkFilesContext.fromContext(opRoot, tree, command);
+
+    // Create the output file in the worker exec root (as if the action produced it)
+    Files.write(workerExecRoot.resolve("output_file"), "output content".getBytes());
+
+    // Create WorkerInputs with no non-tool inputs (so cleanUpNontoolInputs is a no-op)
+    WorkerInputs workerInputs =
+        new WorkerInputs(opRoot, ImmutableSet.of(), ImmutableSet.of(), ImmutableMap.of());
+
+    RequestCtx request =
+        new RequestCtx(
+            WorkRequest.getDefaultInstance(),
+            workFilesContext,
+            workerInputs,
+            Duration.newBuilder().setSeconds(10).build());
+
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+    when(mockWorker.flushStdErr()).thenReturn("");
+
+    // Return a non-zero exit code for the action
+    WorkResponse response = WorkResponse.newBuilder().setExitCode(1).build();
+
+    ProtoCoordinator protoCoordinator = newCoordinator();
+    protoCoordinator.postWorkCleanup(response, mockWorker, request);
+
+    // Outputs should be moved to the operation root even on non-zero exit code
+    assertThat(Files.exists(opRoot.resolve("output_file"))).isTrue();
+    assertThat(Files.exists(workerExecRoot.resolve("output_file"))).isFalse();
+  }
+
+  @Test
+  public void postWorkCleanup_cleansNontoolInputsOnNonZeroExitCode() throws Exception {
+    Path fsRoot = jimFsRoot();
+    Path opRoot = fsRoot.resolve("opRoot_cleanupInputsOnNonzeroExitCode");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_cleanupInputsOnNonzeroExitCode");
+    Files.createDirectory(workerExecRoot);
+
+    // Create a non-tool input file in the operation root
+    Path inputFileInOpRoot = opRoot.resolve("input_file.txt");
+    Files.write(inputFileInOpRoot, "input content".getBytes());
+    Input input = Input.newBuilder().setPath(inputFileInOpRoot.toString()).build();
+
+    // Copy it to worker exec root (simulating what preWorkInit does)
+    Path inputFileInWorkerExecRoot = workerExecRoot.resolve("input_file.txt");
+    Files.write(inputFileInWorkerExecRoot, "input content".getBytes());
+
+    // Create WorkerInputs with one non-tool input
+    WorkerInputs workerInputs =
+        new WorkerInputs(
+            opRoot,
+            ImmutableSet.of(),
+            ImmutableSet.of(),
+            ImmutableMap.of(inputFileInOpRoot, input));
+
+    // Create a Command with no outputs (so moveOutputsToOperationRoot is a no-op)
+    Command command = Command.newBuilder().build();
+    Tree tree =
+        WorkerTestUtils.makeTree(
+            opRoot.toString(), ImmutableList.of(new TreeFile("input_file.txt", "input content")));
+    WorkFilesContext workFilesContext = WorkFilesContext.fromContext(opRoot, tree, command);
+
+    RequestCtx request =
+        new RequestCtx(
+            WorkRequest.getDefaultInstance(),
+            workFilesContext,
+            workerInputs,
+            Duration.newBuilder().setSeconds(10).build());
+
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+    when(mockWorker.flushStdErr()).thenReturn("");
+
+    // Return a non-zero exit code for the action
+    WorkResponse response = WorkResponse.newBuilder().setExitCode(1).build();
+
+    ProtoCoordinator protoCoordinator = newCoordinator();
+    protoCoordinator.postWorkCleanup(response, mockWorker, request);
+
+    // Non-tool inputs should be cleaned even on non-zero exit code
+    assertThat(Files.exists(inputFileInWorkerExecRoot)).isFalse();
+    // Original file in the operation root should be untouched
+    assertThat(Files.exists(inputFileInOpRoot)).isTrue();
+  }
+
+  @Test
+  public void postWorkCleanup_movesOutputsAndCleansInputsOnZeroExitCode() throws Exception {
+    Path fsRoot = jimFsRoot();
+    Path opRoot = fsRoot.resolve("opRoot_zeroExitCode");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_zeroExitCode");
+    Files.createDirectory(workerExecRoot);
+
+    // Create a non-tool input file in the operation root
+    Path inputFileInOpRoot = opRoot.resolve("input_file.txt");
+    Files.write(inputFileInOpRoot, "input content".getBytes());
+    Input input = Input.newBuilder().setPath(inputFileInOpRoot.toString()).build();
+
+    // Copy it to worker exec root (simulating what preWorkInit does)
+    Path inputFileInWorkerExecRoot = workerExecRoot.resolve("input_file.txt");
+    Files.write(inputFileInWorkerExecRoot, "input content".getBytes());
+
+    // Set up a command with a declared output file
+    Command command = Command.newBuilder().addOutputFiles("output_file").build();
+    Tree tree =
+        WorkerTestUtils.makeTree(
+            opRoot.toString(), ImmutableList.of(new TreeFile("input_file.txt", "input content")));
+    WorkFilesContext workFilesContext = WorkFilesContext.fromContext(opRoot, tree, command);
+
+    // Create the output file in the worker exec root (as if the action produced it)
+    Files.write(workerExecRoot.resolve("output_file"), "output content".getBytes());
+
+    WorkerInputs workerInputs =
+        new WorkerInputs(
+            opRoot,
+            ImmutableSet.of(),
+            ImmutableSet.of(),
+            ImmutableMap.of(inputFileInOpRoot, input));
+
+    RequestCtx request =
+        new RequestCtx(
+            WorkRequest.getDefaultInstance(),
+            workFilesContext,
+            workerInputs,
+            Duration.newBuilder().setSeconds(10).build());
+
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+    when(mockWorker.flushStdErr()).thenReturn("");
+
+    // Exit code 0 as if the operation succeeded
+    WorkResponse response = WorkResponse.newBuilder().setExitCode(0).build();
+
+    ProtoCoordinator protoCoordinator = newCoordinator();
+    protoCoordinator.postWorkCleanup(response, mockWorker, request);
+
+    // Outputs should be moved to the operation root
+    assertThat(Files.exists(opRoot.resolve("output_file"))).isTrue();
+    assertThat(Files.exists(workerExecRoot.resolve("output_file"))).isFalse();
+
+    // Non-tool inputs should be cleaned from the worker exec root
+    assertThat(Files.exists(inputFileInWorkerExecRoot)).isFalse();
+
+    // Original file in the operation root should be untouched
+    assertThat(Files.exists(inputFileInOpRoot)).isTrue();
   }
 }

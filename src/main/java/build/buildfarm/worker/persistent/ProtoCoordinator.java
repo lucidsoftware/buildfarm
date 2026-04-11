@@ -221,14 +221,14 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       throw new RuntimeException("postWorkCleanup: WorkResponse was null!");
     }
 
-    if (response.getExitCode() == 0) {
-      try {
-        Path workerExecRoot = worker.getExecRoot();
-        moveOutputsToOperationRoot(request.filesContext, workerExecRoot);
-        cleanUpNontoolInputs(request.workerInputs, workerExecRoot);
-      } catch (IOException e) {
-        throw logBadCleanup(request, e);
-      }
+    try {
+      Path workerExecRoot = worker.getExecRoot();
+      // Always move outputs and clean up non-tool inputs, regardless of exit code. This matches the
+      // REAPI spec as well as what Buildfarm and Bazel do elsewhere.
+      moveOutputsToOperationRoot(request.filesContext, workerExecRoot);
+      cleanUpNontoolInputs(request.workerInputs, workerExecRoot);
+    } catch (IOException e) {
+      throw logBadCleanup(request, e);
     }
 
     return new ResponseCtx(response, worker.flushStdErr());
@@ -249,7 +249,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
 
     log.log(Level.SEVERE, sb.toString(), e);
 
-    return new IOException("Response was OK but failed on postWorkCleanup", e);
+    return new IOException("Failed during postWorkCleanup", e);
   }
 
   private void copyNontoolInputs(WorkerInputs workerInputs, Path workerExecRoot)
