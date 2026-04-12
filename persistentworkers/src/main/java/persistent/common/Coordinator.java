@@ -45,14 +45,23 @@ public abstract class Coordinator<
 
   public CO runRequest(K workerKey, CI reqWithCtx) throws Exception {
     W worker = workerPool.obtain(workerKey);
+    boolean postWorkCleanupCalled = false;
     try {
       I request = preWorkInit(workerKey, reqWithCtx, worker);
       O workResponse = worker.doWork(request);
+      postWorkCleanupCalled = true;
       CO responseAfterCleanup = postWorkCleanup(workResponse, worker, reqWithCtx);
 
       workerPool.release(workerKey, worker);
       return responseAfterCleanup;
     } catch (Exception e) {
+      if (!postWorkCleanupCalled) {
+        try {
+          postWorkCleanup(null, worker, reqWithCtx);
+        } catch (Exception cleanupEx) {
+          e.addSuppressed(cleanupEx);
+        }
+      }
       try {
         workerPool.invalidate(workerKey, worker);
       } catch (Exception invalidateEx) {
@@ -67,6 +76,19 @@ public abstract class Coordinator<
 
   public abstract I preWorkInit(K workerKey, CI request, W worker) throws IOException;
 
+  /**
+   * Performs post-work cleanup after a worker has completed (or failed) a request. This method is
+   * called once per {@link #runRequest} invocation, even if {@code doWork} or {@code preWorkInit}
+   * throws an exception.
+   *
+   * @param response the work response, or {@code null} if {@code doWork} threw an exception. When
+   *     {@code null}, implementations should perform any necessary cleanup (e.g., canceling timers,
+   *     removing tracking entries) and return {@code null}.
+   * @param worker the worker that processed (or attempted to process) the request
+   * @param request the original request with context
+   * @return the response with additional context, or {@code null} if response was {@code null}
+   * @throws IOException if cleanup or response processing fails
+   */
   public abstract CO postWorkCleanup(O response, W worker, CI request) throws IOException;
 
   public static <K, I, O, W extends Worker<I, O>> SimpleCoordinator<K, I, O, W> simple(

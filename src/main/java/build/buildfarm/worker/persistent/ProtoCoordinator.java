@@ -217,8 +217,11 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       pendingRequest.task.future.cancel(false);
     }
 
+    // When doWork or preWorkInit throws, Coordinator calls postWorkCleanup(null, ...) for any
+    // cleanup that needs to happen despite the failure. The cleanup above (pendingReqs removal,
+    // future cancellation) is complete at this point, so we return null as expected.
     if (response == null) {
-      throw new RuntimeException("postWorkCleanup: WorkResponse was null!");
+      return null;
     }
 
     try {

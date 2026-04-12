@@ -15,7 +15,7 @@
 package persistent.common;
 
 public interface Worker<I, O> extends Destructable {
-  O doWork(I request);
+  O doWork(I request) throws Exception;
 
   default void destroy() {}
 }

@@ -17,6 +17,9 @@ package persistent.common.processes;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
@@ -112,5 +115,121 @@ public class CoordinatorTest {
     assertThat(thrown.getMessage()).isEqualTo(THROWING_WORKER_ERROR_MESSAGE);
     assertThat(worker.destroyed).isTrue();
     assertThat(thrown.getSuppressed()).asList().contains(invalidateFailure);
+  }
+
+  @Test
+  public void doWork_checkedException_propagatesToCaller() throws Exception {
+    final String errorMessage = "worker I/O failed";
+    ObjectPool<String, Worker<Integer, String>> pool =
+        new MapPool<>(
+            key ->
+                new Worker<Integer, String>() {
+                  @Override
+                  public String doWork(Integer request) throws Exception {
+                    throw new IOException(errorMessage);
+                  }
+                });
+
+    SimpleCoordinator<String, Integer, String, Worker<Integer, String>> coordinator =
+        Coordinator.simple(pool);
+
+    IOException thrown =
+        assertThrows(IOException.class, () -> coordinator.runRequest("key", Id.of(42)));
+
+    assertThat(thrown.getMessage()).isEqualTo(errorMessage);
+  }
+
+  @Test
+  public void doWork_exception_callsPostWorkCleanup() throws Exception {
+    AtomicInteger postWorkCleanupCalls = new AtomicInteger(0);
+    AtomicReference<Object> receivedResponse = new AtomicReference<>(new Object());
+
+    ObjectPool<String, Worker<Integer, String>> pool =
+        new MapPool<>(
+            key ->
+                new Worker<Integer, String>() {
+                  @Override
+                  public String doWork(Integer request) {
+                    throw new RuntimeException("simulated doWork failure");
+                  }
+                });
+
+    Coordinator<
+            String,
+            Integer,
+            String,
+            Worker<Integer, String>,
+            Id<Integer>,
+            Id<String>,
+            ObjectPool<String, Worker<Integer, String>>>
+        coordinator =
+            new Coordinator<>(pool) {
+              @Override
+              public Integer preWorkInit(
+                  String workerKey, Id<Integer> request, Worker<Integer, String> worker) {
+                return request.get();
+              }
+
+              @Override
+              public Id<String> postWorkCleanup(
+                  String response, Worker<Integer, String> worker, Id<Integer> request) {
+                postWorkCleanupCalls.incrementAndGet();
+                receivedResponse.set(response);
+                return Id.of(response);
+              }
+            };
+
+    assertThrows(RuntimeException.class, () -> coordinator.runRequest("key", Id.of(42)));
+
+    // Verify that postWorkCleanup is called when an error is encountered during doWork
+    assertThat(postWorkCleanupCalls.get()).isEqualTo(1);
+    assertThat(receivedResponse.get()).isNull();
+  }
+
+  @Test
+  public void preWorkInit_exception_callsPostWorkCleanup() throws Exception {
+    AtomicInteger postWorkCleanupCalls = new AtomicInteger(0);
+    AtomicReference<Object> receivedResponse = new AtomicReference<>(new Object());
+
+    ObjectPool<String, Worker<Integer, String>> pool =
+        new MapPool<>(
+            key ->
+                new Worker<Integer, String>() {
+                  @Override
+                  public String doWork(Integer request) {
+                    return "foo";
+                  }
+                });
+
+    Coordinator<
+            String,
+            Integer,
+            String,
+            Worker<Integer, String>,
+            Id<Integer>,
+            Id<String>,
+            ObjectPool<String, Worker<Integer, String>>>
+        coordinator =
+            new Coordinator<>(pool) {
+              @Override
+              public Integer preWorkInit(
+                  String workerKey, Id<Integer> request, Worker<Integer, String> worker) {
+                throw new RuntimeException("simulated preWorkInit failure");
+              }
+
+              @Override
+              public Id<String> postWorkCleanup(
+                  String response, Worker<Integer, String> worker, Id<Integer> request) {
+                postWorkCleanupCalls.incrementAndGet();
+                receivedResponse.set(response);
+                return Id.of(response);
+              }
+            };
+
+    assertThrows(RuntimeException.class, () -> coordinator.runRequest("key", Id.of(42)));
+
+    // Verify that postWorkCleanup is called when an error is encountered during preWorkInit
+    assertThat(postWorkCleanupCalls.get()).isEqualTo(1);
+    assertThat(receivedResponse.get()).isNull();
   }
 }

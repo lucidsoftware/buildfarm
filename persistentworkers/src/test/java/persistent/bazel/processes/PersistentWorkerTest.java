@@ -14,6 +14,8 @@
 
 package persistent.bazel.processes;
 
+import static org.junit.Assert.assertThrows;
+
 import com.google.common.collect.ImmutableList;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
@@ -34,7 +36,7 @@ import persistent.testutil.WorkerUtils;
 @RunWith(JUnit4.class)
 public class PersistentWorkerTest {
   static WorkResponse sendAddRequest(PersistentWorker worker, Path stdErrLog, int x, int y)
-      throws IOException {
+      throws IOException, InterruptedException {
     ImmutableList<String> arguments = ImmutableList.of(String.valueOf(x), String.valueOf(y));
 
     WorkRequest request =
@@ -86,5 +88,44 @@ public class PersistentWorkerTest {
     Assert.assertEquals(response2.getOutput(), "50");
     Assert.assertEquals(response2.getExitCode(), 0);
     Assert.assertEquals(worker.getExitValue(), Optional.empty()); // Not yet exited
+  }
+
+  @Test
+  public void doWork_afterProcessDestroyed_throwsIOException() throws Exception {
+    Path workDir = Files.createTempDirectory("test-workdir-");
+
+    String filename = "adder-bin_deploy.jar";
+
+    Path jarPath =
+        ProcessUtils.retrieveFileResource(
+            getClass().getClassLoader(), filename, workDir.resolve(filename));
+
+    ImmutableList<String> initCmd =
+        ImmutableList.of(
+            JavaProcessWrapper.CURRENT_JVM_COMMAND,
+            "-cp",
+            jarPath.toString(),
+            "adder.Adder",
+            "--persistent_worker");
+
+    WorkerKey key = WorkerUtils.emptyWorkerKey(workDir, initCmd);
+    PersistentWorker worker = new PersistentWorker(key, "worker-dir");
+
+    // Verify the worker is functional
+    WorkRequest request =
+        WorkRequest.newBuilder().addArguments("1").addArguments("2").setRequestId(0).build();
+    WorkResponse response = worker.doWork(request);
+    Assert.assertEquals("3", response.getOutput());
+    Assert.assertEquals(0, response.getExitCode());
+
+    // Kill the worker process
+    worker.destroy();
+
+    // Verify that doing work on a destroyed worker results in an error. This also somewhat checks
+    // that the kind of exception encountered during doWork is propagated up rather than a null
+    // being returned and a RuntimeException later being thrown.
+    WorkRequest secondRequest =
+        WorkRequest.newBuilder().addArguments("3").addArguments("4").setRequestId(0).build();
+    assertThrows(IOException.class, () -> worker.doWork(secondRequest));
   }
 }

@@ -78,24 +78,21 @@ public class PersistentWorker implements Worker<WorkRequest, WorkResponse> {
   }
 
   @Override
-  public WorkResponse doWork(WorkRequest request) {
-    WorkResponse response = null;
+  public WorkResponse doWork(WorkRequest request) throws IOException, InterruptedException {
+    logRequest(request);
+    workerRW.write(request);
+    WorkResponse response = workerRW.waitAndRead();
+    if (response == null) {
+      throw new IOException(
+          "Persistent worker returned no response"
+              + " (process may have crashed or written corrupt data)."
+              + " Stderr: "
+              + getStdErr());
+    }
     try {
-      logRequest(request);
-
-      workerRW.write(request);
-      response = workerRW.waitAndRead();
-
       logIfBadResponse(response);
-    } catch (InterruptedException e) {
-      logger.severe("Interrupted during doWork: " + e.getMessage());
-      Thread.currentThread().interrupt();
     } catch (IOException e) {
-      e.printStackTrace();
-      logger.severe("IO Failing with : " + e.getMessage());
-    } catch (Exception e) {
-      e.printStackTrace();
-      logger.severe("Failing with : " + e.getMessage());
+      logger.log(Level.WARNING, "Failed to read stderr for response logging", e);
     }
     return response;
   }
