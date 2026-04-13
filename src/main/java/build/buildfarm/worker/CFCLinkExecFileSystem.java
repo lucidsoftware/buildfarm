@@ -30,18 +30,18 @@ import build.bazel.remote.execution.v2.DirectoryNode;
 import build.bazel.remote.execution.v2.FileNode;
 import build.buildfarm.cas.cfc.CASFileCache;
 import build.buildfarm.cas.cfc.CASFileCache.PathResult;
-import build.buildfarm.common.CommandUtils;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.io.Directories;
 import build.buildfarm.v1test.Digest;
 import build.buildfarm.v1test.WorkerExecutedMetadata;
 import build.buildfarm.worker.ExecDirException.ViolationException;
+import build.buildfarm.worker.util.LinkedInputExclusions;
+import build.buildfarm.worker.util.LinkedInputExclusions.ExclusionSet;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.ListenableFuture;
 import java.io.IOException;
 import java.nio.file.FileVisitResult;
@@ -49,11 +49,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.UserPrincipal;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.Stack;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
@@ -62,6 +62,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 import lombok.extern.java.Log;
 import org.jspecify.annotations.Nullable;
 
@@ -70,8 +71,11 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
   // perform first-available non-output symlinking and retain directories in cache
   private final boolean linkInputDirectories;
 
-  // indicate symlinking above for a set of matching paths
-  private final Iterable<Pattern> linkedInputDirectories;
+  // operator-supplied regex patterns; any input directory whose path-relative-to-the-input-root
+  // matches is kept as a real directory rather than symlinked to its CAS tree. These merge with the
+  // auto-computed LinkedInputExclusions set — a directory is excluded from linking if it appears in
+  // the computed set OR matches one of these patterns.
+  private final ImmutableList<Pattern> linkedInputExclusionPatterns;
 
   private final Map<Path, DigestFunction.Value> rootInputDigestFunction = new ConcurrentHashMap<>();
   private final Map<Path, Iterable<String>> rootInputFiles = new ConcurrentHashMap<>();
@@ -84,6 +88,7 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
       ImmutableMap<String, UserPrincipal> owners,
       boolean linkInputDirectories,
       Iterable<String> linkedInputDirectories,
+      Iterable<String> linkedInputExclusionPatterns,
       boolean allowSymlinkTargetAbsolute,
       ExecutorService removeDirectoryService,
       ExecutorService accessRecorder,
@@ -97,7 +102,37 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
         accessRecorder,
         fetchService);
     this.linkInputDirectories = linkInputDirectories;
-    this.linkedInputDirectories = Iterables.transform(linkedInputDirectories, Pattern::compile);
+    this.linkedInputExclusionPatterns = compileExclusionPatterns(linkedInputExclusionPatterns);
+    if (linkedInputDirectories.iterator().hasNext()) {
+      log.warning(
+          "linkedInputDirectories is deprecated and ignored; the LinkedInputExclusions computation"
+              + " automatically determines which directories can be symlinked based on output"
+              + " paths. To force specific directories to remain real, use"
+              + " linkedInputExclusionPatterns.");
+    }
+  }
+
+  private static ImmutableList<Pattern> compileExclusionPatterns(Iterable<String> patterns) {
+    ImmutableList.Builder<Pattern> compiled = ImmutableList.builder();
+    for (String pattern : patterns) {
+      try {
+        compiled.add(Pattern.compile(pattern));
+      } catch (PatternSyntaxException e) {
+        throw new IllegalArgumentException(
+            "linkedInputExclusionPatterns contains an invalid regex: " + pattern, e);
+      }
+    }
+    return compiled.build();
+  }
+
+  private static final class DirectoryFrame {
+    private final String path;
+    private final Directory directory;
+
+    private DirectoryFrame(String path, Directory directory) {
+      this.path = path;
+      this.directory = directory;
+    }
   }
 
   @SuppressWarnings("ConstantConditions")
@@ -164,67 +199,6 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
     }
   }
 
-  private static Iterator<String> directoriesIterator(
-      build.bazel.remote.execution.v2.Digest digest,
-      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex) {
-    Directory root = directoriesIndex.get(digest);
-    return new Iterator<>() {
-      boolean atEnd = root.getDirectoriesCount() == 0;
-      Stack<String> path = new Stack<>();
-      Stack<Iterator<DirectoryNode>> route = new Stack<>();
-      Iterator<DirectoryNode> current = root.getDirectoriesList().iterator();
-
-      @Override
-      public boolean hasNext() {
-        return !atEnd;
-      }
-
-      @Override
-      public String next() {
-        String nextPath;
-        DirectoryNode next = current.next();
-        String name = next.getName();
-        path.push(name);
-        nextPath = String.join("/", path);
-        build.bazel.remote.execution.v2.Digest digest = next.getDigest();
-        if (digest.getSizeBytes() != 0) {
-          route.push(current);
-          current = directoriesIndex.get(digest).getDirectoriesList().iterator();
-        } else {
-          path.pop();
-        }
-        while (!current.hasNext() && !route.isEmpty()) {
-          current = route.pop();
-          path.pop();
-        }
-        atEnd = !current.hasNext();
-        return nextPath;
-      }
-    };
-  }
-
-  private Set<String> linkedDirectories(
-      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex,
-      build.bazel.remote.execution.v2.Digest rootDigest) {
-    // skip this search if all the directories are real
-    if (linkInputDirectories) {
-      ImmutableSet.Builder<String> builder = ImmutableSet.builder();
-
-      Iterator<String> dirs = directoriesIterator(rootDigest, directoriesIndex);
-      while (dirs.hasNext()) {
-        String dir = dirs.next();
-        for (Pattern pattern : linkedInputDirectories) {
-          if (pattern.matcher(dir).matches()) {
-            builder.add(dir);
-            break; // avoid adding the same directory twice
-          }
-        }
-      }
-      return builder.build();
-    }
-    return ImmutableSet.of();
-  }
-
   @VisibleForTesting
   static OutputDirectory createOutputDirectory(Command command) {
     Iterable<String> files;
@@ -243,9 +217,46 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
     return OutputDirectory.parse(files, dirs, command.getEnvironmentVariablesList());
   }
 
+  private boolean matchesLinkedInputExclusionPattern(String relativePath) {
+    for (Pattern pattern : linkedInputExclusionPatterns) {
+      if (pattern.matcher(relativePath).matches()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private ImmutableSet<String> matchedLinkedInputExclusionDirectories(
+      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex,
+      build.bazel.remote.execution.v2.Digest rootDigest) {
+    if (linkedInputExclusionPatterns.isEmpty()) {
+      return ImmutableSet.of();
+    }
+
+    HashSet<String> matches = new HashSet<>();
+    ArrayDeque<DirectoryFrame> remaining = new ArrayDeque<>();
+    remaining.add(new DirectoryFrame("", directoriesIndex.get(rootDigest)));
+    while (!remaining.isEmpty()) {
+      DirectoryFrame frame = remaining.removeLast();
+      for (DirectoryNode directoryNode : frame.directory.getDirectoriesList()) {
+        String path =
+            frame.path.isEmpty()
+                ? directoryNode.getName()
+                : frame.path + "/" + directoryNode.getName();
+        if (matchesLinkedInputExclusionPattern(path)) {
+          matches.add(path);
+        }
+        if (directoryNode.getDigest().getSizeBytes() != 0) {
+          remaining.add(new DirectoryFrame(path, directoriesIndex.get(directoryNode.getDigest())));
+        }
+      }
+    }
+    return ImmutableSet.copyOf(matches);
+  }
+
   class LinkExecFileVisitor extends ExecFileVisitor {
     private final Path root;
-    private final Set<Path> linkedDirectories; // only need contains
+    private final ExclusionSet linkedInputExclusions;
     private final Map<build.bazel.remote.execution.v2.Digest, Directory>
         index; // only need retrieve
     private final OutputDirectory outputDirectoryRoot;
@@ -257,12 +268,12 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
     LinkExecFileVisitor(
         WorkerExecutedMetadata.Builder workerExecutedMetadata,
         Path root,
-        Set<Path> linkedDirectories,
+        ExclusionSet linkedInputExclusions,
         Map<build.bazel.remote.execution.v2.Digest, Directory> index,
         OutputDirectory outputDirectoryRoot) {
       super(workerExecutedMetadata);
       this.root = root;
-      this.linkedDirectories = linkedDirectories;
+      this.linkedInputExclusions = linkedInputExclusions;
       this.index = index;
       this.outputDirectoryRoot = outputDirectoryRoot;
     }
@@ -303,10 +314,13 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
         outputDirectory =
             parentOutputDirectory != null ? parentOutputDirectory.getChild(name) : null;
       }
-      if (outputDirectory == null && linkedDirectories.contains(dir)) {
+      String relativePath = LinkedInputExclusions.pathToRelativeString(root, dir);
+      if (linkInputDirectories
+          && outputDirectory == null
+          && !linkedInputExclusions.excludes(relativePath)) {
         Digest digest = (Digest) attrs.fileKey();
         build.bazel.remote.execution.v2.Digest reapiDigest = DigestUtil.toDigest(digest);
-        workerExecutedMetadata.addLinkedInputDirectories(root.relativize(dir).toString());
+        workerExecutedMetadata.addLinkedInputDirectories(relativePath);
         futures.add(
             transform(
                 linkDirectory(dir, digest, index),
@@ -369,29 +383,20 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
     Digest inputRootDigest = DigestUtil.fromDigest(action.getInputRootDigest(), digestFunction);
     OutputDirectory outputDirectory = createOutputDirectory(command);
 
+    ExclusionSet linkedInputExclusions =
+        linkInputDirectories
+            ? LinkedInputExclusions.computeExclusionSet(
+                command,
+                ImmutableSet.of(),
+                matchedLinkedInputExclusionDirectories(
+                    directoriesIndex, DigestUtil.toDigest(inputRootDigest)))
+            : ExclusionSet.empty();
+
     Path execDir = root().resolve(operationName);
     if (Files.exists(execDir)) {
       Directories.remove(execDir, fileStore);
     }
     Files.createDirectories(execDir);
-
-    Set<Path> linkedInputDirectories =
-        linkInputDirectories
-            ? ImmutableSet.copyOf(
-                Iterables.transform(
-                    linkedDirectories(directoriesIndex, DigestUtil.toDigest(inputRootDigest)),
-                    execDir::resolve))
-            : ImmutableSet.of(); // does this work on windows with / separators?
-
-    // When output_paths is used (REAPI >= 2.1), output directories are indistinguishable from
-    // output files. Exclude them from linking so they remain writable for the action.
-    if (command.getOutputPathsCount() != 0 && !linkedInputDirectories.isEmpty()) {
-      Set<Path> outputPaths =
-          ImmutableSet.copyOf(
-              CommandUtils.getResolvedOutputPaths(
-                  command, execDir.resolve(command.getWorkingDirectory())));
-      linkedInputDirectories = Sets.difference(linkedInputDirectories, outputPaths).immutableCopy();
-    }
 
     log.log(Level.FINER, operationName + " walking execTree");
     ExecTree execTree = new ExecTree(directoriesIndex);
@@ -399,7 +404,7 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
         new LinkExecFileVisitor(
             workerExecutedMetadata,
             execDir,
-            linkedInputDirectories,
+            linkedInputExclusions,
             directoriesIndex,
             outputDirectory);
     execTree.walk(execDir, inputRootDigest, visitor);

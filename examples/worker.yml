@@ -1,5 +1,10 @@
 publicName: localhost:8981
 dequeueMatchSettings:
   allowUnmatched: true
-linkedInputDirectories:
-- (?!external/)[^/]+
+# linkedInputDirectories is deprecated and ignored. The input link exclusion
+# computation automatically determines which directories can be symlinked
+# based on output paths. To force specific input directories to remain real,
+# use linkedInputExclusionPatterns (regex patterns that merge with the
+# auto-computed exclusion set). Empty by default.
+# linkedInputExclusionPatterns:
+# - external

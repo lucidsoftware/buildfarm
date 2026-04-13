@@ -25,6 +25,7 @@ java_test(
         "//src/main/java/build/buildfarm/instance",
         "//src/main/java/build/buildfarm/worker",
         "//src/main/java/build/buildfarm/worker/resources",
+        "//src/main/java/build/buildfarm/worker/util",
         "//src/main/protobuf/build/buildfarm/v1test:buildfarm_java_proto",
         "//src/test/java/build/buildfarm:test_runner",
         "@buildfarm_maven//:com_github_jnr_jnr_constants",

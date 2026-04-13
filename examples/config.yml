@@ -136,8 +136,18 @@ worker:
   reportResultStageWidth: 1
   linkExecFileSystem: true
   linkInputDirectories: true
-  linkedInputDirectories:
-  - ^(?!external$).*$
+  # linkedInputDirectories is deprecated and ignored. The input link exclusion
+  # computation automatically determines which directories can be symlinked
+  # based on output paths. Previously, the default regex excluded "external/"
+  # from symlinking; now all non-output directories are eligible, which is
+  # more efficient (one directory symlink instead of per-child symlinks).
+  #
+  # linkedInputExclusionPatterns forces specific input directories to remain
+  # real instead of symlinked. Matches merge with the auto-computed exclusion
+  # set. To reproduce the old "^(?!external$).*$" inclusion default, use the
+  # complementary exclusion pattern below. Empty by default.
+  # linkedInputExclusionPatterns:
+  # - external
   execOwner:
   defaultMaxCores: 0
   limitGlobalExecution: false
