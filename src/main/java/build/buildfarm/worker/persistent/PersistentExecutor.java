@@ -107,7 +107,7 @@ public class PersistentExecutor {
       Duration timeout,
       Path workRootsDir,
       ActionResult.Builder resultBuilder)
-      throws IOException {
+      throws IOException, InterruptedException {
     // Pull out persistent worker start command from the overall action request
 
     log.log(Level.FINE, "executeCommandOnPersistentWorker[" + operationName + "]");
@@ -195,6 +195,9 @@ public class PersistentExecutor {
 
       response = fullResponse.response;
       stdErr = fullResponse.errorString;
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw e;
     } catch (Exception e) {
       String debug =
           "\n\tRequest.initCmd: "
