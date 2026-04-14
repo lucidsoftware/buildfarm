@@ -33,6 +33,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import lombok.extern.java.Log;
 import persistent.bazel.client.WorkerKey;
@@ -75,6 +76,22 @@ public class PersistentExecutor {
               + defaultMaxWorkersPerKey);
     }
     return defaultMaxWorkersPerKey;
+  }
+
+  /**
+   * Shuts down the shared ProtoCoordinator, releasing persistent worker materialization refs. Must
+   * be called before CASFileCache.stop() during graceful shutdown.
+   */
+  public static void shutdownCoordinator() {
+    coordinator.shutdown();
+  }
+
+  /**
+   * Shuts down the shared ProtoCoordinator, waiting up to the supplied budget for active persistent
+   * requests to finish before force-invalidating their workers.
+   */
+  public static void shutdownCoordinator(long timeout, TimeUnit unit) {
+    coordinator.shutdown(timeout, unit);
   }
 
   /**

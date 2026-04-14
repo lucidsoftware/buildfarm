@@ -14,14 +14,15 @@
 
 package build.buildfarm.worker.persistent;
 
+import build.bazel.remote.execution.v2.Digest;
 import build.bazel.remote.execution.v2.DigestFunction;
 import build.buildfarm.cas.cfc.CASFileCache;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import javax.annotation.Nullable;
 import lombok.extern.java.Log;
@@ -31,9 +32,9 @@ import lombok.extern.java.Log;
  * ProtoCoordinator for persistent workers. Holds CAS references that must be decremented via
  * close().
  *
- * <p>Implements AutoCloseable with idempotent close() — multiple calls are safe after refs have
- * been decremented. If ref cleanup fails, the FetchResult stays open so a later cleanup site can
- * retry.
+ * <p>Lifecycle: OPEN → TRANSFERRED (refs handed to MaterializationState) or CLOSED (refs
+ * decremented). Both are terminal states. close() only decrements from OPEN. If ref cleanup fails,
+ * the FetchResult stays OPEN so a later cleanup site can retry.
  */
 @Log
 public class FetchResult implements AutoCloseable {
@@ -55,7 +56,7 @@ public class FetchResult implements AutoCloseable {
       EntryType type,
       @Nullable Path casPath,
       @Nullable String key,
-      @Nullable build.bazel.remote.execution.v2.Digest digest,
+      @Nullable Digest digest,
       @Nullable String symlinkTarget) {}
 
   private final ImmutableList<Entry> entries;
@@ -70,7 +71,7 @@ public class FetchResult implements AutoCloseable {
   private final ImmutableSet<String> descendedDirectories;
 
   private final ImmutableList<String> refKeys;
-  private final ImmutableList<build.bazel.remote.execution.v2.Digest> refDigests;
+  private final ImmutableList<Digest> refDigests;
   private final DigestFunction.Value digestFunction;
   private final CASFileCache fileCache;
 
@@ -91,14 +92,20 @@ public class FetchResult implements AutoCloseable {
    */
   private final ImmutableSet<String> zeroSizeToolInputPaths;
 
-  private final AtomicBoolean closed = new AtomicBoolean(false);
-  private final AtomicBoolean closing = new AtomicBoolean(false);
+  /** Lifecycle states for CAS ref ownership. */
+  enum State {
+    OPEN,
+    TRANSFERRED,
+    CLOSED
+  }
+
+  private State state = State.OPEN;
 
   public FetchResult(
       ImmutableList<Entry> entries,
       ImmutableSet<String> descendedDirectories,
       ImmutableList<String> refKeys,
-      ImmutableList<build.bazel.remote.execution.v2.Digest> refDigests,
+      ImmutableList<Digest> refDigests,
       DigestFunction.Value digestFunction,
       CASFileCache fileCache,
       ImmutableMap<String, Path> toolInputCasPaths,
@@ -121,6 +128,22 @@ public class FetchResult implements AutoCloseable {
     return descendedDirectories;
   }
 
+  public ImmutableList<String> refKeys() {
+    return refKeys;
+  }
+
+  public ImmutableList<Digest> refDigests() {
+    return refDigests;
+  }
+
+  public DigestFunction.Value digestFunction() {
+    return digestFunction;
+  }
+
+  public CASFileCache fileCache() {
+    return fileCache;
+  }
+
   public ImmutableMap<String, Path> toolInputCasPaths() {
     return toolInputCasPaths;
   }
@@ -130,32 +153,31 @@ public class FetchResult implements AutoCloseable {
   }
 
   /**
-   * Decrements all CAS references held by this FetchResult. Idempotent after successful cleanup.
-   * Failed cleanup attempts leave this FetchResult open for a later retry.
+   * Decrements all CAS references held by this FetchResult. Only succeeds when transitioning from
+   * OPEN to CLOSED. No-op if already TRANSFERRED or CLOSED.
    */
   @Override
-  public void close() {
-    if (closed.get() || !closing.compareAndSet(false, true)) {
+  public synchronized void close() {
+    if (state != State.OPEN) {
       return;
     }
 
-    boolean wasInterrupted = false;
-    try {
-      if (!refKeys.isEmpty() || !refDigests.isEmpty()) {
+    if (!refKeys.isEmpty() || !refDigests.isEmpty()) {
+      try {
         fileCache.decrementReferences(refKeys, refDigests, digestFunction);
-      }
-      closed.set(true);
-    } catch (IOException e) {
-      log.log(Level.SEVERE, cleanupFailureMessage(), e);
-    } catch (InterruptedException e) {
-      wasInterrupted = true;
-      log.log(Level.SEVERE, cleanupFailureMessage(), e);
-    } finally {
-      closing.set(false);
-      if (wasInterrupted) {
-        Thread.currentThread().interrupt();
+      } catch (RuntimeException | IOException | InterruptedException e) {
+        // decrementReferences can throw unchecked (e.g. IllegalStateException) when the backing CAS
+        // entry is already gone or its refcount underflows. Swallow and log like the checked cases:
+        // close() is best-effort and runs from teardown finally-blocks/loops where throwing would
+        // strand sibling cleanups. Stay OPEN so a later cleanup site can retry.
+        log.log(Level.SEVERE, cleanupFailureMessage(), e);
+        if (e instanceof InterruptedException) {
+          Thread.currentThread().interrupt();
+        }
+        return;
       }
     }
+    state = State.CLOSED;
   }
 
   private String cleanupFailureMessage() {
@@ -166,7 +188,23 @@ public class FetchResult implements AutoCloseable {
         + " directory refs)";
   }
 
-  public boolean isClosed() {
-    return closed.get();
+  /**
+   * Marks this FetchResult as transferred — the caller has taken ownership of the CAS refs (e.g.,
+   * stored them in a MaterializationState). After this call, close() becomes a no-op — it will NOT
+   * decrement refs. Returns false if close() already ran (refs already decremented), in which case
+   * the caller must not assume ref ownership.
+   */
+  public synchronized boolean markTransferred() {
+    if (state != State.OPEN) {
+      return false;
+    }
+    state = State.TRANSFERRED;
+    return true;
+  }
+
+  /** Returns true if this FetchResult has reached a terminal state (TRANSFERRED or CLOSED). */
+  @VisibleForTesting
+  public synchronized boolean isTerminal() {
+    return state != State.OPEN;
   }
 }

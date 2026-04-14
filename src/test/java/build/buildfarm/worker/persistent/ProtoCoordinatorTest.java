@@ -41,6 +41,7 @@ import com.google.protobuf.Duration;
 import com.google.rpc.Code;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -49,6 +50,7 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.After;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -61,13 +63,13 @@ public class ProtoCoordinatorTest {
   private final List<ProtoCoordinator> coordinators = new ArrayList<>();
 
   private ProtoCoordinator newCoordinator() {
-    ProtoCoordinator protoCoordinator = ProtoCoordinator.ofCommonsPool(4);
+    ProtoCoordinator protoCoordinator = ProtoCoordinator.ofCommonsPool(/* maxWorkersPerKey= */ 4);
     coordinators.add(protoCoordinator);
     return protoCoordinator;
   }
 
   @After
-  public void shutdownSchedulers() {
+  public void shutdownCoordinators() {
     for (ProtoCoordinator protoCoordinator : coordinators) {
       protoCoordinator.timeoutScheduler.shutdownNow();
     }
@@ -426,7 +428,7 @@ public class ProtoCoordinatorTest {
 
     assertThat(code).isEqualTo(Code.OK);
     assertThat(resultBuilder.getExitCode()).isEqualTo(-1);
-    assertThat(fetchResult.isClosed()).isTrue();
+    assertThat(fetchResult.isTerminal()).isTrue();
     verify(mockCache)
         .decrementReferences(
             ImmutableList.of("sha256_worker_failure"),
@@ -462,7 +464,7 @@ public class ProtoCoordinatorTest {
       Files.write(execFile, "output content".getBytes());
     }
 
-    ProtoCoordinator protoCoordinator = ProtoCoordinator.ofCommonsPool(4);
+    ProtoCoordinator protoCoordinator = newCoordinator();
     protoCoordinator.moveOutputsToOperationRoot(workFilesContext, workerExecRoot);
 
     for (String relOutput : outputPaths) {
@@ -494,7 +496,7 @@ public class ProtoCoordinatorTest {
     Files.write(outputDir.resolve("file1.txt"), "file1".getBytes());
     Files.write(outputDir.resolve("subdir/file2.txt"), "file2".getBytes());
 
-    ProtoCoordinator protoCoordinator = ProtoCoordinator.ofCommonsPool(4);
+    ProtoCoordinator protoCoordinator = newCoordinator();
     protoCoordinator.moveOutputsToOperationRoot(workFilesContext, workerExecRoot);
 
     assertThat(Files.exists(opRoot.resolve("output.jar"))).isTrue();
@@ -577,7 +579,7 @@ public class ProtoCoordinatorTest {
 
     // Make sure that, despite the error, the request is cleaned up from the map of pending
     // requests
-    assertThat(ProtoCoordinator.hasPendingRequest(request)).isFalse();
+    assertThat(protoCoordinator.hasPendingRequest(request)).isFalse();
   }
 
   @Test
@@ -606,7 +608,7 @@ public class ProtoCoordinatorTest {
     Files.write(outputDir.resolve("file1.txt"), "file1".getBytes());
     Files.write(outputDir.resolve("subdir/file2.txt"), "file2".getBytes());
 
-    ProtoCoordinator protoCoordinator = ProtoCoordinator.ofCommonsPool(4);
+    ProtoCoordinator protoCoordinator = newCoordinator();
     protoCoordinator.moveOutputsToOperationRoot(workFilesContext, workerExecRoot);
 
     assertThat(Files.exists(opRoot.resolve("output_file"))).isTrue();
@@ -820,10 +822,13 @@ public class ProtoCoordinatorTest {
    * FetchResult path).
    */
   private RequestCtx makeFetchResultRequest(Path opRoot, FetchResult fetchResult) {
+    return makeFetchResultRequest(opRoot, WorkerTestUtils.makeCommand(), fetchResult);
+  }
+
+  private RequestCtx makeFetchResultRequest(Path opRoot, Command command, FetchResult fetchResult) {
     Tree tree =
         WorkerTestUtils.makeTree(
             opRoot.toString(), ImmutableList.of(new TreeFile("dummy", "content")));
-    Command command = WorkerTestUtils.makeCommand();
     WorkFilesContext ctx = WorkFilesContext.fromContext(opRoot, tree, command);
     WorkerInputs workerFiles = WorkerInputs.from(ctx, ImmutableList.of("reqArg1"));
     return new RequestCtx(
@@ -907,7 +912,7 @@ public class ProtoCoordinatorTest {
   }
 
   @Test
-  public void postWorkCleanup_cleanUpFetchResultLinks_deletesAll() throws Exception {
+  public void postWorkCleanup_successLeavesLinksForIncrementalReuse() throws Exception {
     ProtoCoordinator protoCoordinator = newCoordinator();
 
     Path fsRoot = jimFsRoot();
@@ -954,13 +959,13 @@ public class ProtoCoordinatorTest {
     WorkResponse response = WorkResponse.newBuilder().setExitCode(0).build();
     protoCoordinator.postWorkCleanup(response, mockWorker, request);
 
-    // FetchResult should be closed (refs decremented)
-    assertThat(fetchResult.isClosed()).isTrue();
-    verify(mockCache)
-        .decrementReferences(
-            ImmutableList.of("sha256_aaa"),
-            ImmutableList.of(dirDigest),
-            DigestFunction.Value.SHA256);
+    // FetchResult should be marked transferred (refs carried by MaterializationState, not
+    // decremented yet — they'll be decremented when the state is replaced or the worker shuts down)
+    assertThat(fetchResult.isTerminal()).isTrue();
+
+    // Links should still exist (left in place for incremental reuse)
+    assertThat(Files.exists(workerExecRoot.resolve("src/A.java"))).isTrue();
+    assertThat(Files.isSymbolicLink(workerExecRoot.resolve("lib"))).isTrue();
   }
 
   @Test
@@ -1005,7 +1010,613 @@ public class ProtoCoordinatorTest {
     assertThat(Files.exists(workerExecRoot.resolve("src/B.java"))).isFalse();
 
     // FetchResult should be closed
-    assertThat(fetchResult.isClosed()).isTrue();
+    assertThat(fetchResult.isTerminal()).isTrue();
+  }
+
+  // ---- Incremental update tests (Phase 3 paths) ----
+
+  @Test
+  public void incrementalUpdate_unchangedFilesPersistAcrossRequests() throws Exception {
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_incrPersist");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_incrPersist");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_incrPersist");
+    Files.createDirectory(workerExecRoot);
+
+    // CAS targets
+    Path casFileA = casRoot.resolve("file_a");
+    Files.write(casFileA, "content A".getBytes());
+    Path casFileB = casRoot.resolve("file_b");
+    Files.write(casFileB, "content B".getBytes());
+    Path casFileC = casRoot.resolve("file_c");
+    Files.write(casFileC, "content C".getBytes());
+    Path casFileBprime = casRoot.resolve("file_b_prime");
+    Files.write(casFileBprime, "content B prime".getBytes());
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    // --- Request 1: full materialization of {A, B, C} ---
+    ImmutableList<FetchResult.Entry> entries1 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFileA, "key_a", null, null),
+            new FetchResult.Entry(
+                "src/B.java", FetchResult.EntryType.FILE, casFileB, "key_b", null, null),
+            new FetchResult.Entry(
+                "src/C.java", FetchResult.EntryType.FILE, casFileC, "key_c", null, null));
+
+    FetchResult fetchResult1 =
+        makeFetchResultWithRealPaths(casRoot, entries1, ImmutableSet.of("src"), mockCache);
+    RequestCtx request1 = makeFetchResultRequest(opRoot, fetchResult1);
+
+    protoCoordinator.preWorkInit(null, request1, mockWorker);
+
+    // Verify all three files exist
+    assertThat(Files.exists(workerExecRoot.resolve("src/A.java"))).isTrue();
+    assertThat(Files.exists(workerExecRoot.resolve("src/B.java"))).isTrue();
+    assertThat(Files.exists(workerExecRoot.resolve("src/C.java"))).isTrue();
+
+    // Complete request 1 successfully
+    WorkResponse response1 = WorkResponse.newBuilder().setExitCode(0).build();
+    protoCoordinator.postWorkCleanup(response1, mockWorker, request1);
+
+    // After cleanup, links should STILL exist (incremental reuse)
+    assertThat(Files.exists(workerExecRoot.resolve("src/A.java"))).isTrue();
+    assertThat(Files.exists(workerExecRoot.resolve("src/B.java"))).isTrue();
+    assertThat(Files.exists(workerExecRoot.resolve("src/C.java"))).isTrue();
+
+    // --- Request 2: B changed to B' ---
+    ImmutableList<FetchResult.Entry> entries2 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFileA, "key_a", null, null),
+            new FetchResult.Entry(
+                "src/B.java", FetchResult.EntryType.FILE, casFileBprime, "key_b_prime", null, null),
+            new FetchResult.Entry(
+                "src/C.java", FetchResult.EntryType.FILE, casFileC, "key_c", null, null));
+
+    FetchResult fetchResult2 =
+        makeFetchResultWithRealPaths(casRoot, entries2, ImmutableSet.of("src"), mockCache);
+    RequestCtx request2 = makeFetchResultRequest(opRoot, fetchResult2);
+
+    protoCoordinator.preWorkInit(null, request2, mockWorker);
+
+    // A and C should still exist (unchanged)
+    assertThat(Files.exists(workerExecRoot.resolve("src/A.java"))).isTrue();
+    assertThat(Files.exists(workerExecRoot.resolve("src/C.java"))).isTrue();
+
+    // B should be updated to B'
+    assertThat(Files.exists(workerExecRoot.resolve("src/B.java"))).isTrue();
+    assertThat(new String(Files.readAllBytes(workerExecRoot.resolve("src/B.java"))))
+        .isEqualTo("content B prime");
+  }
+
+  @Test
+  public void incrementalUpdate_addedAndRemovedEntries() throws Exception {
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_incrAddRm");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_incrAddRm");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_incrAddRm");
+    Files.createDirectory(workerExecRoot);
+
+    Path casFileA = casRoot.resolve("file_a");
+    Files.write(casFileA, "content A".getBytes());
+    Path casFileB = casRoot.resolve("file_b");
+    Files.write(casFileB, "content B".getBytes());
+    Path casFileC = casRoot.resolve("file_c");
+    Files.write(casFileC, "content C".getBytes());
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    // --- Request 1: {A, B} ---
+    ImmutableList<FetchResult.Entry> entries1 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFileA, "key_a", null, null),
+            new FetchResult.Entry(
+                "src/B.java", FetchResult.EntryType.FILE, casFileB, "key_b", null, null));
+
+    FetchResult fetchResult1 =
+        makeFetchResultWithRealPaths(casRoot, entries1, ImmutableSet.of("src"), mockCache);
+    RequestCtx request1 = makeFetchResultRequest(opRoot, fetchResult1);
+
+    protoCoordinator.preWorkInit(null, request1, mockWorker);
+    WorkResponse response1 = WorkResponse.newBuilder().setExitCode(0).build();
+    protoCoordinator.postWorkCleanup(response1, mockWorker, request1);
+
+    // --- Request 2: {B, C} (A removed, C added) ---
+    ImmutableList<FetchResult.Entry> entries2 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/B.java", FetchResult.EntryType.FILE, casFileB, "key_b", null, null),
+            new FetchResult.Entry(
+                "src/C.java", FetchResult.EntryType.FILE, casFileC, "key_c", null, null));
+
+    FetchResult fetchResult2 =
+        makeFetchResultWithRealPaths(casRoot, entries2, ImmutableSet.of("src"), mockCache);
+    RequestCtx request2 = makeFetchResultRequest(opRoot, fetchResult2);
+
+    protoCoordinator.preWorkInit(null, request2, mockWorker);
+
+    // A should be removed
+    assertThat(Files.exists(workerExecRoot.resolve("src/A.java"))).isFalse();
+    // B should be unchanged
+    assertThat(Files.exists(workerExecRoot.resolve("src/B.java"))).isTrue();
+    assertThat(new String(Files.readAllBytes(workerExecRoot.resolve("src/B.java"))))
+        .isEqualTo("content B");
+    // C should be added
+    assertThat(Files.exists(workerExecRoot.resolve("src/C.java"))).isTrue();
+    assertThat(new String(Files.readAllBytes(workerExecRoot.resolve("src/C.java"))))
+        .isEqualTo("content C");
+  }
+
+  @Test
+  public void incrementalUpdate_partialFailure_cleansUpAllLinks() throws Exception {
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_incrFail");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_incrFail");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_incrFail");
+    Files.createDirectory(workerExecRoot);
+
+    Path casFileA = casRoot.resolve("file_a");
+    Files.write(casFileA, "content A".getBytes());
+    Path casFileB = casRoot.resolve("file_b");
+    Files.write(casFileB, "content B".getBytes());
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    // --- Request 1: {A, B} succeeds ---
+    ImmutableList<FetchResult.Entry> entries1 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFileA, "key_a", null, null),
+            new FetchResult.Entry(
+                "src/B.java", FetchResult.EntryType.FILE, casFileB, "key_b", null, null));
+
+    FetchResult fetchResult1 =
+        makeFetchResultWithRealPaths(casRoot, entries1, ImmutableSet.of("src"), mockCache);
+    RequestCtx request1 = makeFetchResultRequest(opRoot, fetchResult1);
+
+    protoCoordinator.preWorkInit(null, request1, mockWorker);
+    WorkResponse response1 = WorkResponse.newBuilder().setExitCode(0).build();
+    protoCoordinator.postWorkCleanup(response1, mockWorker, request1);
+
+    // A and B persist after cleanup
+    assertThat(Files.exists(workerExecRoot.resolve("src/A.java"))).isTrue();
+    assertThat(Files.exists(workerExecRoot.resolve("src/B.java"))).isTrue();
+
+    // --- Request 2: add C (with non-existent CAS path to trigger failure) ---
+    Path badCasFile = casRoot.resolve("nonexistent_file"); // Does not exist
+    ImmutableList<FetchResult.Entry> entries2 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFileA, "key_a", null, null),
+            new FetchResult.Entry(
+                "src/B.java", FetchResult.EntryType.FILE, casFileB, "key_b", null, null),
+            new FetchResult.Entry(
+                "src/C.java", FetchResult.EntryType.FILE, badCasFile, "key_c_bad", null, null));
+
+    FetchResult fetchResult2 =
+        makeFetchResultWithRealPaths(casRoot, entries2, ImmutableSet.of("src"), mockCache);
+    RequestCtx request2 = makeFetchResultRequest(opRoot, fetchResult2);
+
+    // preWorkInit should fail because C's CAS path doesn't exist
+    assertThrows(IOException.class, () -> protoCoordinator.preWorkInit(null, request2, mockWorker));
+
+    // Simulate the coordinator framework calling postWorkCleanup(null) after failure
+    protoCoordinator.postWorkCleanup(null, mockWorker, request2);
+
+    // ALL links should be cleaned up (both new and unchanged from request 1)
+    assertThat(Files.exists(workerExecRoot.resolve("src/A.java"))).isFalse();
+    assertThat(Files.exists(workerExecRoot.resolve("src/B.java"))).isFalse();
+    assertThat(Files.exists(workerExecRoot.resolve("src/C.java"))).isFalse();
+
+    // FetchResult should be closed
+    assertThat(fetchResult2.isTerminal()).isTrue();
+  }
+
+  @Test
+  public void incrementalUpdate_descendedDirectoriesChanged_fullRematerialization()
+      throws Exception {
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_incrCbl");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_incrCbl");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_incrCbl");
+    Files.createDirectory(workerExecRoot);
+
+    Path casDir = casRoot.resolve("dir_lib");
+    Files.createDirectory(casDir);
+
+    build.bazel.remote.execution.v2.Digest dirDigest =
+        build.bazel.remote.execution.v2.Digest.newBuilder()
+            .setHash("lib_hash")
+            .setSizeBytes(100)
+            .build();
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    // --- Request 1: lib linked, descendedDirectories={src} ---
+    ImmutableList<FetchResult.Entry> entries1 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "lib", FetchResult.EntryType.DIRECTORY, casDir, null, dirDigest, null));
+
+    FetchResult fetchResult1 =
+        makeFetchResultWithRealPaths(casRoot, entries1, ImmutableSet.of("src"), mockCache);
+    RequestCtx request1 = makeFetchResultRequest(opRoot, fetchResult1);
+
+    protoCoordinator.preWorkInit(null, request1, mockWorker);
+    assertThat(Files.isSymbolicLink(workerExecRoot.resolve("lib"))).isTrue();
+
+    WorkResponse response1 = WorkResponse.newBuilder().setExitCode(0).build();
+    protoCoordinator.postWorkCleanup(response1, mockWorker, request1);
+
+    // Remove lib from disk between requests. The previous state still records lib at its unchanged
+    // digest, so an incremental diff would classify lib as unchanged and skip it — leaving it
+    // missing. Only a full re-materialization (cleanUpPreviousState + linkFromFetchResult) re-links
+    // it, which is what makes the full-vs-incremental branch observable here.
+    Files.delete(workerExecRoot.resolve("lib"));
+    assertThat(Files.exists(workerExecRoot.resolve("lib"), LinkOption.NOFOLLOW_LINKS)).isFalse();
+
+    // --- Request 2: SAME lib digest, but descendedDirectories changed to {src, out} ---
+    ImmutableList<FetchResult.Entry> entries2 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "lib", FetchResult.EntryType.DIRECTORY, casDir, null, dirDigest, null));
+
+    FetchResult fetchResult2 =
+        makeFetchResultWithRealPaths(casRoot, entries2, ImmutableSet.of("src", "out"), mockCache);
+    RequestCtx request2 = makeFetchResultRequest(opRoot, fetchResult2);
+
+    protoCoordinator.preWorkInit(null, request2, mockWorker);
+
+    // The changed descendedDirectories set forced full re-materialization, which re-linked the
+    // unchanged-digest lib we deleted. Had the diff stayed on the incremental path, lib would still
+    // be missing.
+    assertThat(Files.isSymbolicLink(workerExecRoot.resolve("lib"))).isTrue();
+  }
+
+  @Test
+  public void fullRematerialization_replacesPriorInputMutatedToNonEmptyDirectory()
+      throws Exception {
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_fullReplaceDir");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_fullReplaceDir");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_fullReplaceDir");
+    Files.createDirectory(workerExecRoot);
+
+    Path casFileA = casRoot.resolve("file_a");
+    Files.write(casFileA, "content A".getBytes());
+    Path casFileB = casRoot.resolve("file_b");
+    Files.write(casFileB, "content B".getBytes());
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    ImmutableList<FetchResult.Entry> entries1 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFileA, "key_a", null, null));
+    FetchResult fetchResult1 =
+        makeFetchResultWithRealPaths(casRoot, entries1, ImmutableSet.of("src"), mockCache);
+    RequestCtx request1 = makeFetchResultRequest(opRoot, fetchResult1);
+
+    protoCoordinator.preWorkInit(null, request1, mockWorker);
+    protoCoordinator.postWorkCleanup(
+        WorkResponse.newBuilder().setExitCode(0).build(), mockWorker, request1);
+
+    Path priorInputPath = workerExecRoot.resolve("src/A.java");
+    Files.delete(priorInputPath);
+    Files.createDirectory(priorInputPath);
+    Files.write(priorInputPath.resolve("leftover.tmp"), "leftover".getBytes());
+
+    ImmutableList<FetchResult.Entry> entries2 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFileB, "key_b", null, null));
+    FetchResult fetchResult2 =
+        makeFetchResultWithRealPaths(casRoot, entries2, ImmutableSet.of("src", "out"), mockCache);
+    RequestCtx request2 = makeFetchResultRequest(opRoot, fetchResult2);
+
+    protoCoordinator.preWorkInit(null, request2, mockWorker);
+
+    assertThat(Files.isRegularFile(priorInputPath)).isTrue();
+    assertThat(new String(Files.readAllBytes(priorInputPath))).isEqualTo("content B");
+  }
+
+  @Test
+  public void incrementalRemovedEntry_replacesPriorInputMutatedToNonEmptyDirectory()
+      throws Exception {
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_removedReplaceDir");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_removedReplaceDir");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_removedReplaceDir");
+    Files.createDirectory(workerExecRoot);
+
+    Path casFileA = casRoot.resolve("file_a");
+    Files.write(casFileA, "content A".getBytes());
+    Path casFileB = casRoot.resolve("file_b");
+    Files.write(casFileB, "content B".getBytes());
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    ImmutableList<FetchResult.Entry> entries1 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFileA, "key_a", null, null),
+            new FetchResult.Entry(
+                "src/B.java", FetchResult.EntryType.FILE, casFileB, "key_b", null, null));
+    FetchResult fetchResult1 =
+        makeFetchResultWithRealPaths(casRoot, entries1, ImmutableSet.of("src"), mockCache);
+    RequestCtx request1 = makeFetchResultRequest(opRoot, fetchResult1);
+
+    protoCoordinator.preWorkInit(null, request1, mockWorker);
+    protoCoordinator.postWorkCleanup(
+        WorkResponse.newBuilder().setExitCode(0).build(), mockWorker, request1);
+
+    Path removedInputPath = workerExecRoot.resolve("src/A.java");
+    Files.delete(removedInputPath);
+    Files.createDirectory(removedInputPath);
+    Files.write(removedInputPath.resolve("leftover.tmp"), "leftover".getBytes());
+
+    ImmutableList<FetchResult.Entry> entries2 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/B.java", FetchResult.EntryType.FILE, casFileB, "key_b", null, null));
+    FetchResult fetchResult2 =
+        makeFetchResultWithRealPaths(casRoot, entries2, ImmutableSet.of("src"), mockCache);
+    RequestCtx request2 = makeFetchResultRequest(opRoot, fetchResult2);
+
+    protoCoordinator.preWorkInit(null, request2, mockWorker);
+
+    assertThat(Files.exists(removedInputPath, LinkOption.NOFOLLOW_LINKS)).isFalse();
+    assertThat(Files.isRegularFile(workerExecRoot.resolve("src/B.java"))).isTrue();
+  }
+
+  // ---- carried-ref retention tests ----
+
+  @Test
+  public void incrementalUpdate_refsRetainedAcrossRequests_decrementedOnReplacement()
+      throws Exception {
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_refRetain");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_refRetain");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_refRetain");
+    Files.createDirectory(workerExecRoot);
+
+    Path casFileA = casRoot.resolve("file_a");
+    Files.write(casFileA, "content A".getBytes());
+    Path casFileB = casRoot.resolve("file_b");
+    Files.write(casFileB, "content B".getBytes());
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    // --- Request 1: {A} ---
+    ImmutableList<FetchResult.Entry> entries1 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFileA, "key_a", null, null));
+
+    FetchResult fetchResult1 =
+        makeFetchResultWithRealPaths(casRoot, entries1, ImmutableSet.of("src"), mockCache);
+    RequestCtx request1 = makeFetchResultRequest(opRoot, fetchResult1);
+
+    protoCoordinator.preWorkInit(null, request1, mockWorker);
+    WorkResponse response1 = WorkResponse.newBuilder().setExitCode(0).build();
+    protoCoordinator.postWorkCleanup(response1, mockWorker, request1);
+
+    // After request 1: FetchResult is transferred, refs NOT decremented
+    assertThat(fetchResult1.isTerminal()).isTrue();
+    verify(mockCache, org.mockito.Mockito.never())
+        .decrementReferences(
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(DigestFunction.Value.class));
+
+    // --- Request 2: {B} (A removed, B added) ---
+    ImmutableList<FetchResult.Entry> entries2 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/B.java", FetchResult.EntryType.FILE, casFileB, "key_b", null, null));
+
+    FetchResult fetchResult2 =
+        makeFetchResultWithRealPaths(casRoot, entries2, ImmutableSet.of("src"), mockCache);
+    RequestCtx request2 = makeFetchResultRequest(opRoot, fetchResult2);
+
+    // Request 2 replaces request 1's state and decrements request 1's refs.
+    CountDownLatch refDecremented = new CountDownLatch(1);
+    org.mockito.Mockito.doAnswer(
+            invocation -> {
+              refDecremented.countDown();
+              return null;
+            })
+        .when(mockCache)
+        .decrementReferences(
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(DigestFunction.Value.class));
+
+    protoCoordinator.preWorkInit(null, request2, mockWorker);
+    WorkResponse response2 = WorkResponse.newBuilder().setExitCode(0).build();
+    protoCoordinator.postWorkCleanup(response2, mockWorker, request2);
+
+    // Wait for the ref decrement to complete
+    assertThat(refDecremented.await(5, TimeUnit.SECONDS)).isTrue();
+
+    // After request 2: request 1's refs should now be decremented (state was replaced)
+    verify(mockCache)
+        .decrementReferences(
+            ImmutableList.of("key_a"), ImmutableList.of(), DigestFunction.Value.SHA256);
+  }
+
+  @Test
+  public void incrementalUpdate_previousStateCloseThrows_doesNotDecrementNewRefs()
+      throws Exception {
+    // Regression for the transferFetchResultToState compensation bug: releasing the PREVIOUS
+    // state's refs can throw unchecked (decrementReferences throws IllegalStateException when the
+    // backing CAS entry is already gone / its refcount underflows). That failure must NOT cause the
+    // just-stored new state's refs to be decremented — those refs back links still live in the exec
+    // root. The request must still succeed; the old refs simply leak (logged).
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_prevCloseThrows");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_prevCloseThrows");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_prevCloseThrows");
+    Files.createDirectory(workerExecRoot);
+
+    Path casFileA = casRoot.resolve("file_a");
+    Files.write(casFileA, "content A".getBytes());
+    Path casFileB = casRoot.resolve("file_b");
+    Files.write(casFileB, "content B".getBytes());
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    // --- Request 1: {A} stored as the baseline state, carrying key_a ---
+    ImmutableList<FetchResult.Entry> entries1 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFileA, "key_a", null, null));
+    FetchResult fetchResult1 =
+        makeFetchResultWithRealPaths(casRoot, entries1, ImmutableSet.of("src"), mockCache);
+    RequestCtx request1 = makeFetchResultRequest(opRoot, fetchResult1);
+
+    protoCoordinator.preWorkInit(null, request1, mockWorker);
+    protoCoordinator.postWorkCleanup(
+        WorkResponse.newBuilder().setExitCode(0).build(), mockWorker, request1);
+
+    // Releasing request 1's refs (key_a) throws unchecked, as if its CAS entry was already evicted.
+    org.mockito.Mockito.doThrow(new IllegalStateException("key_a has been removed with references"))
+        .when(mockCache)
+        .decrementReferences(
+            org.mockito.ArgumentMatchers.eq(ImmutableList.of("key_a")),
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(DigestFunction.Value.class));
+
+    // --- Request 2: {B} (A removed, B added). Replacing the state releases key_a and throws. ---
+    ImmutableList<FetchResult.Entry> entries2 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/B.java", FetchResult.EntryType.FILE, casFileB, "key_b", null, null));
+    FetchResult fetchResult2 =
+        makeFetchResultWithRealPaths(casRoot, entries2, ImmutableSet.of("src"), mockCache);
+    RequestCtx request2 = makeFetchResultRequest(opRoot, fetchResult2);
+
+    protoCoordinator.preWorkInit(null, request2, mockWorker);
+    // The unchecked failure releasing key_a must be swallowed: request 2 still completes.
+    ResponseCtx response2 =
+        protoCoordinator.postWorkCleanup(
+            WorkResponse.newBuilder().setExitCode(0).build(), mockWorker, request2);
+    assertThat(response2).isNotNull();
+
+    // The old refs (key_a) decrement was attempted...
+    verify(mockCache)
+        .decrementReferences(
+            ImmutableList.of("key_a"), ImmutableList.of(), DigestFunction.Value.SHA256);
+    // ...but the NEW state's refs (key_b) must never be decremented — B is still linked.
+    verify(mockCache, org.mockito.Mockito.never())
+        .decrementReferences(
+            org.mockito.ArgumentMatchers.eq(ImmutableList.of("key_b")),
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(DigestFunction.Value.class));
+    // B's link is intact, backed by the refs that were correctly retained.
+    assertThat(Files.exists(workerExecRoot.resolve("src/B.java"))).isTrue();
+  }
+
+  @Test
+  public void incrementalUpdate_partialFailure_fetchResultCloseDecrementsNewRefs()
+      throws Exception {
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_refFail");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_refFail");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_refFail");
+    Files.createDirectory(workerExecRoot);
+
+    Path casFileA = casRoot.resolve("file_a");
+    Files.write(casFileA, "content A".getBytes());
+    Path badCasFile = casRoot.resolve("nonexistent_file"); // Does not exist
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    // Request with one good file and one bad file (nonexistent CAS path)
+    ImmutableList<FetchResult.Entry> entries =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFileA, "key_a", null, null),
+            new FetchResult.Entry(
+                "src/B.java", FetchResult.EntryType.FILE, badCasFile, "key_b_bad", null, null));
+
+    FetchResult fetchResult =
+        makeFetchResultWithRealPaths(casRoot, entries, ImmutableSet.of("src"), mockCache);
+    RequestCtx request = makeFetchResultRequest(opRoot, fetchResult);
+
+    // preWorkInit should fail because B's CAS path doesn't exist
+    assertThrows(IOException.class, () -> protoCoordinator.preWorkInit(null, request, mockWorker));
+
+    // Simulate the coordinator framework calling postWorkCleanup(null) after failure
+    protoCoordinator.postWorkCleanup(null, mockWorker, request);
+
+    // FetchResult should be closed (markTransferred was NOT called — failure path)
+    // close() should decrement refs because the failure happened before transfer
+    assertThat(fetchResult.isTerminal()).isTrue();
+    // The failure happened before any transfer, so close() decremented the carried refs — both the
+    // good entry's key and the bad entry's key were referenced by InputFetcher before linking.
+    verify(mockCache)
+        .decrementReferences(
+            ImmutableList.of("key_a", "key_b_bad"),
+            ImmutableList.of(),
+            DigestFunction.Value.SHA256);
   }
 
   @Test
@@ -1041,7 +1652,7 @@ public class ProtoCoordinatorTest {
 
     protoCoordinator.postWorkCleanup(null, mockWorker, request);
 
-    assertThat(fetchResult.isClosed()).isTrue();
+    assertThat(fetchResult.isTerminal()).isTrue();
     verify(mockCache)
         .decrementReferences(
             ImmutableList.of("sha256_cleanup"), ImmutableList.of(), DigestFunction.Value.SHA256);
@@ -1395,12 +2006,14 @@ public class ProtoCoordinatorTest {
     assertThat(Files.exists(workerExecRoot.resolve("data/a.java"))).isTrue();
     protoCoordinator.postWorkCleanup(
         WorkResponse.newBuilder().setExitCode(0).build(), mockWorker, requestA);
-    // A's link and its now-empty descended dir are gone.
-    assertThat(Files.exists(workerExecRoot.resolve("data/a.java"))).isFalse();
-    assertThat(Files.exists(workerExecRoot.resolve("data"))).isFalse();
+    // V2 incremental reuse: a successful request leaves its links in place (refs are transferred to
+    // the stored MaterializationState) so the next request can diff against them. A's link and its
+    // descended dir persist rather than being torn down on success.
+    assertThat(Files.exists(workerExecRoot.resolve("data/a.java"))).isTrue();
+    assertThat(Files.exists(workerExecRoot.resolve("data"))).isTrue();
 
     // A's worker process left an undeclared artifact where B will link "data" as a directory unit.
-    Files.createDirectories(workerExecRoot.resolve("data"));
+    // "data" is now a non-empty real directory (A's persisted a.java plus this leftover).
     Files.write(workerExecRoot.resolve("data/undeclared.tmp"), "leftover".getBytes());
 
     // Request B (same worker exec root): "data" is now a directory symlink to CAS.
@@ -1416,5 +2029,777 @@ public class ProtoCoordinatorTest {
     protoCoordinator.preWorkInit(null, requestB, mockWorker);
     assertThat(Files.isSymbolicLink(workerExecRoot.resolve("data"))).isTrue();
     assertThat(Files.readSymbolicLink(workerExecRoot.resolve("data"))).isEqualTo(casDir);
+  }
+
+  // ---- Worker state lifetime, timeout, and shutdown tests ----
+
+  /**
+   * Helper to run a full request cycle (preWorkInit + postWorkCleanup with success response)
+   * storing a MaterializationState for the worker.
+   */
+  private void runSuccessfulRequest(
+      ProtoCoordinator coordinator,
+      Path opRoot,
+      Path casRoot,
+      Path workerExecRoot,
+      CASFileCache mockCache,
+      PersistentWorker mockWorker,
+      String fileKey)
+      throws Exception {
+    Path casFile = casRoot.resolve("file_" + fileKey);
+    if (!Files.exists(casFile)) {
+      Files.write(casFile, ("content_" + fileKey).getBytes());
+    }
+
+    ImmutableList<FetchResult.Entry> entries =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/" + fileKey + ".java",
+                FetchResult.EntryType.FILE,
+                casFile,
+                fileKey,
+                null,
+                null));
+
+    FetchResult fetchResult =
+        makeFetchResultWithRealPaths(casRoot, entries, ImmutableSet.of("src"), mockCache);
+    RequestCtx request = makeFetchResultRequest(opRoot, fetchResult);
+
+    coordinator.preWorkInit(null, request, mockWorker);
+    WorkResponse response = WorkResponse.newBuilder().setExitCode(0).build();
+    coordinator.postWorkCleanup(response, mockWorker, request);
+  }
+
+  @Test
+  public void workerStatesRemainUntilCoordinatorShutdown() throws Exception {
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_worker_lifetime");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_worker_lifetime");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot1 = fsRoot.resolve("workerExecRoot_lifetime1");
+    Files.createDirectory(workerExecRoot1);
+    Path workerExecRoot2 = fsRoot.resolve("workerExecRoot_lifetime2");
+    Files.createDirectory(workerExecRoot2);
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker1 = mock(PersistentWorker.class);
+    when(mockWorker1.getExecRoot()).thenReturn(workerExecRoot1);
+    PersistentWorker mockWorker2 = mock(PersistentWorker.class);
+    when(mockWorker2.getExecRoot()).thenReturn(workerExecRoot2);
+
+    runSuccessfulRequest(
+        protoCoordinator, opRoot, casRoot, workerExecRoot1, mockCache, mockWorker1, "key_w1");
+    runSuccessfulRequest(
+        protoCoordinator, opRoot, casRoot, workerExecRoot2, mockCache, mockWorker2, "key_w2");
+
+    // Creating state for worker2 must not release worker1's refs. Both workers are still live and
+    // both exec roots still contain their persisted links.
+    org.mockito.Mockito.verify(mockCache, org.mockito.Mockito.never())
+        .decrementReferences(
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(DigestFunction.Value.class));
+
+    protoCoordinator.shutdown();
+
+    verify(mockCache)
+        .decrementReferences(
+            ImmutableList.of("key_w1"), ImmutableList.of(), DigestFunction.Value.SHA256);
+    verify(mockCache)
+        .decrementReferences(
+            ImmutableList.of("key_w2"), ImmutableList.of(), DigestFunction.Value.SHA256);
+  }
+
+  @Test
+  public void onTimeout_closesWorkerStateAndDecrementsCASRefs() throws Exception {
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_timeout");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_timeout");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_timeout");
+    Files.createDirectory(workerExecRoot);
+
+    // Set up latch for ref decrement after worker destroy
+    CountDownLatch refDecremented = new CountDownLatch(1);
+    AtomicBoolean workerDestroyed = new AtomicBoolean(false);
+    CASFileCache mockCache = mock(CASFileCache.class);
+    org.mockito.Mockito.doAnswer(
+            invocation -> {
+              assertThat(workerDestroyed.get()).isTrue();
+              refDecremented.countDown();
+              return null;
+            })
+        .when(mockCache)
+        .decrementReferences(
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(DigestFunction.Value.class));
+
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+    org.mockito.Mockito.doAnswer(
+            invocation -> {
+              workerDestroyed.set(true);
+              return null;
+            })
+        .when(mockWorker)
+        .destroy();
+    // Need a WorkerKey for invalidateObject — use a mock that won't throw
+    WorkerKey mockKey = mock(WorkerKey.class);
+    when(mockWorker.getKey()).thenReturn(mockKey);
+
+    // Request 1: full successful cycle stores state for the worker
+    runSuccessfulRequest(
+        protoCoordinator, opRoot, casRoot, workerExecRoot, mockCache, mockWorker, "key_t1");
+
+    // Request 2: set up preWorkInit with a very short timeout, then fire the timeout handler
+    Path casFile2 = casRoot.resolve("file_key_t2");
+    Files.write(casFile2, "content_t2".getBytes());
+
+    ImmutableList<FetchResult.Entry> entries2 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/T2.java", FetchResult.EntryType.FILE, casFile2, "key_t2", null, null));
+    FetchResult fetchResult2 =
+        makeFetchResultWithRealPaths(casRoot, entries2, ImmutableSet.of("src"), mockCache);
+    RequestCtx request2 = makeFetchResultRequest(opRoot, fetchResult2);
+
+    // preWorkInit populates pendingReqs and creates links
+    protoCoordinator.preWorkInit(null, request2, mockWorker);
+    assertThat(protoCoordinator.hasPendingRequest(request2)).isTrue();
+
+    // Directly invoke the timeout handler (deterministic, no scheduling involved).
+    // The handler calls pendingReqs.remove() + onTimeout() which closes worker state.
+    ProtoCoordinator.RequestTimeoutHandler handler =
+        protoCoordinator.new RequestTimeoutHandler(request2);
+    handler.run();
+
+    // Timeout handler should have cleaned up pendingReqs
+    assertThat(protoCoordinator.hasPendingRequest(request2)).isFalse();
+
+    // Wait for state cleanup to decrement refs.
+    assertThat(refDecremented.await(5, TimeUnit.SECONDS)).isTrue();
+
+    // Verify the first request's state refs were decremented after worker destruction.
+    verify(mockCache)
+        .decrementReferences(
+            ImmutableList.of("key_t1"), ImmutableList.of(), DigestFunction.Value.SHA256);
+  }
+
+  @Test
+  public void shutdown_closesAllStatesAndDecrementsRefs() throws Exception {
+    // Don't use newCoordinator() — we manage shutdown manually in this test
+    ProtoCoordinator protoCoordinator = ProtoCoordinator.ofCommonsPool(/* maxWorkersPerKey= */ 4);
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_shutdown");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_shutdown");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot1 = fsRoot.resolve("workerExecRoot_shutdown1");
+    Files.createDirectory(workerExecRoot1);
+    Path workerExecRoot2 = fsRoot.resolve("workerExecRoot_shutdown2");
+    Files.createDirectory(workerExecRoot2);
+
+    // Set up latch for 2 ref decrements (one per state)
+    CountDownLatch refsDecremented = new CountDownLatch(2);
+    CASFileCache mockCache = mock(CASFileCache.class);
+    org.mockito.Mockito.doAnswer(
+            invocation -> {
+              refsDecremented.countDown();
+              return null;
+            })
+        .when(mockCache)
+        .decrementReferences(
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(DigestFunction.Value.class));
+
+    PersistentWorker mockWorker1 = mock(PersistentWorker.class);
+    when(mockWorker1.getExecRoot()).thenReturn(workerExecRoot1);
+    PersistentWorker mockWorker2 = mock(PersistentWorker.class);
+    when(mockWorker2.getExecRoot()).thenReturn(workerExecRoot2);
+
+    // Store 2 states via successful requests
+    runSuccessfulRequest(
+        protoCoordinator, opRoot, casRoot, workerExecRoot1, mockCache, mockWorker1, "key_s1");
+    runSuccessfulRequest(
+        protoCoordinator, opRoot, casRoot, workerExecRoot2, mockCache, mockWorker2, "key_s2");
+
+    // Call shutdown — should close all states and decrement all refs
+    protoCoordinator.shutdown();
+    protoCoordinator.timeoutScheduler.shutdownNow();
+
+    // Wait for both ref decrements to complete
+    assertThat(refsDecremented.await(5, TimeUnit.SECONDS)).isTrue();
+
+    // Verify each state's distinct ref key was decremented — not just two decrements total, which
+    // would also pass if one state were decremented twice and the other leaked.
+    verify(mockCache)
+        .decrementReferences(
+            ImmutableList.of("key_s1"), ImmutableList.of(), DigestFunction.Value.SHA256);
+    verify(mockCache)
+        .decrementReferences(
+            ImmutableList.of("key_s2"), ImmutableList.of(), DigestFunction.Value.SHA256);
+  }
+
+  // ---- Regression and gap-closing tests (output/input overlap, NOFOLLOW delete, failure paths)
+  // ----
+
+  @Test
+  public void incrementalUpdate_inputDeclaredAsOutput_isReLinkedNextRequest() throws Exception {
+    // An input whose path is also a declared output is moved out of the exec root during cleanup;
+    // the next request's diff must re-link it rather than treat it as an unchanged input that is
+    // still on disk.
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_inOut");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_inOut");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_inOut");
+    Files.createDirectory(workerExecRoot);
+
+    Path casFileA = casRoot.resolve("file_a");
+    Files.write(casFileA, "content A".getBytes());
+    Path casFileB = casRoot.resolve("file_b");
+    Files.write(casFileB, "content B".getBytes());
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    // Request 1 declares src/A.java as BOTH an input (linked) and an output_path (moved out).
+    Command outputOverlapsInput =
+        Command.newBuilder().addAllOutputPaths(ImmutableList.of("src/A.java")).build();
+    ImmutableList<FetchResult.Entry> entries1 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFileA, "key_a", null, null),
+            new FetchResult.Entry(
+                "src/B.java", FetchResult.EntryType.FILE, casFileB, "key_b", null, null));
+    FetchResult fetchResult1 =
+        makeFetchResultWithRealPaths(casRoot, entries1, ImmutableSet.of("src"), mockCache);
+    RequestCtx request1 = makeFetchResultRequest(opRoot, outputOverlapsInput, fetchResult1);
+
+    protoCoordinator.preWorkInit(null, request1, mockWorker);
+    assertThat(Files.exists(workerExecRoot.resolve("src/A.java"))).isTrue();
+
+    WorkResponse ok = WorkResponse.newBuilder().setExitCode(0).build();
+    protoCoordinator.postWorkCleanup(ok, mockWorker, request1);
+
+    // moveOutputsToOperationRoot moved src/A.java out; src/B.java (not an output) stays linked.
+    assertThat(Files.exists(opRoot.resolve("src/A.java"))).isTrue();
+    assertThat(Files.exists(workerExecRoot.resolve("src/A.java"))).isFalse();
+    assertThat(Files.exists(workerExecRoot.resolve("src/B.java"))).isTrue();
+
+    // Request 2: identical inputs, A unchanged. The stored state must have excluded A, so the diff
+    // re-links it; without the exclusion it would be skipped as "unchanged" and left missing.
+    ImmutableList<FetchResult.Entry> entries2 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFileA, "key_a", null, null),
+            new FetchResult.Entry(
+                "src/B.java", FetchResult.EntryType.FILE, casFileB, "key_b", null, null));
+    FetchResult fetchResult2 =
+        makeFetchResultWithRealPaths(casRoot, entries2, ImmutableSet.of("src"), mockCache);
+    RequestCtx request2 = makeFetchResultRequest(opRoot, fetchResult2);
+
+    protoCoordinator.preWorkInit(null, request2, mockWorker);
+
+    assertThat(Files.exists(workerExecRoot.resolve("src/A.java"))).isTrue();
+    assertThat(new String(Files.readAllBytes(workerExecRoot.resolve("src/A.java"))))
+        .isEqualTo("content A");
+    assertThat(Files.exists(workerExecRoot.resolve("src/B.java"))).isTrue();
+  }
+
+  @Test
+  public void incrementalUpdate_inputUnderOutputDirectory_isReLinkedNextRequest() throws Exception {
+    // An input that lives under a declared output directory is moved out with that directory's
+    // subtree; the next request must re-link it.
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_underOut");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_underOut");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_underOut");
+    Files.createDirectory(workerExecRoot);
+
+    Path casFile = casRoot.resolve("file_gen");
+    Files.write(casFile, "gen content".getBytes());
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    // gen/in.txt is an input under the declared output directory "gen".
+    Command outputDirContainsInput =
+        Command.newBuilder().addAllOutputPaths(ImmutableList.of("gen")).build();
+    ImmutableList<FetchResult.Entry> entries =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "gen/in.txt", FetchResult.EntryType.FILE, casFile, "key_gen", null, null));
+    FetchResult fetchResult1 =
+        makeFetchResultWithRealPaths(casRoot, entries, ImmutableSet.of("gen"), mockCache);
+    RequestCtx request1 = makeFetchResultRequest(opRoot, outputDirContainsInput, fetchResult1);
+
+    protoCoordinator.preWorkInit(null, request1, mockWorker);
+    assertThat(Files.exists(workerExecRoot.resolve("gen/in.txt"))).isTrue();
+
+    WorkResponse ok = WorkResponse.newBuilder().setExitCode(0).build();
+    protoCoordinator.postWorkCleanup(ok, mockWorker, request1);
+
+    // The "gen" subtree was moved out, taking gen/in.txt with it.
+    assertThat(Files.exists(workerExecRoot.resolve("gen/in.txt"))).isFalse();
+
+    // Request 2: same input, unchanged. It must be re-linked (was excluded from the stored state).
+    FetchResult fetchResult2 =
+        makeFetchResultWithRealPaths(casRoot, entries, ImmutableSet.of("gen"), mockCache);
+    RequestCtx request2 = makeFetchResultRequest(opRoot, fetchResult2);
+
+    protoCoordinator.preWorkInit(null, request2, mockWorker);
+
+    assertThat(Files.exists(workerExecRoot.resolve("gen/in.txt"))).isTrue();
+    assertThat(new String(Files.readAllBytes(workerExecRoot.resolve("gen/in.txt"))))
+        .isEqualTo("gen content");
+  }
+
+  @Test
+  public void incrementalUpdate_inputDeclaredAsLegacyOutput_isReLinkedNextRequest()
+      throws Exception {
+    // Same as incrementalUpdate_inputDeclaredAsOutput, but via the pre-REAPI-2.1 output_files /
+    // output_directories fields instead of output_paths. This exercises movedOutputEntryPaths's
+    // legacy branch, which must mirror moveOutputsToOperationRoot exactly: an output file matches
+    // exactly, and an input under an output directory matches by prefix.
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_legacyOut");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_legacyOut");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_legacyOut");
+    Files.createDirectory(workerExecRoot);
+
+    Path casFileA = casRoot.resolve("file_a");
+    Files.write(casFileA, "content A".getBytes());
+    Path casFileGen = casRoot.resolve("file_gen");
+    Files.write(casFileGen, "gen content".getBytes());
+    Path casFileB = casRoot.resolve("file_b");
+    Files.write(casFileB, "content B".getBytes());
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    // src/A.java is a declared output_file (exact match); gen/in.txt is an input under the declared
+    // output_directory "gen" (prefix match); src/B.java is a plain input that stays linked.
+    Command legacyOutputs =
+        Command.newBuilder().addOutputFiles("src/A.java").addOutputDirectories("gen").build();
+    ImmutableList<FetchResult.Entry> entries =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFileA, "key_a", null, null),
+            new FetchResult.Entry(
+                "gen/in.txt", FetchResult.EntryType.FILE, casFileGen, "key_gen", null, null),
+            new FetchResult.Entry(
+                "src/B.java", FetchResult.EntryType.FILE, casFileB, "key_b", null, null));
+    FetchResult fetchResult1 =
+        makeFetchResultWithRealPaths(casRoot, entries, ImmutableSet.of("src", "gen"), mockCache);
+    RequestCtx request1 = makeFetchResultRequest(opRoot, legacyOutputs, fetchResult1);
+
+    protoCoordinator.preWorkInit(null, request1, mockWorker);
+    assertThat(Files.exists(workerExecRoot.resolve("src/A.java"))).isTrue();
+    assertThat(Files.exists(workerExecRoot.resolve("gen/in.txt"))).isTrue();
+
+    WorkResponse ok = WorkResponse.newBuilder().setExitCode(0).build();
+    protoCoordinator.postWorkCleanup(ok, mockWorker, request1);
+
+    // The output_file and the output_directory subtree were moved out; B (not an output) stays.
+    assertThat(Files.exists(opRoot.resolve("src/A.java"))).isTrue();
+    assertThat(Files.exists(workerExecRoot.resolve("src/A.java"))).isFalse();
+    assertThat(Files.exists(workerExecRoot.resolve("gen/in.txt"))).isFalse();
+    assertThat(Files.exists(workerExecRoot.resolve("src/B.java"))).isTrue();
+
+    // Request 2: identical inputs. The stored state must have excluded A and gen/in.txt (the moved
+    // paths), so the diff re-links them; without the exclusion they'd be skipped as "unchanged".
+    FetchResult fetchResult2 =
+        makeFetchResultWithRealPaths(casRoot, entries, ImmutableSet.of("src", "gen"), mockCache);
+    RequestCtx request2 = makeFetchResultRequest(opRoot, fetchResult2);
+
+    protoCoordinator.preWorkInit(null, request2, mockWorker);
+
+    assertThat(Files.exists(workerExecRoot.resolve("src/A.java"))).isTrue();
+    assertThat(new String(Files.readAllBytes(workerExecRoot.resolve("src/A.java"))))
+        .isEqualTo("content A");
+    assertThat(Files.exists(workerExecRoot.resolve("gen/in.txt"))).isTrue();
+    assertThat(new String(Files.readAllBytes(workerExecRoot.resolve("gen/in.txt"))))
+        .isEqualTo("gen content");
+    assertThat(Files.exists(workerExecRoot.resolve("src/B.java"))).isTrue();
+  }
+
+  @Test
+  public void incrementalUpdate_removedDirectoryEntry_doesNotDeleteSharedCasTree()
+      throws Exception {
+    // A removed DIRECTORY entry on the incremental applyDelta path must unlink only the symlink
+    // (NOFOLLOW), never descend into and delete the shared CAS directory it pointed at.
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_noFollow");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_noFollow");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_noFollow");
+    Files.createDirectory(workerExecRoot);
+
+    Path casFile = casRoot.resolve("file_keep");
+    Files.write(casFile, "keep".getBytes());
+    Path casDir = casRoot.resolve("dir_shared");
+    Files.createDirectory(casDir);
+    Files.write(casDir.resolve("inner.txt"), "shared inner".getBytes());
+
+    build.bazel.remote.execution.v2.Digest dirDigest =
+        build.bazel.remote.execution.v2.Digest.newBuilder()
+            .setHash("shared")
+            .setSizeBytes(10)
+            .build();
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    // Request 1: link a FILE (src/Keep.java) and a DIRECTORY symlink (lib -> casDir).
+    ImmutableList<FetchResult.Entry> entries1 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/Keep.java", FetchResult.EntryType.FILE, casFile, "key_keep", null, null),
+            new FetchResult.Entry(
+                "lib", FetchResult.EntryType.DIRECTORY, casDir, null, dirDigest, null));
+    FetchResult fetchResult1 =
+        makeFetchResultWithRealPaths(casRoot, entries1, ImmutableSet.of("src"), mockCache);
+    RequestCtx request1 = makeFetchResultRequest(opRoot, fetchResult1);
+
+    protoCoordinator.preWorkInit(null, request1, mockWorker);
+    assertThat(Files.isSymbolicLink(workerExecRoot.resolve("lib"))).isTrue();
+    WorkResponse ok = WorkResponse.newBuilder().setExitCode(0).build();
+    protoCoordinator.postWorkCleanup(ok, mockWorker, request1);
+
+    // Request 2: lib is removed (same descendedDirectories -> incremental applyDelta path).
+    ImmutableList<FetchResult.Entry> entries2 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/Keep.java", FetchResult.EntryType.FILE, casFile, "key_keep", null, null));
+    FetchResult fetchResult2 =
+        makeFetchResultWithRealPaths(casRoot, entries2, ImmutableSet.of("src"), mockCache);
+    RequestCtx request2 = makeFetchResultRequest(opRoot, fetchResult2);
+
+    protoCoordinator.preWorkInit(null, request2, mockWorker);
+
+    // The symlink is gone, but the shared CAS tree it pointed at is untouched.
+    assertThat(Files.exists(workerExecRoot.resolve("lib"), LinkOption.NOFOLLOW_LINKS)).isFalse();
+    assertThat(Files.exists(casDir)).isTrue();
+    assertThat(Files.exists(casDir.resolve("inner.txt"))).isTrue();
+    assertThat(new String(Files.readAllBytes(casDir.resolve("inner.txt"))))
+        .isEqualTo("shared inner");
+  }
+
+  @Test
+  public void postWorkCleanup_afterTimeoutWonRace_closesFetchResultWithoutCachingState()
+      throws Exception {
+    // If the timeout handler won the pendingReqs.remove() race, postWorkCleanup must release the
+    // FetchResult's refs and NOT store a state for the worker that is being destroyed.
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_race");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_race");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_race");
+    Files.createDirectory(workerExecRoot);
+
+    Path casFile = casRoot.resolve("file_race");
+    Files.write(casFile, "content race".getBytes());
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+    when(mockWorker.getKey()).thenReturn(mock(WorkerKey.class));
+
+    ImmutableList<FetchResult.Entry> entries =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/R.java", FetchResult.EntryType.FILE, casFile, "key_race", null, null));
+    FetchResult fetchResult =
+        makeFetchResultWithRealPaths(casRoot, entries, ImmutableSet.of("src"), mockCache);
+    RequestCtx request = makeFetchResultRequest(opRoot, fetchResult);
+
+    protoCoordinator.preWorkInit(null, request, mockWorker);
+    assertThat(protoCoordinator.hasPendingRequest(request)).isTrue();
+
+    // Timeout handler wins the race and removes the request from pendingReqs.
+    protoCoordinator.new RequestTimeoutHandler(request).run();
+    assertThat(protoCoordinator.hasPendingRequest(request)).isFalse();
+
+    // postWorkCleanup now sees pendingRequest == null even though the response is successful.
+    WorkResponse response = WorkResponse.newBuilder().setExitCode(0).build();
+    protoCoordinator.postWorkCleanup(response, mockWorker, request);
+
+    // FetchResult was closed (refs released synchronously), not transferred to a stored state.
+    assertThat(fetchResult.isTerminal()).isTrue();
+    verify(mockCache)
+        .decrementReferences(
+            ImmutableList.of("key_race"), ImmutableList.of(), DigestFunction.Value.SHA256);
+  }
+
+  @Test
+  public void postWorkCleanup_moveOutputsIOException_releasesFetchResultRefs() throws Exception {
+    // When moveOutputsToOperationRoot fails, postWorkCleanup must still release the FetchResult's
+    // refs (close it) and rethrow, rather than leak refs or store a stale baseline.
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_moveIo");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_moveIo");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_moveIo");
+    Files.createDirectory(workerExecRoot);
+
+    Path casFile = casRoot.resolve("file_io");
+    Files.write(casFile, "content".getBytes());
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    Command outputDir = Command.newBuilder().addAllOutputPaths(ImmutableList.of("out")).build();
+    ImmutableList<FetchResult.Entry> entries =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/A.java", FetchResult.EntryType.FILE, casFile, "key_io", null, null));
+    FetchResult fetchResult =
+        makeFetchResultWithRealPaths(casRoot, entries, ImmutableSet.of("src"), mockCache);
+    RequestCtx request = makeFetchResultRequest(opRoot, outputDir, fetchResult);
+
+    protoCoordinator.preWorkInit(null, request, mockWorker);
+
+    // The action "produced" the output directory "out"; pre-create opRoot/out as a regular file so
+    // moveDirectory's createDirectories collides and throws.
+    Files.createDirectories(workerExecRoot.resolve("out/inner"));
+    Files.write(workerExecRoot.resolve("out/inner/o.txt"), "out".getBytes());
+    Files.write(opRoot.resolve("out"), "collision".getBytes());
+
+    WorkResponse response = WorkResponse.newBuilder().setExitCode(0).build();
+    IOException thrown =
+        assertThrows(
+            IOException.class,
+            () -> protoCoordinator.postWorkCleanup(response, mockWorker, request));
+    assertThat(thrown.getMessage()).contains("Failed during postWorkCleanup");
+
+    // Refs released even though cleanup failed.
+    assertThat(fetchResult.isTerminal()).isTrue();
+    verify(mockCache)
+        .decrementReferences(
+            ImmutableList.of("key_io"), ImmutableList.of(), DigestFunction.Value.SHA256);
+  }
+
+  @Test
+  public void postWorkCleanup_nullResponse_decrementsPreviousStateRefs() throws Exception {
+    // On a failed request (null response), the previous request's stored state must have its
+    // carried refs released, in addition to the failed request's own refs.
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_prevClose");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_prevClose");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_prevClose");
+    Files.createDirectory(workerExecRoot);
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    // Request 1 succeeds and stores a state carrying ref "key_prev".
+    runSuccessfulRequest(
+        protoCoordinator, opRoot, casRoot, workerExecRoot, mockCache, mockWorker, "key_prev");
+
+    CountDownLatch prevDecremented = new CountDownLatch(1);
+    org.mockito.Mockito.doAnswer(
+            invocation -> {
+              if (((List<?>) invocation.getArgument(0)).contains("key_prev")) {
+                prevDecremented.countDown();
+              }
+              return null;
+            })
+        .when(mockCache)
+        .decrementReferences(
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(DigestFunction.Value.class));
+
+    // Request 2: preWorkInit succeeds, then the request "fails" → postWorkCleanup(null).
+    Path casFileNew = casRoot.resolve("file_new");
+    Files.write(casFileNew, "new".getBytes());
+    ImmutableList<FetchResult.Entry> entries2 =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/N.java", FetchResult.EntryType.FILE, casFileNew, "key_new", null, null));
+    FetchResult fetchResult2 =
+        makeFetchResultWithRealPaths(casRoot, entries2, ImmutableSet.of("src"), mockCache);
+    RequestCtx request2 = makeFetchResultRequest(opRoot, fetchResult2);
+
+    protoCoordinator.preWorkInit(null, request2, mockWorker);
+    protoCoordinator.postWorkCleanup(null, mockWorker, request2);
+
+    // Previous state's refs released (once — idempotent close), and the failed request's refs too.
+    assertThat(prevDecremented.await(5, TimeUnit.SECONDS)).isTrue();
+    verify(mockCache)
+        .decrementReferences(
+            ImmutableList.of("key_prev"), ImmutableList.of(), DigestFunction.Value.SHA256);
+    assertThat(fetchResult2.isTerminal()).isTrue();
+    verify(mockCache)
+        .decrementReferences(
+            ImmutableList.of("key_new"), ImmutableList.of(), DigestFunction.Value.SHA256);
+  }
+
+  @Test
+  public void shutdown_waitsForInFlightRequestBeforeDraining() throws Exception {
+    // shutdown() must not close workerStates until in-flight requests drain, so refs are not
+    // decremented while their links are still in use.
+    ProtoCoordinator protoCoordinator = ProtoCoordinator.ofCommonsPool(/* maxWorkersPerKey= */ 4);
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_drain");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_drain");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_drain");
+    Files.createDirectory(workerExecRoot);
+
+    Path casFile = casRoot.resolve("file_drain");
+    Files.write(casFile, "content".getBytes());
+
+    CASFileCache mockCache = mock(CASFileCache.class);
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+
+    // Begin an in-flight request: preWorkInit increments inFlightRequests; no postWorkCleanup yet.
+    ImmutableList<FetchResult.Entry> entries =
+        ImmutableList.of(
+            new FetchResult.Entry(
+                "src/D.java", FetchResult.EntryType.FILE, casFile, "key_drain", null, null));
+    FetchResult fetchResult =
+        makeFetchResultWithRealPaths(casRoot, entries, ImmutableSet.of("src"), mockCache);
+    RequestCtx request = makeFetchResultRequest(opRoot, fetchResult);
+    protoCoordinator.preWorkInit(null, request, mockWorker);
+
+    CountDownLatch shutdownReturned = new CountDownLatch(1);
+    Thread shutdownThread =
+        new Thread(
+            () -> {
+              protoCoordinator.shutdown(5, TimeUnit.SECONDS);
+              shutdownReturned.countDown();
+            });
+    shutdownThread.start();
+
+    // shutdown() is blocked in the drain loop (inFlightRequests == 1); it must not return yet.
+    assertThat(shutdownReturned.await(200, TimeUnit.MILLISECONDS)).isFalse();
+
+    // Completing the request drops inFlightRequests to 0, so the drain loop exits.
+    WorkResponse response = WorkResponse.newBuilder().setExitCode(0).build();
+    protoCoordinator.postWorkCleanup(response, mockWorker, request);
+
+    assertThat(shutdownReturned.await(5, TimeUnit.SECONDS)).isTrue();
+    shutdownThread.join(TimeUnit.SECONDS.toMillis(5));
+    protoCoordinator.timeoutScheduler.shutdownNow();
+  }
+
+  @Test
+  public void shutdown_timeoutInvalidatesPendingWorkerBeforeClosingState() throws Exception {
+    ProtoCoordinator protoCoordinator = newCoordinator();
+
+    Path fsRoot = jimFsRoot();
+    Path casRoot = fsRoot.resolve("cas_shutdownTimeout");
+    Files.createDirectory(casRoot);
+    Path opRoot = fsRoot.resolve("opRoot_shutdownTimeout");
+    Files.createDirectory(opRoot);
+    Path workerExecRoot = fsRoot.resolve("workerExecRoot_shutdownTimeout");
+    Files.createDirectory(workerExecRoot);
+
+    CountDownLatch previousStateRefsDecremented = new CountDownLatch(1);
+    AtomicBoolean workerDestroyed = new AtomicBoolean(false);
+    CASFileCache mockCache = mock(CASFileCache.class);
+    org.mockito.Mockito.doAnswer(
+            invocation -> {
+              if (((List<?>) invocation.getArgument(0)).contains("key_prev_timeout")) {
+                assertThat(workerDestroyed.get()).isTrue();
+                previousStateRefsDecremented.countDown();
+              }
+              return null;
+            })
+        .when(mockCache)
+        .decrementReferences(
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(),
+            org.mockito.ArgumentMatchers.any(DigestFunction.Value.class));
+
+    PersistentWorker mockWorker = mock(PersistentWorker.class);
+    when(mockWorker.getExecRoot()).thenReturn(workerExecRoot);
+    when(mockWorker.getKey()).thenReturn(mock(WorkerKey.class));
+    org.mockito.Mockito.doAnswer(
+            invocation -> {
+              workerDestroyed.set(true);
+              return null;
+            })
+        .when(mockWorker)
+        .destroy();
+
+    runSuccessfulRequest(
+        protoCoordinator,
+        opRoot,
+        casRoot,
+        workerExecRoot,
+        mockCache,
+        mockWorker,
+        "key_prev_timeout");
+
+    Path casFileNew = casRoot.resolve("file_key_new_timeout");
+    Files.write(casFileNew, "new".getBytes());
+    FetchResult fetchResult =
+        makeFetchResultWithRealPaths(
+            casRoot,
+            ImmutableList.of(
+                new FetchResult.Entry(
+                    "src/New.java",
+                    FetchResult.EntryType.FILE,
+                    casFileNew,
+                    "key_new_timeout",
+                    null,
+                    null)),
+            ImmutableSet.of("src"),
+            mockCache);
+    RequestCtx request = makeFetchResultRequest(opRoot, fetchResult);
+
+    protoCoordinator.preWorkInit(null, request, mockWorker);
+    assertThat(protoCoordinator.hasPendingRequest(request)).isTrue();
+
+    protoCoordinator.shutdown(100, TimeUnit.MILLISECONDS);
+
+    assertThat(protoCoordinator.hasPendingRequest(request)).isFalse();
+    assertThat(workerDestroyed.get()).isTrue();
+    assertThat(previousStateRefsDecremented.await(5, TimeUnit.SECONDS)).isTrue();
   }
 }

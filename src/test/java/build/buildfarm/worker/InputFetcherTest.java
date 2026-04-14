@@ -269,7 +269,7 @@ public class InputFetcherTest {
     assertThrows(
         IllegalArgumentException.class, () -> inputFetcher.fetchPolled(Stopwatch.createStarted()));
 
-    assertThat(fetchResult.isClosed()).isTrue();
+    assertThat(fetchResult.isTerminal()).isTrue();
     verify(fileCache)
         .decrementReferences(
             ImmutableList.of("sha256_runtime_failure"),
@@ -355,7 +355,7 @@ public class InputFetcherTest {
 
     inputFetcher.fetchPolled(Stopwatch.createStarted());
 
-    assertThat(fetchResult.isClosed()).isTrue();
+    assertThat(fetchResult.isTerminal()).isTrue();
     assertThat(destroyed.get()).isTrue();
     verify(error).put(any(ExecutionContext.class));
     verify(fileCache)

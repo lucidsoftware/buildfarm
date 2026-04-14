@@ -70,9 +70,9 @@ public class FetchResultTest {
             ImmutableMap.of(),
             ImmutableSet.of());
 
-    assertThat(fetchResult.isClosed()).isFalse();
+    assertThat(fetchResult.isTerminal()).isFalse();
     fetchResult.close();
-    assertThat(fetchResult.isClosed()).isTrue();
+    assertThat(fetchResult.isTerminal()).isTrue();
 
     verify(mockCache, times(1))
         .decrementReferences(
@@ -111,7 +111,8 @@ public class FetchResultTest {
   }
 
   @Test
-  public void close_failedDecrementLeavesOpenForRetry() throws Exception {
+  public void close_failedDecrementCanRetry() throws Exception {
+    // Failed cleanup leaves the FetchResult open so a later cleanup site can retry.
     CASFileCache mockCache = mock(CASFileCache.class);
     ImmutableList<String> refKeys = ImmutableList.of("sha256_abc123");
     ImmutableList<build.bazel.remote.execution.v2.Digest> refDigests = ImmutableList.of();
@@ -133,11 +134,11 @@ public class FetchResultTest {
             ImmutableSet.of());
 
     fetchResult.close();
-    assertThat(fetchResult.isClosed()).isFalse();
+    assertThat(fetchResult.isTerminal()).isFalse();
 
-    fetchResult.close();
-    assertThat(fetchResult.isClosed()).isTrue();
+    fetchResult.close(); // retries and succeeds
 
+    assertThat(fetchResult.isTerminal()).isTrue();
     verify(mockCache, times(2))
         .decrementReferences(eq(refKeys), eq(refDigests), eq(DigestFunction.Value.SHA256));
   }
@@ -166,6 +167,65 @@ public class FetchResultTest {
 
     // No refs to decrement — decrementReferences should NOT be called
     verify(mockCache, never()).decrementReferences(any(), any(), any(DigestFunction.Value.class));
+  }
+
+  @Test
+  public void markTransferred_preventsClose() throws Exception {
+    CASFileCache mockCache = mock(CASFileCache.class);
+
+    FetchResult fetchResult =
+        new FetchResult(
+            ImmutableList.of(
+                new FetchResult.Entry(
+                    "src/Foo.java",
+                    FetchResult.EntryType.FILE,
+                    Path.of("/cas/abc123"),
+                    "sha256_abc123",
+                    null,
+                    null)),
+            ImmutableSet.of(),
+            ImmutableList.of("sha256_abc123"),
+            ImmutableList.of(),
+            DigestFunction.Value.SHA256,
+            mockCache,
+            ImmutableMap.of(),
+            ImmutableSet.of());
+
+    assertThat(fetchResult.markTransferred()).isTrue();
+    assertThat(fetchResult.isTerminal()).isTrue();
+    fetchResult.close(); // should be a no-op
+
+    // decrementReferences should NOT be called — refs were transferred
+    verify(mockCache, never()).decrementReferences(any(), any(), any(DigestFunction.Value.class));
+  }
+
+  @Test
+  public void markTransferred_failsAfterClose() throws Exception {
+    CASFileCache mockCache = mock(CASFileCache.class);
+
+    FetchResult fetchResult =
+        new FetchResult(
+            ImmutableList.of(
+                new FetchResult.Entry(
+                    "src/Foo.java",
+                    FetchResult.EntryType.FILE,
+                    Path.of("/cas/abc123"),
+                    "sha256_abc123",
+                    null,
+                    null)),
+            ImmutableSet.of(),
+            ImmutableList.of("sha256_abc123"),
+            ImmutableList.of(),
+            DigestFunction.Value.SHA256,
+            mockCache,
+            ImmutableMap.of(),
+            ImmutableSet.of());
+
+    fetchResult.close();
+    assertThat(fetchResult.markTransferred()).isFalse();
+
+    // decrementReferences was called by close()
+    verify(mockCache, times(1)).decrementReferences(any(), any(), any(DigestFunction.Value.class));
   }
 
   @Test

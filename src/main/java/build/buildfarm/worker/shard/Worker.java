@@ -44,6 +44,7 @@ import build.buildfarm.common.FailoverInputStreamFactory;
 import build.buildfarm.common.InputStreamFactory;
 import build.buildfarm.common.LoggingMain;
 import build.buildfarm.common.Size;
+import build.buildfarm.common.Time;
 import build.buildfarm.common.ZstdDecompressingOutputStream.FixedBufferPool;
 import build.buildfarm.common.config.BuildfarmConfigs;
 import build.buildfarm.common.config.Cas;
@@ -78,6 +79,7 @@ import build.buildfarm.worker.PutOperationStage;
 import build.buildfarm.worker.ReportResultStage;
 import build.buildfarm.worker.SuperscalarPipelineStage;
 import build.buildfarm.worker.cgroup.Group;
+import build.buildfarm.worker.persistent.PersistentExecutor;
 import build.buildfarm.worker.resources.LocalResourceSet;
 import build.buildfarm.worker.resources.LocalResourceSet.PoolResource;
 import build.buildfarm.worker.resources.LocalResourceSetUtils;
@@ -184,7 +186,7 @@ public final class Worker extends LoggingMain {
    * using stderr here instead of log. By the time this is called in PreDestroy, the log is no
    * longer available and is not logging messages.
    */
-  public void prepareWorkerForGracefulShutdown() {
+  private void prepareWorkerForGracefulShutdown(long gracefulShutdownDeadlineNanos) {
     if (configs.getWorker().getGracefulShutdownSeconds() == 0) {
       log.info(
           "Graceful Shutdown is not enabled. Worker is shutting down without finishing executions"
@@ -194,35 +196,54 @@ public final class Worker extends LoggingMain {
           "Graceful Shutdown - The current worker will not be registered again and should be"
               + " shutdown gracefully!");
       context.prepareForGracefulShutdown();
-      int scanRate = 30; // check every 30 seconds
-      int timeWaited = 0;
-      int timeOut = configs.getWorker().getGracefulShutdownSeconds();
+      long scanRateNanos = SECONDS.toNanos(30); // check every 30 seconds
+      long waitStartNanos = System.nanoTime();
+      long timeWaitedSeconds = 0;
       try {
         if (pipeline.isEmpty()) {
           log.info("Graceful Shutdown - no work in the pipeline.");
         } else {
           log.info("Graceful Shutdown - waiting for executions to finish.");
         }
-        while (!pipeline.isEmpty() && timeWaited < timeOut) {
-          SECONDS.sleep(scanRate);
-          timeWaited += scanRate;
+        while (!pipeline.isEmpty()) {
+          long remainingNanos = gracefulShutdownDeadlineNanos - System.nanoTime();
+          if (remainingNanos <= 0) {
+            break;
+          }
+          TimeUnit.NANOSECONDS.sleep(Math.min(scanRateNanos, remainingNanos));
+          timeWaitedSeconds = TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - waitStartNanos);
           log.info(
               String.format(
-                  "Graceful Shutdown - Pipeline is still not empty after %d seconds.", timeWaited));
+                  "Graceful Shutdown - Pipeline is still not empty after %d seconds.",
+                  timeWaitedSeconds));
         }
       } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
         log.info(
             "Graceful Shutdown - The worker gracefully shutdown is interrupted: " + e.getMessage());
       } finally {
         log.info(
             String.format(
                 "Graceful Shutdown - It took the worker %d seconds to %s",
-                timeWaited,
+                timeWaitedSeconds,
                 pipeline.isEmpty()
                     ? "finish all actions"
                     : "gracefully shutdown but still cannot finish all actions"));
       }
     }
+  }
+
+  private static long gracefulShutdownDeadlineNanos() {
+    int gracefulShutdownSeconds = configs.getWorker().getGracefulShutdownSeconds();
+    if (gracefulShutdownSeconds <= 0) {
+      return System.nanoTime();
+    }
+    return Time.deadlineNanosFromNow(SECONDS.toNanos(gracefulShutdownSeconds));
+  }
+
+  private static long remainingShutdownMillis(long deadlineNanos) {
+    long remainingNanos = deadlineNanos - System.nanoTime();
+    return remainingNanos <= 0 ? 0 : TimeUnit.NANOSECONDS.toMillis(remainingNanos);
   }
 
   private Worker() {
@@ -1011,7 +1032,8 @@ public final class Worker extends LoggingMain {
 
   private void shutdown() throws InterruptedException {
     log.info("*** shutting down gRPC server since JVM is shutting down");
-    prepareWorkerForGracefulShutdown();
+    long gracefulShutdownDeadlineNanos = gracefulShutdownDeadlineNanos();
+    prepareWorkerForGracefulShutdown(gracefulShutdownDeadlineNanos);
     // Clean-up any cgroups that were possibly created/mutated.
     Group.onShutdown();
     PrometheusPublisher.stopHttpServer();
@@ -1030,6 +1052,9 @@ public final class Worker extends LoggingMain {
     healthCheckMetric.labels("stop").inc();
     executionSlotsTotal.set(0);
     inputFetchSlotsTotal.set(0);
+    // Release persistent worker materialization refs before stopping CAS.
+    PersistentExecutor.shutdownCoordinator(
+        remainingShutdownMillis(gracefulShutdownDeadlineNanos), TimeUnit.MILLISECONDS);
     if (execFileSystem != null) {
       log.info("Stopping exec filesystem");
       try {

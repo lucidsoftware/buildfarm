@@ -63,6 +63,21 @@ public class Time {
   }
 
   /**
+   * Returns a {@link System#nanoTime()}-based deadline {@code timeoutNanos} from now, clamped to
+   * {@link Long#MAX_VALUE} on overflow. {@code timeoutNanos} is floored at 0, so a non-positive
+   * timeout yields a deadline of now (already expired).
+   *
+   * @param timeoutNanos Nanoseconds from now until the deadline.
+   * @return The deadline as a nanoTime value, suitable for comparison against {@code
+   *     System.nanoTime()}.
+   */
+  public static long deadlineNanosFromNow(long timeoutNanos) {
+    long now = System.nanoTime();
+    long deadlineNanos = now + Math.max(0, timeoutNanos);
+    return deadlineNanos < now ? Long.MAX_VALUE : deadlineNanos;
+  }
+
+  /**
    * @brief Milliseconds to seconds.
    * @details Milliseconds to seconds.
    * @param milliseconds Milliseconds to convert.

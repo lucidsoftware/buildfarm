@@ -29,6 +29,7 @@ java_library(
         "@buildfarm_maven//:io_grpc_grpc_stub",
         "@buildfarm_maven//:io_prometheus_simpleclient",
         "@buildfarm_maven//:org_apache_commons_commons_compress",
+        "@buildfarm_maven//:org_apache_commons_commons_pool2",
         "@buildfarm_maven//:org_jetbrains_annotations",
         "@buildfarm_maven//:org_projectlombok_lombok",
     ],
