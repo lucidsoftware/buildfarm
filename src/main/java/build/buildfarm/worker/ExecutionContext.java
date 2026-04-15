@@ -23,8 +23,10 @@ import build.buildfarm.v1test.QueueEntry;
 import build.buildfarm.v1test.QueuedOperationMetadata;
 import build.buildfarm.v1test.Tree;
 import build.buildfarm.v1test.WorkerExecutedMetadata;
+import build.buildfarm.worker.persistent.FetchResult;
 import com.google.longrunning.Operation;
 import java.nio.file.Path;
+import javax.annotation.Nullable;
 
 public final class ExecutionContext {
   final ExecuteResponse.Builder executeResponse;
@@ -38,6 +40,8 @@ public final class ExecutionContext {
   final QueueEntry queueEntry;
   public final Claim claim;
   final WorkerExecutedMetadata.Builder workerExecutedMetadata;
+  final boolean isPersistentWorker;
+  @Nullable final FetchResult fetchResult;
 
   private ExecutionContext(
       ExecuteResponse.Builder executeResponse,
@@ -50,7 +54,9 @@ public final class ExecutionContext {
       Tree tree,
       QueueEntry queueEntry,
       Claim claim,
-      WorkerExecutedMetadata.Builder workerExecutedMetadata) {
+      WorkerExecutedMetadata.Builder workerExecutedMetadata,
+      boolean isPersistentWorker,
+      @Nullable FetchResult fetchResult) {
     this.executeResponse = executeResponse;
     this.operation = operation;
     this.metadata = metadata;
@@ -62,6 +68,8 @@ public final class ExecutionContext {
     this.queueEntry = queueEntry;
     this.claim = claim;
     this.workerExecutedMetadata = workerExecutedMetadata;
+    this.isPersistentWorker = isPersistentWorker;
+    this.fetchResult = fetchResult;
   }
 
   public static final class Builder {
@@ -76,6 +84,8 @@ public final class ExecutionContext {
     private QueueEntry queueEntry;
     private Claim claim;
     private WorkerExecutedMetadata.Builder workerExecutedMetadata;
+    private boolean isPersistentWorker;
+    private FetchResult fetchResult;
 
     private Builder(
         ExecuteResponse.Builder executeResponse,
@@ -88,7 +98,9 @@ public final class ExecutionContext {
         Tree tree,
         QueueEntry queueEntry,
         Claim claim,
-        WorkerExecutedMetadata.Builder workerExecutedMetadata) {
+        WorkerExecutedMetadata.Builder workerExecutedMetadata,
+        boolean isPersistentWorker,
+        FetchResult fetchResult) {
       this.executeResponse = executeResponse;
       this.operation = operation;
       this.metadata = metadata;
@@ -100,6 +112,8 @@ public final class ExecutionContext {
       this.queueEntry = queueEntry;
       this.claim = claim;
       this.workerExecutedMetadata = workerExecutedMetadata;
+      this.isPersistentWorker = isPersistentWorker;
+      this.fetchResult = fetchResult;
     }
 
     public Builder setOperation(Operation operation) {
@@ -147,6 +161,16 @@ public final class ExecutionContext {
       return this;
     }
 
+    public Builder setIsPersistentWorker(boolean isPersistentWorker) {
+      this.isPersistentWorker = isPersistentWorker;
+      return this;
+    }
+
+    public Builder setFetchResult(FetchResult fetchResult) {
+      this.fetchResult = fetchResult;
+      return this;
+    }
+
     public ExecutionContext build() {
       return new ExecutionContext(
           executeResponse,
@@ -159,7 +183,9 @@ public final class ExecutionContext {
           tree,
           queueEntry,
           claim,
-          workerExecutedMetadata);
+          workerExecutedMetadata,
+          isPersistentWorker,
+          fetchResult);
     }
   }
 
@@ -175,7 +201,9 @@ public final class ExecutionContext {
         /* tree= */ null,
         /* queueEntry= */ null,
         /* claim= */ null,
-        /* workerExecutedMetadata= */ WorkerExecutedMetadata.newBuilder());
+        /* workerExecutedMetadata= */ WorkerExecutedMetadata.newBuilder(),
+        /* isPersistentWorker= */ false,
+        /* fetchResult= */ null);
   }
 
   public Builder toBuilder() {
@@ -190,6 +218,8 @@ public final class ExecutionContext {
         tree,
         queueEntry,
         claim,
-        workerExecutedMetadata);
+        workerExecutedMetadata,
+        isPersistentWorker,
+        fetchResult);
   }
 }

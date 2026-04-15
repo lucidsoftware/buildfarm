@@ -33,8 +33,12 @@ import build.buildfarm.common.ProxyDirectoriesIndex;
 import build.buildfarm.v1test.ExecuteEntry;
 import build.buildfarm.v1test.QueuedOperation;
 import build.buildfarm.v1test.Tree;
+import build.buildfarm.worker.persistent.FetchResult;
+import build.buildfarm.worker.persistent.PersistentWorkerDetection;
+import build.buildfarm.worker.util.InputsIndexer;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Stopwatch;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.longrunning.Operation;
 import com.google.protobuf.Any;
@@ -229,6 +233,8 @@ public class InputFetcher implements Runnable {
     final Map<Digest, Directory> directoriesIndex;
     QueuedOperation queuedOperation;
     Path execDir;
+    FetchResult fetchResult = null;
+    boolean isPersistentWorker = false;
     try {
       queuedOperation = workerContext.getQueuedOperation(executionContext.queueEntry);
       List<String> constraintFailures = validateQueuedOperation(queuedOperation);
@@ -242,16 +248,46 @@ public class InputFetcher implements Runnable {
 
       directoriesIndex = new ProxyDirectoriesIndex(queuedOperation.getTree().getDirectoriesMap());
 
-      execDir =
-          workerContext.createExecDir(
-              executionName,
-              directoriesIndex,
-              executionContext.queueEntry.getExecuteEntry().getActionDigest().getDigestFunction(),
-              queuedOperation.getAction(),
-              queuedOperation.getCommand(),
-              executionContext.claim.owner(),
-              executionContext.workerExecutedMetadata);
+      // Detect persistent worker actions for the fetch+ref optimization
+      String actionMnemonic = executionContext.metadata.getRequestMetadata().getActionMnemonic();
+      isPersistentWorker =
+          PersistentWorkerDetection.isPersistentWorkerAction(
+              queuedOperation.getCommand(), actionMnemonic);
+
+      if (isPersistentWorker && workerContext.isLinkExecFileSystem()) {
+        // Persistent worker with link-mode: fetch+ref inputs into local CAS (no links),
+        // create lightweight exec dir with output stubs only.
+        ImmutableSet<String> toolPaths =
+            InputsIndexer.getRelativeToolInputPaths(queuedOperation.getTree());
+
+        fetchResult =
+            workerContext.fetchAndRefInputs(
+                directoriesIndex,
+                executionContext.queueEntry.getExecuteEntry().getActionDigest().getDigestFunction(),
+                queuedOperation.getAction(),
+                queuedOperation.getCommand(),
+                toolPaths,
+                executionContext.workerExecutedMetadata);
+
+        execDir =
+            workerContext.createLightweightExecDir(executionName, queuedOperation.getCommand());
+      } else {
+        // Regular action or persistent worker with copy-mode: full materialization
+        execDir =
+            workerContext.createExecDir(
+                executionName,
+                directoriesIndex,
+                executionContext.queueEntry.getExecuteEntry().getActionDigest().getDigestFunction(),
+                queuedOperation.getAction(),
+                queuedOperation.getCommand(),
+                executionContext.claim.owner(),
+                executionContext.workerExecutedMetadata);
+      }
     } catch (IOException e) {
+      // Close FetchResult to decrement CAS refs if fetchAndRefInputs succeeded
+      // but a subsequent operation (e.g., createLightweightExecDir) failed.
+      closeFetchResult(fetchResult, executionName);
+      fetchResult = null;
       Status.Builder status = Status.newBuilder().setMessage("Error creating exec dir");
       if (e instanceof ExecDirException execDirEx) {
         execDirEx.toStatus(status);
@@ -263,6 +299,10 @@ public class InputFetcher implements Runnable {
       executedAction.setInputFetchCompletedTimestamp(Timestamps.now());
       failOperation(executedAction.build(), status.build());
       return 0;
+    } catch (RuntimeException e) {
+      // fetchAndRefInputs may have succeeded before a subsequent operation threw unchecked.
+      closeFetchResult(fetchResult, executionName);
+      throw e;
     }
     success = true;
 
@@ -284,19 +324,45 @@ public class InputFetcher implements Runnable {
     boolean completed = false;
     try {
       long fetchUSecs = stopwatch.elapsed(MICROSECONDS);
-      proceedToOutput(queuedOperation.getAction(), command, execDir, queuedOperation.getTree());
+      proceedToOutput(
+          queuedOperation.getAction(),
+          command,
+          execDir,
+          queuedOperation.getTree(),
+          isPersistentWorker,
+          fetchResult);
       completed = true;
       return stopwatch.elapsed(MICROSECONDS) - fetchUSecs;
     } finally {
       if (!completed) {
-        try {
-          workerContext.destroyExecDir(execDir);
-        } catch (IOException e) {
-          log.log(
-              Level.SEVERE,
-              format("error deleting exec dir for %s after interrupt", executionName));
-        }
+        cleanUpFetchedInputs(execDir, fetchResult, executionName);
       }
+    }
+  }
+
+  private void closeFetchResult(@Nullable FetchResult fetchResult, String executionName) {
+    if (fetchResult == null) {
+      return;
+    }
+    try {
+      fetchResult.close();
+    } catch (RuntimeException e) {
+      log.log(Level.SEVERE, format("error closing FetchResult for %s", executionName), e);
+    }
+  }
+
+  private void cleanUpFetchedInputs(
+      Path execDir, @Nullable FetchResult fetchResult, String executionName)
+      throws InterruptedException {
+    // Close FetchResult to decrement CAS refs before destroying the lightweight exec dir.
+    // Idempotent
+    // if the executor or coordinator already closed it.
+    closeFetchResult(fetchResult, executionName);
+    try {
+      workerContext.destroyExecDir(execDir);
+    } catch (IOException e) {
+      log.log(
+          Level.SEVERE, format("error deleting exec dir for %s after interrupt", executionName));
     }
   }
 
@@ -307,7 +373,13 @@ public class InputFetcher implements Runnable {
   @SuppressWarnings(
       "PMD.UnusedLocalVariable") // PMD thinks that the try-with-resources is not used. See
   // https://github.com/pmd/pmd/issues/5747
-  private void proceedToOutput(Action action, Command command, Path execDir, Tree tree)
+  private void proceedToOutput(
+      Action action,
+      Command command,
+      Path execDir,
+      Tree tree,
+      boolean isPersistentWorker,
+      @Nullable FetchResult fetchResult)
       throws InterruptedException {
     // switch poller to disable deadline
     executionContext.poller.pause();
@@ -325,6 +397,8 @@ public class InputFetcher implements Runnable {
             .setAction(action)
             .setCommand(command)
             .setTree(tree)
+            .setIsPersistentWorker(isPersistentWorker)
+            .setFetchResult(fetchResult)
             .build();
     boolean claimed;
     // PMD exemption false positive: unused variable
@@ -343,6 +417,7 @@ public class InputFetcher implements Runnable {
       String executionName = executionContext.queueEntry.getExecuteEntry().getOperationName();
       log.log(Level.FINER, "InputFetcher: Execution " + executionName + " Failed to claim output");
 
+      cleanUpFetchedInputs(execDir, fetchResult, executionName);
       owner.error().put(fetchedExecutionContext);
     }
     polling = false;

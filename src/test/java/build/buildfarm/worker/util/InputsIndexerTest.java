@@ -138,6 +138,48 @@ public class InputsIndexerTest {
     assertThat(indexer.getToolInputs()).isEqualTo(toolInputs);
   }
 
+  // getRelativeToolInputPaths returns only tool-marked inputs, at root and nested, joined with '/'.
+  @Test
+  public void getRelativeToolInputPaths_collectsToolPathsWithForwardSlashes() {
+    Tree.Builder treeBuilder = Tree.newBuilder();
+
+    FileNode rootTool =
+        makeFileNode(
+            "root_tool",
+            "root tool contents",
+            makeNodeProperties(ImmutableMap.of(BAZEL_TOOL_INPUT_MARKER, "x")));
+    FileNode plain = makeFileNode("plain", "plain contents", NodeProperties.getDefaultInstance());
+    FileNode nestedTool =
+        makeFileNode(
+            "nested_tool",
+            "nested tool contents",
+            makeNodeProperties(ImmutableMap.of(BAZEL_TOOL_INPUT_MARKER, "x")));
+    FileNode plain2 =
+        makeFileNode("plain2", "plain2 contents", NodeProperties.getDefaultInstance());
+
+    Directory subDir = Directory.newBuilder().addFiles(nestedTool).addFiles(plain2).build();
+    String subDirName = "sub";
+    Digest subDirDigest = addDirToTree(treeBuilder, subDirName, subDir);
+
+    Directory rootDir =
+        Directory.newBuilder()
+            .addFiles(rootTool)
+            .addFiles(plain)
+            .addDirectories(makeDirNode(subDirName, DigestUtil.toDigest(subDirDigest)))
+            .build();
+    Digest rootDirDigest = addDirToTree(treeBuilder, "root", rootDir);
+    treeBuilder.setRootDigest(rootDirDigest);
+
+    assertThat(InputsIndexer.getRelativeToolInputPaths(treeBuilder.build()))
+        .containsExactly("root_tool", "sub/nested_tool");
+  }
+
+  // Empty / no-root trees yield no tool paths rather than throwing.
+  @Test
+  public void getRelativeToolInputPaths_emptyTreeReturnsEmpty() {
+    assertThat(InputsIndexer.getRelativeToolInputPaths(Tree.newBuilder().build())).isEmpty();
+  }
+
   Digest addDirToTree(Tree.Builder treeBuilder, String dirname, Directory dir) {
     ByteString dirnameBytes = ByteString.copyFromUtf8(dirname);
     Digest digest = DIGEST_UTIL.compute(dirnameBytes);

@@ -9,6 +9,7 @@ java_test(
         "//persistentworkers/src/main/java/persistent/bazel:bazel-persistent-workers",
         "//persistentworkers/src/main/java/persistent/common:persistent-common",
         "//persistentworkers/src/main/protobuf:worker_protocol_java_proto",
+        "//src/main/java/build/buildfarm/cas",
         "//src/main/java/build/buildfarm/common",
         "//src/main/java/build/buildfarm/common/config",
         "//src/main/java/build/buildfarm/worker/persistent",

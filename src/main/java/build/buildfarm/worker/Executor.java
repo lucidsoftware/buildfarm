@@ -64,7 +64,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -316,7 +315,7 @@ class Executor {
             arguments,
             executionContext.command,
             workingDirectory,
-            shouldRunOnPersistentWorker(limits))) {
+            executionContext.isPersistentWorker)) {
       // Apply all other custom execution policies AFTER built-in wrappers
       for (ExecutionPolicy policy : policies) {
         if (!policy.isPrioritized() && policy.getExecutionWrapper() != null) {
@@ -481,28 +480,6 @@ class Executor {
     }
   }
 
-  /**
-   * Decide if this action should run on a Persistent Worker. <br>
-   *
-   * <ul>
-   *   <li>The Persistent worker key must be set. This is set by bazel client with
-   *       "--experimental_remote_mark_tool_inputs"
-   *   <li>the config.yaml has to have a "*" OR have the mnemonic allowlisted.
-   * </ul>
-   *
-   * @return <c>true</c> if the action should be sent to a persistent worker, <c>false</c>
-   *     otherwise.
-   */
-  private boolean shouldRunOnPersistentWorker(ResourceLimits limits) {
-    if (!limits.persistentWorkerKey.isEmpty()) {
-      Collection<String> mnemonicAllowlist =
-          BuildfarmConfigs.getInstance().getWorker().getPersistentWorkerActionMnemonicAllowlist();
-      String actionMnemonic = executionContext.metadata.getRequestMetadata().getActionMnemonic();
-      return mnemonicAllowlist.contains("*") || mnemonicAllowlist.contains(actionMnemonic);
-    }
-    return false;
-  }
-
   @SuppressWarnings("ConstantConditions")
   private Code executeCommand(
       String operationName,
@@ -527,7 +504,7 @@ class Executor {
     if (limits.debugBeforeExecution) {
       return ExecutionDebugger.performBeforeExecutionDebug(processBuilder, limits, resultBuilder);
     }
-    if (shouldRunOnPersistentWorker(limits)) {
+    if (executionContext.isPersistentWorker) {
       // RBE Client suggests to run this Action as persistent...
       log.fine(
           "usePersistentWorker (mnemonic="
@@ -547,6 +524,7 @@ class Executor {
           limits,
           timeout,
           PersistentExecutor.defaultWorkRootsDir,
+          executionContext.fetchResult,
           resultBuilder);
     }
 

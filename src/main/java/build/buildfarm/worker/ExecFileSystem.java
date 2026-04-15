@@ -22,6 +22,7 @@ import build.buildfarm.cas.ContentAddressableStorage;
 import build.buildfarm.common.InputStreamFactory;
 import build.buildfarm.v1test.Digest;
 import build.buildfarm.v1test.WorkerExecutedMetadata;
+import build.buildfarm.worker.persistent.FetchResult;
 import com.google.common.util.concurrent.ListenableFuture;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -30,6 +31,7 @@ import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.UserPrincipal;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import org.jspecify.annotations.Nullable;
@@ -57,6 +59,32 @@ public interface ExecFileSystem extends InputStreamFactory {
       throws IOException, InterruptedException;
 
   void destroyExecDir(Path execDir) throws IOException, InterruptedException;
+
+  /**
+   * Fetches all inputs into local CAS and increments references, without creating any links.
+   * Returns a FetchResult carrying CAS paths and ref keys for deferred linking. The default throws
+   * {@link UnsupportedOperationException}; only link-mode implementations support the fetch+ref
+   * split, so callers must gate on {@link WorkerContext#isLinkExecFileSystem()}.
+   */
+  default FetchResult fetchAndRefInputs(
+      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex,
+      DigestFunction.Value digestFunction,
+      Action action,
+      Command command,
+      Set<String> toolInputPaths,
+      WorkerExecutedMetadata.Builder workerExecutedMetadata)
+      throws IOException, InterruptedException {
+    throw new UnsupportedOperationException("fetchAndRefInputs not supported");
+  }
+
+  /**
+   * Creates a lightweight exec dir with output directory stubs only — no input links, no CAS refs.
+   * The default throws {@link UnsupportedOperationException}; only link-mode implementations
+   * support lightweight mode, so callers must gate on {@link WorkerContext#isLinkExecFileSystem()}.
+   */
+  default Path createLightweightExecDir(String operationName, Command command) throws IOException {
+    throw new UnsupportedOperationException("createLightweightExecDir not supported");
+  }
 
   abstract class ExecBaseAttributes implements BasicFileAttributes {
     private static final FileTime EARLY = FileTime.from(0, TimeUnit.SECONDS);

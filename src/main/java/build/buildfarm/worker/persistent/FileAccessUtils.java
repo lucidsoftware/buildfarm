@@ -19,8 +19,10 @@ import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
 
 import com.google.common.collect.ImmutableSet;
 import java.io.IOException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
@@ -30,10 +32,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 import lombok.extern.java.Log;
 
-/**
- * Utility for concurrent move/copy of files Can be extended in the future to (sym)linking if we
- * need performance
- */
+/** Utility for concurrent move/copy/symlink of files. */
 @Log
 public final class FileAccessUtils {
   // singleton class with only static methods
@@ -161,6 +160,183 @@ public final class FileAccessUtils {
             return FileVisitResult.CONTINUE;
           }
         });
+  }
+
+  /**
+   * Creates a symbolic link, creating necessary parent directories. The link points to the target
+   * path. Works for both file and directory targets. If the link path is already occupied (e.g. an
+   * artifact a prior request left behind in a reused worker exec root), the existing
+   * file/symlink/directory tree is removed and replaced. Thread-safe against writes to the same
+   * path.
+   *
+   * @param target the file or directory to link to
+   * @param link the symlink path to create
+   * @throws IOException if symlink creation fails
+   */
+  public static void createSymlink(Path target, Path link) throws IOException {
+    createLinkSafe(target, link, Files::createSymbolicLink, "createSymlink");
+  }
+
+  /**
+   * Creates a hard link, creating necessary parent directories. If the link path is already
+   * occupied (e.g. an artifact a prior request left behind in a reused worker exec root), the
+   * existing file/symlink/directory tree is removed and replaced. Thread-safe against writes to the
+   * same path.
+   *
+   * @param target the existing file to link to
+   * @param link the hardlink path to create
+   * @throws IOException if the target doesn't exist or hardlink creation fails
+   */
+  public static void createHardlink(Path target, Path link) throws IOException {
+    createLinkSafe(target, link, Files::createLink, "createHardlink");
+  }
+
+  @FunctionalInterface
+  private interface LinkCreator {
+    void create(Path link, Path target) throws IOException;
+  }
+
+  @FunctionalInterface
+  public interface FileCreator {
+    void create(Path link) throws IOException;
+  }
+
+  /**
+   * Creates a file or symlink at {@code link} via {@code creator}, creating necessary parent
+   * directories. If the link path is already occupied (e.g. an artifact a prior request left behind
+   * in a reused worker exec root), the existing file/symlink/directory tree is removed and
+   * replaced. Like {@link #createSymlink}/{@link #createHardlink}, the create is attempted first
+   * and the delete cost is paid only on a genuine collision, never on the common clear-path case.
+   * Thread-safe against writes to the same path. Used for the entry types created directly via
+   * {@code Files.*} (zero-size files and protobuf-declared symlink nodes), which have no CAS
+   * target.
+   *
+   * @param link the path to create; the creator receives its absolute form
+   * @param creator creates the entry at the (absolute) link path passed to it
+   * @throws IOException if creation fails
+   */
+  public static void createReplacingOnConflict(Path link, FileCreator creator) throws IOException {
+    Path absLink = link.toAbsolutePath();
+    log.finer("createReplacingOnConflict: " + absLink);
+    IOException ioException =
+        writeFileSafe(
+            absLink,
+            () -> {
+              try {
+                creator.create(absLink);
+                return null;
+              } catch (FileAlreadyExistsException e) {
+                // The path is occupied — typically an artifact a prior request left behind in this
+                // reused worker exec root. Remove it and retry once. The worker is idle between
+                // requests, so there is no concurrent reader of this path.
+                try {
+                  deletePathRecursive(absLink);
+                  creator.create(absLink);
+                  return null;
+                } catch (IOException retryException) {
+                  return new IOException(
+                      "createReplacingOnConflict() failed replacing existing: " + absLink,
+                      retryException);
+                }
+              } catch (IOException e) {
+                return new IOException("createReplacingOnConflict() failed: " + absLink, e);
+              }
+            });
+    if (ioException != null) {
+      throw ioException;
+    }
+  }
+
+  private static void createLinkSafe(Path target, Path link, LinkCreator creator, String methodName)
+      throws IOException {
+    Path absLink = link.toAbsolutePath();
+    Path absTarget = target.toAbsolutePath();
+    log.finer(methodName + ": " + absLink + " -> " + absTarget);
+    IOException ioException =
+        writeFileSafe(
+            absLink,
+            () -> {
+              try {
+                creator.create(absLink, absTarget);
+                return null;
+              } catch (FileAlreadyExistsException e) {
+                // The link path is occupied — typically an artifact a prior request left behind in
+                // this reused worker exec root. Remove it and retry once. We only pay this cost on
+                // a genuine collision; the common clear-path case creates in a single syscall. The
+                // worker is idle between requests, so there is no concurrent reader of this path.
+                try {
+                  deletePathRecursive(absLink);
+                  creator.create(absLink, absTarget);
+                  return null;
+                } catch (IOException retryException) {
+                  return new IOException(
+                      methodName + "() failed replacing existing: " + absLink + " -> " + absTarget,
+                      retryException);
+                }
+              } catch (IOException e) {
+                return new IOException(
+                    methodName + "() failed: " + absLink + " -> " + absTarget, e);
+              }
+            });
+    if (ioException != null) {
+      throw ioException;
+    }
+  }
+
+  /**
+   * Deletes whatever exists at {@code path} — a regular file, a symlink, or an entire directory
+   * tree — without following symlinks and without creating parent directories. A no-op if the path
+   * does not exist. Thread-safe against writes to the same path.
+   *
+   * @param path the path to remove
+   * @throws IOException if deletion fails
+   */
+  public static void deleteExistingPath(Path path) throws IOException {
+    Path absPath = path.toAbsolutePath();
+    PathLock lock = fileLock(absPath);
+    synchronized (lock) {
+      try {
+        deletePathRecursive(absPath);
+      } finally {
+        fileLocks.remove(absPath);
+      }
+    }
+  }
+
+  /**
+   * Removes the file, symlink, or directory tree at {@code absPath} (a no-op if absent), never
+   * following symlinks: a leftover symlink is unlinked, never resolved into its target (which for a
+   * CAS-backed input would delete a shared CAS tree). The caller must already hold the path lock
+   * for {@code absPath}.
+   */
+  private static void deletePathRecursive(Path absPath) throws IOException {
+    if (Files.isDirectory(absPath, LinkOption.NOFOLLOW_LINKS)) {
+      // A real directory (not a symlink to one): delete its contents bottom-up, then itself.
+      // walkFileTree does not follow symlinks unless FOLLOW_LINKS is passed, so a symlink inside is
+      // delivered to visitFile and unlinked, never descended into.
+      Files.walkFileTree(
+          absPath,
+          new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
+                throws IOException {
+              Files.deleteIfExists(file);
+              return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult postVisitDirectory(Path dir, IOException exc)
+                throws IOException {
+              if (exc != null) {
+                throw exc;
+              }
+              Files.deleteIfExists(dir);
+              return FileVisitResult.CONTINUE;
+            }
+          });
+    } else {
+      Files.deleteIfExists(absPath);
+    }
   }
 
   /**

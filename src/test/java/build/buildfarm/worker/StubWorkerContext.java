@@ -158,6 +158,30 @@ class StubWorkerContext implements WorkerContext {
   }
 
   @Override
+  public boolean isLinkExecFileSystem() {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public build.buildfarm.worker.persistent.FetchResult fetchAndRefInputs(
+      java.util.Map<
+              build.bazel.remote.execution.v2.Digest, build.bazel.remote.execution.v2.Directory>
+          directoriesIndex,
+      build.bazel.remote.execution.v2.DigestFunction.Value digestFunction,
+      build.bazel.remote.execution.v2.Action action,
+      build.bazel.remote.execution.v2.Command command,
+      java.util.Set<String> toolInputPaths,
+      build.buildfarm.v1test.WorkerExecutedMetadata.Builder workerExecutedMetadata) {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public java.nio.file.Path createLightweightExecDir(
+      String operationName, build.bazel.remote.execution.v2.Command command) {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
   public void uploadOutputs(
       build.buildfarm.v1test.Digest actionDigest,
       ActionResult.Builder resultBuilder,

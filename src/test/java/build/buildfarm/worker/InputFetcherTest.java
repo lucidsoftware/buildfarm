@@ -17,29 +17,39 @@ package build.buildfarm.worker;
 import static build.buildfarm.common.Errors.VIOLATION_TYPE_MISSING;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.when;
 
 import build.bazel.remote.execution.v2.Action;
 import build.bazel.remote.execution.v2.Command;
 import build.bazel.remote.execution.v2.DigestFunction;
 import build.bazel.remote.execution.v2.Directory;
 import build.bazel.remote.execution.v2.ExecuteResponse;
+import build.bazel.remote.execution.v2.Platform;
+import build.buildfarm.cas.cfc.CASFileCache;
 import build.buildfarm.cas.cfc.PutDirectoryException;
 import build.buildfarm.common.Claim;
+import build.buildfarm.common.ExecutionProperties;
 import build.buildfarm.v1test.Digest;
 import build.buildfarm.v1test.ExecuteEntry;
 import build.buildfarm.v1test.QueueEntry;
 import build.buildfarm.v1test.QueuedOperation;
 import build.buildfarm.v1test.WorkerExecutedMetadata;
 import build.buildfarm.worker.ExecDirException.ViolationException;
+import build.buildfarm.worker.persistent.FetchResult;
+import com.google.common.base.Stopwatch;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.longrunning.Operation;
 import com.google.protobuf.Any;
+import com.google.protobuf.Duration;
 import com.google.rpc.Code;
 import com.google.rpc.DebugInfo;
 import com.google.rpc.Help;
@@ -54,6 +64,7 @@ import java.nio.file.Path;
 import java.nio.file.attribute.UserPrincipal;
 import java.util.Map;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -61,6 +72,56 @@ import org.junit.runners.JUnit4;
 
 @RunWith(JUnit4.class)
 public class InputFetcherTest {
+  private static Command persistentWorkerCommand() {
+    return Command.newBuilder()
+        .addArguments("/bin/worker")
+        .setPlatform(
+            Platform.newBuilder()
+                .addProperties(
+                    Platform.Property.newBuilder()
+                        .setName(ExecutionProperties.PERSISTENT_WORKER_KEY)
+                        .setValue("tool-hash")
+                        .build())
+                .build())
+        .build();
+  }
+
+  private static ExecutionContext executionContext(Operation operation) {
+    ExecuteEntry executeEntry =
+        ExecuteEntry.newBuilder()
+            .setOperationName(operation.getName())
+            .setActionDigest(
+                Digest.newBuilder().setDigestFunction(DigestFunction.Value.SHA256).build())
+            .build();
+    QueueEntry queueEntry = QueueEntry.newBuilder().setExecuteEntry(executeEntry).build();
+    return ExecutionContext.newBuilder()
+        .setQueueEntry(queueEntry)
+        .setOperation(operation)
+        .setPoller(new build.buildfarm.common.Poller(Duration.newBuilder().setSeconds(1).build()))
+        .setClaim(mock(Claim.class))
+        .build();
+  }
+
+  private static QueuedOperation persistentQueuedOperation(Command command) {
+    return QueuedOperation.newBuilder()
+        .setCommand(command)
+        .setAction(Action.getDefaultInstance())
+        .setTree(build.buildfarm.v1test.Tree.getDefaultInstance())
+        .build();
+  }
+
+  private static FetchResult fetchResult(CASFileCache fileCache, String key) {
+    return new FetchResult(
+        ImmutableList.of(),
+        ImmutableSet.of(),
+        ImmutableList.of(key),
+        ImmutableList.of(),
+        DigestFunction.Value.SHA256,
+        fileCache,
+        ImmutableMap.of(),
+        ImmutableSet.of());
+  }
+
   @Test
   public void onlyMissingFilesIsViolationMissingFailedPrecondition() throws Exception {
     PipelineStage error = mock(PipelineStage.class);
@@ -148,5 +209,159 @@ public class InputFetcherTest {
       }
     }
     verifyNoMoreInteractions(executor);
+  }
+
+  @Test
+  public void fetchPolled_closesFetchResultWhenLightweightExecDirThrowsRuntime() throws Exception {
+    PipelineStage error = mock(PipelineStage.class);
+    Operation operation = Operation.newBuilder().setName("runtime-lightweight-failure").build();
+    Command command = persistentWorkerCommand();
+    QueuedOperation queuedOperation = persistentQueuedOperation(command);
+    CASFileCache fileCache = mock(CASFileCache.class);
+    FetchResult fetchResult = fetchResult(fileCache, "sha256_runtime_failure");
+
+    WorkerContext workerContext =
+        new StubWorkerContext() {
+          @Override
+          public QueuedOperation getQueuedOperation(QueueEntry queueEntry) {
+            return queuedOperation;
+          }
+
+          @Override
+          public boolean putOperation(Operation operation) {
+            return true;
+          }
+
+          @Override
+          public boolean isLinkExecFileSystem() {
+            return true;
+          }
+
+          @Override
+          public FetchResult fetchAndRefInputs(
+              Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex,
+              DigestFunction.Value digestFunction,
+              Action action,
+              Command command,
+              java.util.Set<String> toolInputPaths,
+              WorkerExecutedMetadata.Builder workerExecutedMetadata) {
+            return fetchResult;
+          }
+
+          @Override
+          public Path createLightweightExecDir(String operationName, Command command) {
+            throw new IllegalArgumentException("bad output path");
+          }
+
+          @Override
+          public int getInputFetchStageWidth() {
+            return 1;
+          }
+        };
+
+    InputFetcher inputFetcher =
+        new InputFetcher(
+            workerContext,
+            executionContext(operation),
+            new InputFetchStage(workerContext, /* output= */ null, error),
+            mock(Executor.class));
+
+    assertThrows(
+        IllegalArgumentException.class, () -> inputFetcher.fetchPolled(Stopwatch.createStarted()));
+
+    assertThat(fetchResult.isClosed()).isTrue();
+    verify(fileCache)
+        .decrementReferences(
+            ImmutableList.of("sha256_runtime_failure"),
+            ImmutableList.of(),
+            DigestFunction.Value.SHA256);
+  }
+
+  @Test
+  public void fetchPolled_cleansFetchResultAndExecDirWhenExecuteClaimRejected() throws Exception {
+    PipelineStage output = mock(PipelineStage.class);
+    PipelineStage error = mock(PipelineStage.class);
+    when(output.claim(any(ExecutionContext.class))).thenReturn(false);
+
+    Operation operation = Operation.newBuilder().setName("claim-rejected").build();
+    Command command = persistentWorkerCommand();
+    QueuedOperation queuedOperation = persistentQueuedOperation(command);
+    Path execDir = Path.of("/exec/claim-rejected");
+    AtomicBoolean destroyed = new AtomicBoolean(false);
+    CASFileCache fileCache = mock(CASFileCache.class);
+    FetchResult fetchResult = fetchResult(fileCache, "sha256_claim_rejected");
+
+    WorkerContext workerContext =
+        new StubWorkerContext() {
+          @Override
+          public QueuedOperation getQueuedOperation(QueueEntry queueEntry) {
+            return queuedOperation;
+          }
+
+          @Override
+          public boolean putOperation(Operation operation) {
+            return true;
+          }
+
+          @Override
+          public void resumePoller(
+              build.buildfarm.common.Poller poller,
+              String name,
+              QueueEntry queueEntry,
+              build.bazel.remote.execution.v2.ExecutionStage.Value stage,
+              Runnable onFailure,
+              io.grpc.Deadline deadline,
+              Executor executor) {}
+
+          @Override
+          public boolean isLinkExecFileSystem() {
+            return true;
+          }
+
+          @Override
+          public FetchResult fetchAndRefInputs(
+              Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex,
+              DigestFunction.Value digestFunction,
+              Action action,
+              Command command,
+              java.util.Set<String> toolInputPaths,
+              WorkerExecutedMetadata.Builder workerExecutedMetadata) {
+            return fetchResult;
+          }
+
+          @Override
+          public Path createLightweightExecDir(String operationName, Command command) {
+            return execDir;
+          }
+
+          @Override
+          public void destroyExecDir(Path path) {
+            assertThat(path).isEqualTo(execDir);
+            destroyed.set(true);
+          }
+
+          @Override
+          public int getInputFetchStageWidth() {
+            return 1;
+          }
+        };
+
+    InputFetcher inputFetcher =
+        new InputFetcher(
+            workerContext,
+            executionContext(operation),
+            new InputFetchStage(workerContext, output, error),
+            mock(Executor.class));
+
+    inputFetcher.fetchPolled(Stopwatch.createStarted());
+
+    assertThat(fetchResult.isClosed()).isTrue();
+    assertThat(destroyed.get()).isTrue();
+    verify(error).put(any(ExecutionContext.class));
+    verify(fileCache)
+        .decrementReferences(
+            ImmutableList.of("sha256_claim_rejected"),
+            ImmutableList.of(),
+            DigestFunction.Value.SHA256);
   }
 }

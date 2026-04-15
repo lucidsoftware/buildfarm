@@ -16,6 +16,10 @@ package build.buildfarm.worker.persistent;
 
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
 import com.google.protobuf.Duration;
+import java.nio.file.Path;
+import java.util.HashSet;
+import java.util.Set;
+import javax.annotation.Nullable;
 import persistent.common.CtxAround;
 
 public class RequestCtx implements CtxAround<WorkRequest> {
@@ -27,12 +31,32 @@ public class RequestCtx implements CtxAround<WorkRequest> {
 
   public final Duration timeout;
 
+  /** FetchResult from InputFetcher — carries CAS paths and ref keys for deferred linking. */
+  @Nullable public final FetchResult fetchResult;
+
+  /**
+   * Tracks paths created in the worker exec root during preWorkInit (directory symlinks, file
+   * hardlinks, zero-size files, symlink nodes). Populated incrementally during link creation. Read
+   * during postWorkCleanup to delete all created links.
+   */
+  final Set<Path> trackedLinks = new HashSet<>();
+
   public RequestCtx(
       WorkRequest request, WorkFilesContext ctx, WorkerInputs workFiles, Duration timeout) {
+    this(request, ctx, workFiles, timeout, /* fetchResult= */ null);
+  }
+
+  public RequestCtx(
+      WorkRequest request,
+      WorkFilesContext ctx,
+      WorkerInputs workFiles,
+      Duration timeout,
+      @Nullable FetchResult fetchResult) {
     this.request = request;
     this.filesContext = ctx;
     this.workerInputs = workFiles;
     this.timeout = timeout;
+    this.fetchResult = fetchResult;
   }
 
   @Override

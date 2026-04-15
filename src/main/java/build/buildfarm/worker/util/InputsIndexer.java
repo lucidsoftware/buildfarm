@@ -16,12 +16,14 @@ package build.buildfarm.worker.util;
 
 import build.bazel.remote.execution.v2.Digest;
 import build.bazel.remote.execution.v2.Directory;
+import build.bazel.remote.execution.v2.DirectoryNode;
 import build.bazel.remote.execution.v2.FileNode;
 import build.bazel.remote.execution.v2.NodeProperty;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.ProxyDirectoriesIndex;
 import build.buildfarm.v1test.Tree;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.worker.WorkerProtocol.Input;
 import java.nio.file.FileSystem;
 import java.nio.file.Path;
@@ -91,6 +93,42 @@ public class InputsIndexer {
       toolInputs = inputs.build();
     }
     return toolInputs;
+  }
+
+  /**
+   * Extracts tool input paths as relative strings from a tree by traversing only the nodes that
+   * carry the tool input marker. Avoids building full file maps — only allocates strings for the ~5
+   * tool inputs rather than ~9000 Path objects for all files.
+   */
+  public static ImmutableSet<String> getRelativeToolInputPaths(Tree tree) {
+    Map<Digest, Directory> directoriesIndex = new ProxyDirectoriesIndex(tree.getDirectoriesMap());
+    Directory rootDir = directoriesIndex.get(DigestUtil.toDigest(tree.getRootDigest()));
+    if (rootDir == null) {
+      return ImmutableSet.of();
+    }
+    ImmutableSet.Builder<String> toolPaths = ImmutableSet.builder();
+    collectToolInputPaths("", rootDir, directoriesIndex, toolPaths);
+    return toolPaths.build();
+  }
+
+  private static void collectToolInputPaths(
+      String dirPath,
+      Directory dir,
+      Map<Digest, Directory> directoriesIndex,
+      ImmutableSet.Builder<String> toolPaths) {
+    for (FileNode fileNode : dir.getFilesList()) {
+      if (isToolInput(fileNode)) {
+        toolPaths.add(dirPath.isEmpty() ? fileNode.getName() : dirPath + "/" + fileNode.getName());
+      }
+    }
+    for (DirectoryNode directoryNode : dir.getDirectoriesList()) {
+      String childPath =
+          dirPath.isEmpty() ? directoryNode.getName() : dirPath + "/" + directoryNode.getName();
+      Directory child = directoriesIndex.get(directoryNode.getDigest());
+      if (child != null) {
+        collectToolInputPaths(childPath, child, directoriesIndex, toolPaths);
+      }
+    }
   }
 
   private ImmutableMap<Path, FileNode> getAllFiles() {

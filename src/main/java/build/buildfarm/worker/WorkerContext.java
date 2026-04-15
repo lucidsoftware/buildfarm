@@ -28,6 +28,7 @@ import build.buildfarm.common.config.ExecutionPolicy;
 import build.buildfarm.v1test.QueueEntry;
 import build.buildfarm.v1test.QueuedOperation;
 import build.buildfarm.v1test.WorkerExecutedMetadata;
+import build.buildfarm.worker.persistent.FetchResult;
 import build.buildfarm.worker.resources.ResourceLimits;
 import com.google.common.collect.ImmutableList;
 import com.google.longrunning.Operation;
@@ -39,6 +40,7 @@ import java.nio.file.Path;
 import java.nio.file.attribute.UserPrincipal;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Executor;
 import org.jspecify.annotations.Nullable;
 
@@ -108,6 +110,22 @@ public interface WorkerContext {
       throws IOException, InterruptedException;
 
   void destroyExecDir(Path execDir) throws IOException, InterruptedException;
+
+  /** Returns true if the exec filesystem uses hardlinks with held CAS references (link-mode). */
+  boolean isLinkExecFileSystem();
+
+  /** Fetches inputs into local CAS with refs held. Returns FetchResult for deferred linking. */
+  FetchResult fetchAndRefInputs(
+      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex,
+      DigestFunction.Value digestFunction,
+      Action action,
+      Command command,
+      Set<String> toolInputPaths,
+      WorkerExecutedMetadata.Builder workerExecutedMetadata)
+      throws IOException, InterruptedException;
+
+  /** Creates a lightweight exec dir with output stubs only — no input links, no CAS refs. */
+  Path createLightweightExecDir(String operationName, Command command) throws IOException;
 
   void uploadOutputs(
       build.buildfarm.v1test.Digest actionDigest,

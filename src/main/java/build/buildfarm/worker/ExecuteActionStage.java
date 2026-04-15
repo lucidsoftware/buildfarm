@@ -59,6 +59,15 @@ public class ExecuteActionStage extends SuperscalarPipelineStage {
       @Override
       public void put(ExecutionContext executionContext) throws InterruptedException {
         try {
+          // Close FetchResult to decrement CAS refs (idempotent — safe if already closed).
+          // Must happen before destroyExecDir since the lightweight exec dir has no CAS refs.
+          if (executionContext.fetchResult != null) {
+            try {
+              executionContext.fetchResult.close();
+            } catch (Exception e) {
+              log.log(Level.SEVERE, "error closing FetchResult on error path", e);
+            }
+          }
           workerContext.destroyExecDir(executionContext.execDir);
         } catch (IOException e) {
           log.log(

@@ -106,6 +106,7 @@ public class PersistentExecutor {
       ResourceLimits limits,
       Duration timeout,
       Path workRootsDir,
+      @javax.annotation.Nullable FetchResult fetchResult,
       ActionResult.Builder resultBuilder)
       throws IOException, InterruptedException {
     // Pull out persistent worker start command from the overall action request
@@ -157,7 +158,7 @@ public class PersistentExecutor {
             executionName,
             workerFiles);
 
-    coordinator.copyToolInputsIntoWorkerToolRoot(key, workerFiles);
+    coordinator.copyToolInputsIntoWorkerToolRoot(key, workerFiles, fetchResult);
 
     // Make request
 
@@ -182,7 +183,7 @@ public class PersistentExecutor {
             .setRequestId(0)
             .build();
 
-    RequestCtx requestCtx = new RequestCtx(request, context, workerFiles, timeout);
+    RequestCtx requestCtx = new RequestCtx(request, context, workerFiles, timeout, fetchResult);
 
     // Run request
     // Required file operations (in/out) are the responsibility of the coordinator
@@ -199,6 +200,9 @@ public class PersistentExecutor {
       Thread.currentThread().interrupt();
       throw e;
     } catch (Exception e) {
+      if (fetchResult != null) {
+        fetchResult.close();
+      }
       String debug =
           "\n\tRequest.initCmd: "
               + workerExecCmd

@@ -17,12 +17,16 @@ package build.buildfarm.worker.persistent;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
 import com.google.protobuf.util.Durations;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -31,6 +35,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
+import javax.annotation.Nullable;
 import lombok.extern.java.Log;
 import persistent.bazel.client.CommonsWorkerPool;
 import persistent.bazel.client.PersistentWorker;
@@ -131,7 +136,8 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     return new ProtoCoordinator(loadToolsOnCreate, maxWorkersPerKey);
   }
 
-  public void copyToolInputsIntoWorkerToolRoot(WorkerKey key, WorkerInputs workerFiles)
+  public void copyToolInputsIntoWorkerToolRoot(
+      WorkerKey key, WorkerInputs workerFiles, @Nullable FetchResult fetchResult)
       throws IOException {
     WorkerKey lock = keyLock(key);
     synchronized (lock) {
@@ -141,7 +147,29 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
         for (Path opToolPath : workerFiles.opToolInputs) {
           Path workToolPath = workerFiles.relativizeInput(workToolRoot, opToolPath);
           if (!Files.exists(workToolPath)) {
-            workerFiles.copyInputFile(opToolPath, workToolPath);
+            if (fetchResult != null) {
+              // FetchResult path: tool inputs were fetched into CAS by FetchRefVisitor.
+              // Copy from CAS path instead of opRoot (which is a lightweight exec dir
+              // with no input files).
+              String relPath = workerFiles.opRoot.relativize(opToolPath).toString();
+              Path casPath = fetchResult.toolInputCasPaths().get(relPath);
+              if (casPath == null) {
+                if (fetchResult.zeroSizeToolInputPaths().contains(relPath)) {
+                  // Zero-size tool input (e.g. _repo_mapping): no CAS entry exists.
+                  // Create empty file directly, matching how createExecDir handles size-0
+                  // FileNodes.
+                  Files.createDirectories(workToolPath.getParent());
+                  Files.createFile(workToolPath);
+                } else {
+                  throw new IOException(
+                      "Tool input not found in FetchResult toolInputCasPaths: " + relPath);
+                }
+              } else {
+                FileAccessUtils.copyFile(casPath, workToolPath);
+              }
+            } else {
+              workerFiles.copyInputFile(opToolPath, workToolPath);
+            }
           }
         }
       } finally {
@@ -194,8 +222,18 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
           timeoutScheduler.schedule(
               task, Durations.toMillis(request.timeout), TimeUnit.MILLISECONDS);
 
-      // Symlinking should hypothetically be faster+leaner than copying inputs, but it's buggy.
-      copyNontoolInputs(request.workerInputs, worker.getExecRoot());
+      if (request.fetchResult != null) {
+        // Link from FetchResult CAS paths (local sym/hardlinks only, no CAS operations)
+        log.log(
+            Level.FINE,
+            () -> "Persistent worker: linking from FetchResult into " + worker.getExecRoot());
+        linkFromFetchResult(request, worker.getExecRoot());
+      } else {
+        log.log(
+            Level.FINE,
+            () -> "Persistent worker: copying non-tool inputs into " + worker.getExecRoot());
+        copyNontoolInputs(request.workerInputs, worker.getExecRoot());
+      }
     } catch (Exception e) {
       pendingReqs.remove(request);
       if (task.future != null) {
@@ -218,9 +256,14 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     }
 
     // When doWork or preWorkInit throws, Coordinator calls postWorkCleanup(null, ...) for any
-    // cleanup that needs to happen despite the failure. The cleanup above (pendingReqs removal,
-    // future cancellation) is complete at this point, so we return null as expected.
+    // cleanup that needs to happen despite the failure. Clean up partial links and FetchResult
+    // refs.
     if (response == null) {
+      try {
+        cleanUpLinksAndEmptyDirs(request, worker.getExecRoot());
+      } catch (IOException e) {
+        log.log(Level.SEVERE, "error cleaning up partial state after failure", e);
+      }
       return null;
     }
 
@@ -229,8 +272,16 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       // Always move outputs and clean up non-tool inputs, regardless of exit code. This matches the
       // REAPI spec as well as what Buildfarm and Bazel do elsewhere.
       moveOutputsToOperationRoot(request.filesContext, workerExecRoot);
-      cleanUpNontoolInputs(request.workerInputs, workerExecRoot);
+      if (request.fetchResult != null) {
+        cleanUpLinksAndEmptyDirs(request, workerExecRoot);
+      } else {
+        cleanUpNontoolInputs(request.workerInputs, workerExecRoot);
+      }
     } catch (IOException e) {
+      // Ensure FetchResult refs are decremented even if cleanup failed (idempotent)
+      if (request.fetchResult != null) {
+        request.fetchResult.close();
+      }
       throw logBadCleanup(request, e);
     }
 
@@ -310,6 +361,113 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
         workerInputs.deleteInputFileIfExists(workerExecRoot, opPath);
       }
     }
+  }
+
+  /**
+   * Links non-tool inputs from FetchResult CAS paths into the worker exec root. Each FetchResult
+   * entry corresponds 1:1 with a link to create; parent directories are created as needed. An entry
+   * whose path is already occupied in the reused worker exec root replaces the leftover — see
+   * {@link FileAccessUtils#createSymlink}/{@link FileAccessUtils#createHardlink} for files and
+   * directories, and {@link FileAccessUtils#createReplacingOnConflict} for the directly-created
+   * zero-size files and symlink nodes.
+   */
+  private void linkFromFetchResult(RequestCtx request, Path workerExecRoot) throws IOException {
+    FetchResult fetchResult = request.fetchResult;
+    for (FetchResult.Entry entry : fetchResult.entries()) {
+      Path execPath = workerExecRoot.resolve(entry.relativePath());
+      switch (entry.type()) {
+        case DIRECTORY:
+          FileAccessUtils.createSymlink(entry.casPath(), execPath);
+          break;
+        case FILE:
+          FileAccessUtils.createHardlink(entry.casPath(), execPath);
+          break;
+        case ZERO_SIZE_FILE:
+          // Zero-size file: no CAS entry. Ignore the executable bit, matching
+          // CFCLinkExecFileSystem.put's size-0 handling.
+          FileAccessUtils.createReplacingOnConflict(execPath, Files::createFile);
+          break;
+        case SYMLINK_NODE:
+          FileAccessUtils.createReplacingOnConflict(
+              execPath,
+              link ->
+                  Files.createSymbolicLink(
+                      link, link.getFileSystem().getPath(entry.symlinkTarget())));
+          break;
+      }
+      request.trackedLinks.add(execPath);
+    }
+  }
+
+  /**
+   * Deletes tracked links, removes the now-empty real directories the fetch walk descended into
+   * (bottom-up), and closes FetchResult refs. Shared by both success and failure cleanup paths.
+   */
+  private void cleanUpLinksAndEmptyDirs(RequestCtx request, Path workerExecRoot)
+      throws IOException {
+    IOException cleanupException = null;
+    for (Path link : request.trackedLinks) {
+      try {
+        FileAccessUtils.deleteFileIfExists(link);
+      } catch (IOException e) {
+        if (cleanupException == null) {
+          cleanupException = e;
+        } else {
+          cleanupException.addSuppressed(e);
+        }
+      }
+    }
+
+    if (request.fetchResult != null) {
+      try {
+        ImmutableSet<String> descendedDirectories = request.fetchResult.descendedDirectories();
+        // Sort by path depth descending (deepest first): a parent always has fewer segments than
+        // its
+        // child, so descending depth guarantees children are removed before parents — a valid
+        // bottom-up order.
+        List<String> sortedPaths = new ArrayList<>(descendedDirectories);
+        sortedPaths.sort(Comparator.comparingInt(ProtoCoordinator::pathDepth).reversed());
+        for (String relativePath : sortedPaths) {
+          Path directory = workerExecRoot.resolve(relativePath);
+          try {
+            if (Files.isDirectory(directory)) {
+              try (var entries = Files.list(directory)) {
+                if (entries.findFirst().isEmpty()) {
+                  Files.delete(directory);
+                }
+              }
+            }
+          } catch (IOException e) {
+            // Best-effort: the directory may have been removed already, or still hold leftover
+            // content. Log rather than swallow so a stuck/undeletable descended directory is
+            // visible (e.g. when diagnosing a later directory-symlink collision in the reused
+            // worker exec root).
+            log.log(
+                Level.WARNING,
+                "could not remove empty descended directory during cleanup: " + directory,
+                e);
+          }
+        }
+      } finally {
+        // Decrement all CAS refs (idempotent after a successful close; retryable after failure).
+        request.fetchResult.close();
+      }
+    }
+
+    if (cleanupException != null) {
+      throw cleanupException;
+    }
+  }
+
+  /** Counts path segments: 1 + number of '/' characters. */
+  private static int pathDepth(String relativePath) {
+    int count = 1;
+    for (int i = 0; i < relativePath.length(); i++) {
+      if (relativePath.charAt(i) == '/') {
+        count++;
+      }
+    }
+    return count;
   }
 
   @VisibleForTesting

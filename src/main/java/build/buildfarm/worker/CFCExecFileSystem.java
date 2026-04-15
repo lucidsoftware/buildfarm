@@ -58,6 +58,7 @@ import java.nio.file.attribute.UserPrincipal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.function.Consumer;
@@ -73,7 +74,7 @@ public class CFCExecFileSystem implements ExecFileSystem {
   private final ImmutableMap<String, UserPrincipal> owners;
 
   // permit symlinks to point to absolute paths in inputs
-  private final boolean allowSymlinkTargetAbsolute;
+  protected final boolean allowSymlinkTargetAbsolute;
 
   protected final ExecutorService fetchService;
   protected final ExecutorService removeDirectoryService;
@@ -334,6 +335,53 @@ public class CFCExecFileSystem implements ExecFileSystem {
     public FileVisitResult visitFileFailed(Path file, IOException exc) {
       return FileVisitResult.CONTINUE;
     }
+
+    /**
+     * Resolves the child OutputDirectory for a directory node during tree traversal. Returns null
+     * if the parent is null or has no child with the given name.
+     */
+    protected static @Nullable OutputDirectory resolveChildOutputDirectory(
+        @Nullable OutputDirectory parent, String childName) {
+      return parent != null ? parent.getChild(childName) : null;
+    }
+  }
+
+  /**
+   * Drains all futures, collecting errors. Handles interrupts by cancelling remaining futures and
+   * re-throwing InterruptedException. Clears the thread interrupt flag between futures to avoid
+   * masking the source of interruption.
+   */
+  protected static void drainFutures(
+      Iterable<ListenableFuture<Void>> futures, ImmutableList.Builder<Throwable> exceptions)
+      throws InterruptedException {
+    InterruptedException interruptException = null;
+    boolean wasInterrupted = false;
+    for (ListenableFuture<Void> future : futures) {
+      if (interruptException != null || wasInterrupted) {
+        future.cancel(true);
+      } else {
+        try {
+          future.get();
+        } catch (CancellationException e) {
+          exceptions.add(e);
+        } catch (ExecutionException e) {
+          exceptions.add(e.getCause());
+        } catch (InterruptedException e) {
+          future.cancel(true);
+          interruptException = e;
+        }
+      }
+      wasInterrupted = Thread.interrupted() || wasInterrupted;
+    }
+    if (wasInterrupted) {
+      Thread.currentThread().interrupt();
+      if (interruptException == null) {
+        interruptException = new InterruptedException();
+      }
+    }
+    if (interruptException != null) {
+      throw interruptException;
+    }
   }
 
   @Override
@@ -362,35 +410,8 @@ public class CFCExecFileSystem implements ExecFileSystem {
 
     boolean success = false;
     try {
-      InterruptedException exception = null;
-      boolean wasInterrupted = false;
       ImmutableList.Builder<Throwable> exceptions = ImmutableList.builder();
-      for (ListenableFuture<Void> fetchedFuture : fetchedFutures) {
-        if (exception != null || wasInterrupted) {
-          fetchedFuture.cancel(true);
-        } else {
-          try {
-            fetchedFuture.get();
-          } catch (ExecutionException e) {
-            // just to ensure that no other code can react to interrupt status
-            exceptions.add(e.getCause());
-          } catch (InterruptedException e) {
-            fetchedFuture.cancel(true);
-            exception = e;
-          }
-        }
-        wasInterrupted = Thread.interrupted() || wasInterrupted;
-      }
-      if (wasInterrupted) {
-        Thread.currentThread().interrupt();
-        // unlikely, but worth guarding
-        if (exception == null) {
-          exception = new InterruptedException();
-        }
-      }
-      if (exception != null) {
-        throw exception;
-      }
+      drainFutures(fetchedFutures, exceptions);
       checkExecErrors(execDir, exceptions.build());
       success = true;
     } finally {

@@ -56,6 +56,7 @@ import build.buildfarm.v1test.Digest;
 import build.buildfarm.v1test.QueueEntry;
 import build.buildfarm.v1test.QueuedOperation;
 import build.buildfarm.v1test.WorkerExecutedMetadata;
+import build.buildfarm.worker.CFCLinkExecFileSystem;
 import build.buildfarm.worker.DequeueMatchEvaluator;
 import build.buildfarm.worker.ExecFileSystem;
 import build.buildfarm.worker.ExecutionPolicies;
@@ -65,6 +66,7 @@ import build.buildfarm.worker.WorkerContext;
 import build.buildfarm.worker.cgroup.Cpu;
 import build.buildfarm.worker.cgroup.Group;
 import build.buildfarm.worker.cgroup.Mem;
+import build.buildfarm.worker.persistent.FetchResult;
 import build.buildfarm.worker.resources.LocalResourceSet;
 import build.buildfarm.worker.resources.ResourceDecider;
 import build.buildfarm.worker.resources.ResourceLimits;
@@ -843,6 +845,29 @@ class ShardWorkerContext implements WorkerContext {
   @Override
   public void destroyExecDir(Path execDir) throws IOException, InterruptedException {
     execFileSystem.destroyExecDir(execDir);
+  }
+
+  @Override
+  public boolean isLinkExecFileSystem() {
+    return execFileSystem instanceof CFCLinkExecFileSystem;
+  }
+
+  @Override
+  public FetchResult fetchAndRefInputs(
+      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex,
+      DigestFunction.Value digestFunction,
+      Action action,
+      Command command,
+      Set<String> toolInputPaths,
+      WorkerExecutedMetadata.Builder workerExecutedMetadata)
+      throws IOException, InterruptedException {
+    return execFileSystem.fetchAndRefInputs(
+        directoriesIndex, digestFunction, action, command, toolInputPaths, workerExecutedMetadata);
+  }
+
+  @Override
+  public Path createLightweightExecDir(String operationName, Command command) throws IOException {
+    return execFileSystem.createLightweightExecDir(operationName, command);
   }
 
   @Override
