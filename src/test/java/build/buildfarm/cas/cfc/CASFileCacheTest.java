@@ -24,6 +24,7 @@ import static java.lang.Thread.State.WAITING;
 import static java.util.concurrent.Executors.newSingleThreadExecutor;
 import static java.util.concurrent.TimeUnit.MICROSECONDS;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.fail;
@@ -78,10 +79,13 @@ import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -91,6 +95,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -495,6 +503,205 @@ class CASFileCacheTest {
         throw new RuntimeException("could not shut down service");
       }
     }
+  }
+
+  @Test
+  public void waitForLastUnreferencedEntrySkipsWalkAtInfoLevel()
+      throws ExecutionException, IOException, InterruptedException {
+    try (LogCapture capture = new LogCapture(CASFileCache.class, Level.INFO)) {
+      runOverflowingPutAndAwaitWaitCycle(capture);
+
+      List<LogRecord> records = capture.snapshot();
+      assertThat(records).isNotEmpty();
+      // Production path emits only the new lightweight INFO summary; the detailed walk
+      // (header / per-unreferenced-entry / min/max summary) is now FINE-only and must
+      // not appear at INFO.
+      assertThat(records.stream().anyMatch(r -> formatted(r).contains("waiting:"))).isTrue();
+      assertThat(records.stream().noneMatch(r -> formatted(r).contains("header("))).isTrue();
+      assertThat(records.stream().noneMatch(r -> formatted(r).contains("unreferenced entry(")))
+          .isTrue();
+      assertThat(
+              records.stream().noneMatch(r -> formatted(r).contains("unreferenced list is empty")))
+          .isTrue();
+    }
+  }
+
+  @Test
+  public void waitForLastUnreferencedEntryEmitsDetailAtFineLevel()
+      throws ExecutionException, IOException, InterruptedException {
+    try (LogCapture capture = new LogCapture(CASFileCache.class, Level.FINE)) {
+      runOverflowingPutAndAwaitWaitCycle(capture);
+
+      List<LogRecord> records = capture.snapshot();
+      assertThat(records).isNotEmpty();
+      // FINE level reproduces the original detailed walk: a "header(" line per
+      // iteration plus a "unreferenced list is empty ... min(..) max(..)" summary
+      // per iteration. Production INFO summary line must NOT appear at FINE because
+      // the two paths are mutually exclusive.
+      assertThat(records.stream().anyMatch(r -> formatted(r).contains("header("))).isTrue();
+      assertThat(
+              records.stream().anyMatch(r -> formatted(r).contains("unreferenced list is empty")))
+          .isTrue();
+      assertThat(records.stream().noneMatch(r -> formatted(r).contains("waiting:"))).isTrue();
+    }
+  }
+
+  // Fills the cache with one referenced entry, then submits a second put that will park
+  // inside waitForLastUnreferencedEntry (LRU is empty while the first entry is held).
+  // Awaits at least one captured log record so the assertions see the wait-cycle output,
+  // then releases the held entry and drains the put.
+  private void runOverflowingPutAndAwaitWaitCycle(LogCapture capture)
+      throws ExecutionException, IOException, InterruptedException {
+    byte[] bigData = new byte[22000];
+    ByteString bigBlob = ByteString.copyFrom(bigData);
+    Digest bigDigest = DIGEST_UTIL.compute(bigBlob);
+    blobs.put(bigDigest, bigBlob);
+    Path bigPath = fileCache.put(bigDigest, /* isExecutable= */ false).path();
+
+    ExecutorService service = newSingleThreadExecutor();
+    Future<Void> putFuture =
+        service.submit(
+            () -> {
+              ByteString content = ByteString.copyFromUtf8("CAS Would Exceed Max Size");
+              Digest digest = DIGEST_UTIL.compute(content);
+              blobs.put(digest, content);
+              fileCache.put(digest, /* isExecutable= */ false);
+              return null;
+            });
+    capture.awaitRecord(SECONDS.toNanos(5));
+    decrementReference(bigPath);
+    try {
+      putFuture.get();
+    } finally {
+      if (!shutdownAndAwaitTermination(service, 1, SECONDS)) {
+        throw new RuntimeException("could not shut down service");
+      }
+    }
+  }
+
+  @Test
+  public void waitForLastUnreferencedEntryStillThrowsWhenStorageEmpty()
+      throws InterruptedException {
+    // Storage starts empty in the test fixture; the LRU header is unlinked so the
+    // method enters the wait loop and immediately throws on the empty-storage check.
+    IllegalStateException thrown = null;
+    synchronized (fileCache) {
+      try {
+        fileCache.waitForLastUnreferencedEntry(1024L);
+      } catch (IllegalStateException e) {
+        thrown = e;
+      }
+    }
+    assertThat(thrown).isNotNull();
+    assertThat(thrown).hasMessageThat().contains("there are no keys to wait for expiration on");
+  }
+
+  @Test
+  public void waitForLastUnreferencedEntryExitsOnSizeDropBelowLimit()
+      throws IOException, InterruptedException {
+    // Populate one referenced entry so storage isn't empty; with the entry referenced,
+    // the LRU is empty (header.after == header) and the method enters the wait loop.
+    byte[] bigData = new byte[22000];
+    ByteString bigBlob = ByteString.copyFrom(bigData);
+    Digest bigDigest = DIGEST_UTIL.compute(bigBlob);
+    blobs.put(bigDigest, bigBlob);
+    fileCache.put(bigDigest, /* isExecutable= */ false);
+
+    AtomicReference<Entry> result = new AtomicReference<>();
+    AtomicReference<Throwable> error = new AtomicReference<>();
+    Thread caller =
+        new Thread(
+            () -> {
+              try {
+                synchronized (fileCache) {
+                  // Force sizeInBytes above the cap so the wait()-then-check sees the
+                  // over-cap state initially.
+                  fileCache.setSizeInBytesForTesting(fileCache.maxSize() + TEST_BLOCK_SIZE);
+                  result.set(fileCache.waitForLastUnreferencedEntry(1024L));
+                }
+              } catch (Throwable t) {
+                error.set(t);
+              }
+            });
+    caller.start();
+    // Wait for the caller to release the monitor inside Object.wait().
+    long deadline = System.nanoTime() + SECONDS.toNanos(5);
+    while (caller.getState() != WAITING && System.nanoTime() < deadline) {
+      Thread.yield();
+    }
+    assertThat(caller.getState()).isEqualTo(WAITING);
+
+    // Drop sizeInBytes back to the cap and notify so the wait()er rechecks the
+    // size-drop branch and returns null.
+    synchronized (fileCache) {
+      fileCache.setSizeInBytesForTesting(fileCache.maxSize());
+      fileCache.notifyAll();
+    }
+    caller.join(SECONDS.toMillis(5));
+    assertThat(caller.isAlive()).isFalse();
+    assertThat(error.get()).isNull();
+    assertThat(result.get()).isNull();
+  }
+
+  /** Captures JUL log records for a target logger at a configured level. */
+  private static final class LogCapture implements AutoCloseable {
+    private final Logger logger;
+    private final Handler handler;
+    private final Level previousLevel;
+    private final boolean previousUseParentHandlers;
+    private final List<LogRecord> records = new CopyOnWriteArrayList<>();
+
+    LogCapture(Class<?> targetClass, Level level) {
+      this.logger = Logger.getLogger(targetClass.getName());
+      this.previousLevel = logger.getLevel();
+      this.previousUseParentHandlers = logger.getUseParentHandlers();
+      this.handler =
+          new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+              records.add(record);
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+          };
+      handler.setLevel(Level.ALL);
+      logger.setLevel(level);
+      logger.setUseParentHandlers(false);
+      logger.addHandler(handler);
+    }
+
+    void awaitRecord(long timeoutNanos) throws InterruptedException {
+      long deadline = System.nanoTime() + timeoutNanos;
+      while (records.isEmpty()) {
+        if (System.nanoTime() >= deadline) {
+          throw new AssertionError(
+              "no log record arrived within " + NANOSECONDS.toMillis(timeoutNanos) + "ms");
+        }
+        MICROSECONDS.sleep(100);
+      }
+    }
+
+    List<LogRecord> snapshot() {
+      return new ArrayList<>(records);
+    }
+
+    @Override
+    public void close() {
+      logger.removeHandler(handler);
+      logger.setLevel(previousLevel);
+      logger.setUseParentHandlers(previousUseParentHandlers);
+    }
+  }
+
+  // CASFileCache pre-formats log messages with String.format, so LogRecord.getParameters()
+  // is always null and getMessage() is the final string.
+  private static String formatted(LogRecord r) {
+    String msg = r.getMessage();
+    return msg == null ? "" : msg;
   }
 
   @Test
