@@ -24,6 +24,7 @@ import static build.buildfarm.instance.server.NodeInstance.INVALID_COMMAND;
 import static build.buildfarm.instance.server.NodeInstance.OUTPUT_DIRECTORY_IS_OUTPUT_ANCESTOR;
 import static build.buildfarm.instance.server.NodeInstance.OUTPUT_FILE_IS_OUTPUT_ANCESTOR;
 import static build.buildfarm.instance.server.NodeInstance.SYMLINK_TARGET_ABSOLUTE;
+import static build.buildfarm.instance.server.NodeInstance.SYMLINK_TARGET_INVALID;
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
 import static org.junit.Assert.assertThrows;
@@ -72,7 +73,6 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
 import com.google.longrunning.Operation;
@@ -251,11 +251,11 @@ public class NodeInstanceTest {
                     FileNode.newBuilder().setName("foo").build()))
             .build(),
         /* pathDigests= */ new Stack<>(),
-        /* visited= */ Sets.newHashSet(),
+        /* visited= */ Maps.newHashMap(),
         /* directoriesIndex= */ Maps.newHashMap(),
         /* allowSymlinkTargetAbsolute= */ false,
         /* onInputFile= */ file -> {},
-        /* onInputDirectorie= */ directory -> {},
+        /* onInputDirectory= */ directory -> {},
         /* onInputDigest= */ digest -> {},
         preconditionFailure);
 
@@ -287,12 +287,12 @@ public class NodeInstanceTest {
                         .build()))
             .build(),
         /* pathDigests= */ new Stack<>(),
-        /* visited= */ Sets.newHashSet(),
+        /* visited= */ Maps.newHashMap(),
         /* directoriesIndex= */ ImmutableMap.of(
             build.bazel.remote.execution.v2.Digest.getDefaultInstance(), emptyDirectory),
         /* allowSymlinkTargetAbsolute= */ false,
         /* onInputFiles= */ file -> {},
-        /* onInputDirectories= */ directory -> {},
+        /* onInputDirectory= */ directory -> {},
         /* onInputDigests= */ digest -> {},
         preconditionFailure);
 
@@ -313,11 +313,11 @@ public class NodeInstanceTest {
                     FileNode.newBuilder().setName("bar").build()))
             .build(),
         /* pathDigests= */ new Stack<>(),
-        /* visited= */ Sets.newHashSet(),
+        /* visited= */ Maps.newHashMap(),
         /* directoriesIndex= */ Maps.newHashMap(),
         /* allowSymlinkTargetAbsolute= */ false,
         /* onInputFiles= */ file -> {},
-        /* onInputDirectories= */ directory -> {},
+        /* onInputDirectory= */ directory -> {},
         /* onInputDigests= */ digest -> {},
         preconditionFailure);
 
@@ -349,12 +349,12 @@ public class NodeInstanceTest {
                         .build()))
             .build(),
         /* pathDigests= */ new Stack<>(),
-        /* visited= */ Sets.newHashSet(),
+        /* visited= */ Maps.newHashMap(),
         /* directoriesIndex= */ ImmutableMap.of(
             DigestUtil.toDigest(emptyDirectoryDigest), emptyDirectory),
         /* allowSymlinkTargetAbsolute= */ false,
         /* onInputFiles= */ file -> {},
-        /* onInputDirectories= */ directory -> {},
+        /* onInputDirectory= */ directory -> {},
         /* onInputDigests= */ digest -> {},
         preconditionFailure);
 
@@ -386,12 +386,12 @@ public class NodeInstanceTest {
                         .build()))
             .build(),
         /* pathDigests= */ new Stack<>(),
-        /* visited= */ Sets.newHashSet(),
+        /* visited= */ Maps.newHashMap(),
         /* directoriesIndex= */ ImmutableMap.of(
             DigestUtil.toDigest(emptyDirectoryDigest), emptyDirectory),
         /* allowSymlinkTargetAbsolute= */ false,
         /* onInputFiles= */ file -> {},
-        /* onInputDirectories= */ directory -> {},
+        /* onInputDirectory= */ directory -> {},
         /* onInputDigests= */ digest -> {},
         preconditionFailure);
 
@@ -415,11 +415,11 @@ public class NodeInstanceTest {
         ACTION_INPUT_ROOT_DIRECTORY_PATH,
         absoluteSymlinkDirectory,
         /* pathDigests= */ new Stack<>(),
-        /* visited= */ Sets.newHashSet(),
+        /* visited= */ Maps.newHashMap(),
         /* directoriesIndex= */ Maps.newHashMap(),
         /* allowSymlinkTargetAbsolute= */ false,
         /* onInputFile= */ file -> {},
-        /* onInputDirectorie= */ directory -> {},
+        /* onInputDirectory= */ directory -> {},
         /* onInputDigest= */ digest -> {},
         preconditionFailure);
 
@@ -436,14 +436,388 @@ public class NodeInstanceTest {
         ACTION_INPUT_ROOT_DIRECTORY_PATH,
         absoluteSymlinkDirectory,
         /* pathDigests= */ new Stack<>(),
-        /* visited= */ Sets.newHashSet(),
+        /* visited= */ Maps.newHashMap(),
         /* directoriesIndex= */ Maps.newHashMap(),
         /* allowSymlinkTargetAbsolute= */ true,
         /* onInputFile= */ file -> {},
-        /* onInputDirectorie= */ directory -> {},
+        /* onInputDirectory= */ directory -> {},
         /* onInputDigest= */ digest -> {},
         preconditionFailure);
     assertThat(preconditionFailure.getViolationsCount()).isEqualTo(0);
+  }
+
+  @Test
+  public void shouldRejectSymlinkTargetWithDotDotEscape() {
+    // a single dot-dot at the input root escapes the input root and must be rejected
+    PreconditionFailure.Builder preconditionFailure = PreconditionFailure.newBuilder();
+    Directory escapingSymlinkDirectory =
+        Directory.newBuilder()
+            .addSymlinks(SymlinkNode.newBuilder().setName("foo").setTarget("../../foo").build())
+            .build();
+    NodeInstance.validateActionInputDirectory(
+        DIGEST_UTIL.getDigestFunction(),
+        ACTION_INPUT_ROOT_DIRECTORY_PATH,
+        escapingSymlinkDirectory,
+        /* pathDigests= */ new Stack<>(),
+        /* visited= */ Maps.newHashMap(),
+        /* directoriesIndex= */ Maps.newHashMap(),
+        /* allowSymlinkTargetAbsolute= */ false,
+        /* onInputFile= */ file -> {},
+        /* onInputDirectory= */ directory -> {},
+        /* onInputDigest= */ digest -> {},
+        preconditionFailure);
+
+    assertThat(preconditionFailure.getViolationsCount()).isEqualTo(1);
+    Violation violation = preconditionFailure.getViolationsList().getFirst();
+    assertThat(violation.getType()).isEqualTo(VIOLATION_TYPE_INVALID);
+    assertThat(violation.getSubject()).isEqualTo("/: foo -> ../../foo");
+    assertThat(violation.getDescription()).isEqualTo(SYMLINK_TARGET_INVALID);
+  }
+
+  @Test
+  public void shouldRejectSymlinkTargetEscapingInputRoot() {
+    // multiple dot-dots that exceed the symlink's parent depth from the input root
+    PreconditionFailure.Builder preconditionFailure = PreconditionFailure.newBuilder();
+    Directory escapingSymlinkDirectory =
+        Directory.newBuilder()
+            .addSymlinks(
+                SymlinkNode.newBuilder().setName("foo").setTarget("../../../etc/passwd").build())
+            .build();
+    NodeInstance.validateActionInputDirectory(
+        DIGEST_UTIL.getDigestFunction(),
+        // symlink lives two levels deep; three dot-dots still escape
+        "a/b",
+        escapingSymlinkDirectory,
+        /* pathDigests= */ new Stack<>(),
+        /* visited= */ Maps.newHashMap(),
+        /* directoriesIndex= */ Maps.newHashMap(),
+        /* allowSymlinkTargetAbsolute= */ false,
+        /* onInputFile= */ file -> {},
+        /* onInputDirectory= */ directory -> {},
+        /* onInputDigest= */ digest -> {},
+        preconditionFailure);
+
+    assertThat(preconditionFailure.getViolationsCount()).isEqualTo(1);
+    Violation violation = preconditionFailure.getViolationsList().getFirst();
+    assertThat(violation.getType()).isEqualTo(VIOLATION_TYPE_INVALID);
+    assertThat(violation.getSubject()).isEqualTo("/a/b: foo -> ../../../etc/passwd");
+    assertThat(violation.getDescription()).isEqualTo(SYMLINK_TARGET_INVALID);
+  }
+
+  @Test
+  public void shouldAcceptSymlinkTargetStayingWithinInputRoot() {
+    // bar (single segment), ./bar (dot prefix), foo/../bar (balanced dotdot) all stay in root
+    Directory inRootSymlinks =
+        Directory.newBuilder()
+            .addSymlinks(SymlinkNode.newBuilder().setName("a").setTarget("bar").build())
+            .addSymlinks(SymlinkNode.newBuilder().setName("b").setTarget("./bar").build())
+            .addSymlinks(SymlinkNode.newBuilder().setName("c").setTarget("foo/../bar").build())
+            .addSymlinks(SymlinkNode.newBuilder().setName("d").setTarget("foo/bar/baz").build())
+            .build();
+    PreconditionFailure.Builder preconditionFailure = PreconditionFailure.newBuilder();
+    NodeInstance.validateActionInputDirectory(
+        DIGEST_UTIL.getDigestFunction(),
+        ACTION_INPUT_ROOT_DIRECTORY_PATH,
+        inRootSymlinks,
+        /* pathDigests= */ new Stack<>(),
+        /* visited= */ Maps.newHashMap(),
+        /* directoriesIndex= */ Maps.newHashMap(),
+        /* allowSymlinkTargetAbsolute= */ false,
+        /* onInputFile= */ file -> {},
+        /* onInputDirectory= */ directory -> {},
+        /* onInputDigest= */ digest -> {},
+        preconditionFailure);
+
+    assertThat(preconditionFailure.getViolationsCount()).isEqualTo(0);
+  }
+
+  @Test
+  public void shouldRejectSymlinkTargetEscapingThroughDirectorySymlink() {
+    Directory root =
+        Directory.newBuilder()
+            .addSymlinks(SymlinkNode.newBuilder().setName("anchor").setTarget(".").build())
+            .addSymlinks(
+                SymlinkNode.newBuilder().setName("victim").setTarget("anchor/../outside").build())
+            .build();
+
+    PreconditionFailure.Builder preconditionFailure = PreconditionFailure.newBuilder();
+    NodeInstance.validateActionInputDirectory(
+        DIGEST_UTIL.getDigestFunction(),
+        ACTION_INPUT_ROOT_DIRECTORY_PATH,
+        root,
+        /* pathDigests= */ new Stack<>(),
+        /* visited= */ Maps.newHashMap(),
+        /* directoriesIndex= */ Maps.newHashMap(),
+        /* allowSymlinkTargetAbsolute= */ false,
+        /* onInputFile= */ file -> {},
+        /* onInputDirectory= */ directory -> {},
+        /* onInputDigest= */ digest -> {},
+        preconditionFailure);
+
+    assertThat(preconditionFailure.getViolationsCount()).isEqualTo(1);
+    Violation violation = preconditionFailure.getViolationsList().getFirst();
+    assertThat(violation.getType()).isEqualTo(VIOLATION_TYPE_INVALID);
+    assertThat(violation.getSubject()).isEqualTo("/: victim -> anchor/../outside");
+    assertThat(violation.getDescription()).isEqualTo(SYMLINK_TARGET_INVALID);
+  }
+
+  @Test
+  public void shouldAcceptDotDotThroughRealDirectory() {
+    Directory root =
+        Directory.newBuilder()
+            .addFiles(FileNode.newBuilder().setName("file").build())
+            .addSymlinks(SymlinkNode.newBuilder().setName("link").setTarget("dir/../file").build())
+            .addDirectories(DirectoryNode.newBuilder().setName("dir").build())
+            .build();
+
+    PreconditionFailure.Builder preconditionFailure = PreconditionFailure.newBuilder();
+    NodeInstance.validateActionInputDirectory(
+        DIGEST_UTIL.getDigestFunction(),
+        ACTION_INPUT_ROOT_DIRECTORY_PATH,
+        root,
+        /* pathDigests= */ new Stack<>(),
+        /* visited= */ Maps.newHashMap(),
+        /* directoriesIndex= */ Maps.newHashMap(),
+        /* allowSymlinkTargetAbsolute= */ false,
+        /* onInputFile= */ file -> {},
+        /* onInputDirectory= */ directory -> {},
+        /* onInputDigest= */ digest -> {},
+        preconditionFailure);
+
+    assertThat(preconditionFailure.getViolationsCount()).isEqualTo(0);
+  }
+
+  @Test
+  public void shouldAcceptSymlinkCycleWithoutLooping() {
+    Directory root =
+        Directory.newBuilder()
+            .addSymlinks(SymlinkNode.newBuilder().setName("a").setTarget("b").build())
+            .addSymlinks(SymlinkNode.newBuilder().setName("b").setTarget("a").build())
+            .addSymlinks(SymlinkNode.newBuilder().setName("link").setTarget("a/file").build())
+            .build();
+
+    PreconditionFailure.Builder preconditionFailure = PreconditionFailure.newBuilder();
+    NodeInstance.validateActionInputDirectory(
+        DIGEST_UTIL.getDigestFunction(),
+        ACTION_INPUT_ROOT_DIRECTORY_PATH,
+        root,
+        /* pathDigests= */ new Stack<>(),
+        /* visited= */ Maps.newHashMap(),
+        /* directoriesIndex= */ Maps.newHashMap(),
+        /* allowSymlinkTargetAbsolute= */ false,
+        /* onInputFile= */ file -> {},
+        /* onInputDirectory= */ directory -> {},
+        /* onInputDigest= */ digest -> {},
+        preconditionFailure);
+
+    assertThat(preconditionFailure.getViolationsCount()).isEqualTo(0);
+  }
+
+  @Test
+  public void shouldRejectEmptySymlinkTarget() {
+    // empty target previously threw StringIndexOutOfBoundsException at target.charAt(0); should
+    // now be rejected as invalid
+    PreconditionFailure.Builder preconditionFailure = PreconditionFailure.newBuilder();
+    Directory emptyTargetSymlinkDirectory =
+        Directory.newBuilder()
+            .addSymlinks(SymlinkNode.newBuilder().setName("foo").setTarget("").build())
+            .build();
+    NodeInstance.validateActionInputDirectory(
+        DIGEST_UTIL.getDigestFunction(),
+        ACTION_INPUT_ROOT_DIRECTORY_PATH,
+        emptyTargetSymlinkDirectory,
+        /* pathDigests= */ new Stack<>(),
+        /* visited= */ Maps.newHashMap(),
+        /* directoriesIndex= */ Maps.newHashMap(),
+        /* allowSymlinkTargetAbsolute= */ false,
+        /* onInputFile= */ file -> {},
+        /* onInputDirectory= */ directory -> {},
+        /* onInputDigest= */ digest -> {},
+        preconditionFailure);
+
+    assertThat(preconditionFailure.getViolationsCount()).isEqualTo(1);
+    Violation violation = preconditionFailure.getViolationsList().getFirst();
+    assertThat(violation.getType()).isEqualTo(VIOLATION_TYPE_INVALID);
+    assertThat(violation.getSubject()).isEqualTo("/: foo -> ");
+    assertThat(violation.getDescription()).isEqualTo(SYMLINK_TARGET_INVALID);
+  }
+
+  @Test
+  public void shouldAcceptDotDotBalancedByDeeperParentDepth() {
+    // a symlink two directories deep can reach back into the input root via two dot-dots
+    Directory deepSymlinks =
+        Directory.newBuilder()
+            .addSymlinks(SymlinkNode.newBuilder().setName("foo").setTarget("../../foo").build())
+            .addSymlinks(SymlinkNode.newBuilder().setName("zoo").setTarget("../sibling").build())
+            .build();
+    PreconditionFailure.Builder preconditionFailure = PreconditionFailure.newBuilder();
+    NodeInstance.validateActionInputDirectory(
+        DIGEST_UTIL.getDigestFunction(),
+        // parent depth is 2 (a/b)
+        "a/b",
+        deepSymlinks,
+        /* pathDigests= */ new Stack<>(),
+        /* visited= */ Maps.newHashMap(),
+        /* directoriesIndex= */ Maps.newHashMap(),
+        /* allowSymlinkTargetAbsolute= */ false,
+        /* onInputFile= */ file -> {},
+        /* onInputDirectory= */ directory -> {},
+        /* onInputDigest= */ digest -> {},
+        preconditionFailure);
+
+    assertThat(preconditionFailure.getViolationsCount()).isEqualTo(0);
+  }
+
+  @Test
+  public void shouldRejectRelativeDotDotEscapeEvenWhenAbsoluteAllowed() {
+    // allowSymlinkTargetAbsolute governs absolute targets only; relative ..-traversal must still
+    // be rejected so a permissive client cannot escape the input root via a relative target
+    PreconditionFailure.Builder preconditionFailure = PreconditionFailure.newBuilder();
+    Directory escapingSymlinkDirectory =
+        Directory.newBuilder()
+            .addSymlinks(SymlinkNode.newBuilder().setName("foo").setTarget("../foo").build())
+            .build();
+    NodeInstance.validateActionInputDirectory(
+        DIGEST_UTIL.getDigestFunction(),
+        ACTION_INPUT_ROOT_DIRECTORY_PATH,
+        escapingSymlinkDirectory,
+        /* pathDigests= */ new Stack<>(),
+        /* visited= */ Maps.newHashMap(),
+        /* directoriesIndex= */ Maps.newHashMap(),
+        /* allowSymlinkTargetAbsolute= */ true,
+        /* onInputFile= */ file -> {},
+        /* onInputDirectory= */ directory -> {},
+        /* onInputDigest= */ digest -> {},
+        preconditionFailure);
+
+    assertThat(preconditionFailure.getViolationsCount()).isEqualTo(1);
+    Violation violation = preconditionFailure.getViolationsList().getFirst();
+    assertThat(violation.getType()).isEqualTo(VIOLATION_TYPE_INVALID);
+    assertThat(violation.getSubject()).isEqualTo("/: foo -> ../foo");
+    assertThat(violation.getDescription()).isEqualTo(SYMLINK_TARGET_INVALID);
+  }
+
+  @Test
+  public void shouldRejectSymlinkWhenDirectoryReferencedAtShallowerDepthLater() {
+    // Visited-dedup safety: a directory whose escaping symlink "passes" at a deep parentDepth
+    // must be re-validated when the same digest is later referenced at a shallower path where
+    // the same symlink would escape. Without re-validation, the deep-path encounter primes the
+    // visited cache and the shallow-path encounter is enumerated without symlink checks.
+    Directory escapingChild =
+        Directory.newBuilder()
+            .addSymlinks(SymlinkNode.newBuilder().setName("s").setTarget("../../foo").build())
+            .build();
+    build.bazel.remote.execution.v2.Digest escapingChildDigest =
+        DigestUtil.toDigest(DIGEST_UTIL.compute(escapingChild));
+
+    Directory deepParent =
+        Directory.newBuilder()
+            .addDirectories(
+                DirectoryNode.newBuilder().setName("child").setDigest(escapingChildDigest).build())
+            .build();
+    build.bazel.remote.execution.v2.Digest deepParentDigest =
+        DigestUtil.toDigest(DIGEST_UTIL.compute(deepParent));
+
+    // Sorted directory names: "a" < "z", so "a" is processed first. That puts the inner
+    // "child" -> escapingChild reference at parentDepth=2, where "../../foo" stays in the
+    // input root and validation passes. The validator must then re-check when "z" reaches
+    // the same digest at parentDepth=1, where the same target escapes.
+    Directory root =
+        Directory.newBuilder()
+            .addDirectories(
+                DirectoryNode.newBuilder().setName("a").setDigest(deepParentDigest).build())
+            .addDirectories(
+                DirectoryNode.newBuilder().setName("z").setDigest(escapingChildDigest).build())
+            .build();
+    Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex =
+        ImmutableMap.of(
+            deepParentDigest, deepParent,
+            escapingChildDigest, escapingChild);
+
+    PreconditionFailure.Builder preconditionFailure = PreconditionFailure.newBuilder();
+    NodeInstance.validateActionInputDirectory(
+        DIGEST_UTIL.getDigestFunction(),
+        ACTION_INPUT_ROOT_DIRECTORY_PATH,
+        root,
+        /* pathDigests= */ new Stack<>(),
+        /* visited= */ Maps.newHashMap(),
+        directoriesIndex,
+        /* allowSymlinkTargetAbsolute= */ false,
+        /* onInputFile= */ file -> {},
+        /* onInputDirectory= */ directory -> {},
+        /* onInputDigest= */ digest -> {},
+        preconditionFailure);
+
+    assertThat(preconditionFailure.getViolationsCount()).isEqualTo(1);
+    Violation violation = preconditionFailure.getViolationsList().getFirst();
+    assertThat(violation.getType()).isEqualTo(VIOLATION_TYPE_INVALID);
+    assertThat(violation.getSubject()).isEqualTo("/z: s -> ../../foo");
+    assertThat(violation.getDescription()).isEqualTo(SYMLINK_TARGET_INVALID);
+  }
+
+  @Test
+  public void shouldRevalidateSharedSymlinkDirectoryAtSameDepth() {
+    Directory shared =
+        Directory.newBuilder()
+            .addSymlinks(
+                SymlinkNode.newBuilder().setName("s").setTarget("../anchor/../outside").build())
+            .build();
+    build.bazel.remote.execution.v2.Digest sharedDigest =
+        DigestUtil.toDigest(DIGEST_UTIL.compute(shared));
+
+    Directory realAnchorParent =
+        Directory.newBuilder()
+            .addDirectories(DirectoryNode.newBuilder().setName("anchor").build())
+            .addDirectories(
+                DirectoryNode.newBuilder().setName("shared").setDigest(sharedDigest).build())
+            .build();
+    build.bazel.remote.execution.v2.Digest realAnchorParentDigest =
+        DigestUtil.toDigest(DIGEST_UTIL.compute(realAnchorParent));
+
+    Directory symlinkAnchorParent =
+        Directory.newBuilder()
+            .addSymlinks(SymlinkNode.newBuilder().setName("anchor").setTarget("..").build())
+            .addDirectories(
+                DirectoryNode.newBuilder().setName("shared").setDigest(sharedDigest).build())
+            .build();
+    build.bazel.remote.execution.v2.Digest symlinkAnchorParentDigest =
+        DigestUtil.toDigest(DIGEST_UTIL.compute(symlinkAnchorParent));
+
+    Directory root =
+        Directory.newBuilder()
+            .addDirectories(
+                DirectoryNode.newBuilder().setName("x").setDigest(realAnchorParentDigest).build())
+            .addDirectories(
+                DirectoryNode.newBuilder()
+                    .setName("y")
+                    .setDigest(symlinkAnchorParentDigest)
+                    .build())
+            .build();
+    Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex =
+        ImmutableMap.of(
+            realAnchorParentDigest, realAnchorParent,
+            symlinkAnchorParentDigest, symlinkAnchorParent,
+            sharedDigest, shared);
+
+    PreconditionFailure.Builder preconditionFailure = PreconditionFailure.newBuilder();
+    NodeInstance.validateActionInputDirectory(
+        DIGEST_UTIL.getDigestFunction(),
+        ACTION_INPUT_ROOT_DIRECTORY_PATH,
+        root,
+        /* pathDigests= */ new Stack<>(),
+        /* visited= */ Maps.newHashMap(),
+        directoriesIndex,
+        /* allowSymlinkTargetAbsolute= */ false,
+        /* onInputFile= */ file -> {},
+        /* onInputDirectory= */ directory -> {},
+        /* onInputDigest= */ digest -> {},
+        preconditionFailure);
+
+    assertThat(preconditionFailure.getViolationsCount()).isEqualTo(1);
+    Violation violation = preconditionFailure.getViolationsList().getFirst();
+    assertThat(violation.getType()).isEqualTo(VIOLATION_TYPE_INVALID);
+    assertThat(violation.getSubject()).isEqualTo("/y/shared: s -> ../anchor/../outside");
+    assertThat(violation.getDescription()).isEqualTo(SYMLINK_TARGET_INVALID);
   }
 
   @Test
@@ -585,11 +959,11 @@ public class NodeInstanceTest {
         ACTION_INPUT_ROOT_DIRECTORY_PATH,
         root,
         /* pathDigests= */ new Stack<>(),
-        /* visited= */ Sets.newHashSet(),
+        /* visited= */ Maps.newHashMap(),
         /* directoriesIndex= */ ImmutableMap.of(),
         /* allowSymlinkTargetAbsolute= */ false,
         /* onInputFiles= */ file -> {},
-        /* onInputDirectories= */ directory -> {},
+        /* onInputDirectory= */ directory -> {},
         /* onInputDigests= */ digest -> {},
         preconditionFailure);
 
@@ -654,11 +1028,11 @@ public class NodeInstanceTest {
         ACTION_INPUT_ROOT_DIRECTORY_PATH,
         root,
         /* pathDigests= */ new Stack<>(),
-        /* visited= */ Sets.newHashSet(),
+        /* visited= */ Maps.newHashMap(),
         /* directoriesIndex= */ ImmutableMap.of(DigestUtil.toDigest(fooDigest), foo),
         /* allowSymlinkTargetAbsolute= */ false,
         /* onInputFiles= */ file -> {},
-        /* onInputDirectories= */ directory -> {},
+        /* onInputDirectory= */ directory -> {},
         /* onInputDigests= */ digest -> {},
         preconditionFailure);
 
