@@ -122,6 +122,7 @@ import io.grpc.StatusException;
 import io.grpc.protobuf.StatusProto;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.netty.handler.codec.http.QueryStringDecoder;
+import io.prometheus.client.Counter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
@@ -162,6 +163,14 @@ public abstract class NodeInstance extends InstanceBase {
   private static final ExecutorService FETCH_BLOB_EXECUTOR =
       BuildfarmExecutors.getFetchBlobFailoverPool();
 
+  private static final Counter symlinkTargetInvalidCounter =
+      Counter.build()
+          .name("symlink_target_invalid")
+          .help(
+              "Number of SymlinkNode targets rejected during action input validation for being"
+                  + " empty or escaping the action input root.")
+          .register();
+
   protected final ContentAddressableStorage contentAddressableStorage;
   protected final ActionCache actionCache;
   protected final OperationsMap outstandingOperations;
@@ -194,6 +203,9 @@ public abstract class NodeInstance extends InstanceBase {
       "The `Command`'s `environment_variables` are not correctly sorted by `name`.";
 
   public static final String SYMLINK_TARGET_ABSOLUTE = "A symlink target is absolute.";
+
+  public static final String SYMLINK_TARGET_INVALID =
+      "A symlink target is empty or escapes the action input root.";
 
   public static final String MISSING_ACTION = "The action was not found in the CAS.";
 
@@ -966,19 +978,254 @@ public abstract class NodeInstance extends InstanceBase {
     return true;
   }
 
+  private static boolean isTargetWithinInputRoot(String target, int parentDepth) {
+    if (target.isEmpty()) {
+      return false;
+    }
+    int depth = parentDepth;
+    int segStart = 0;
+    int n = target.length();
+    for (int i = 0; i <= n; i++) {
+      if (i == n || target.charAt(i) == '/') {
+        int segLen = i - segStart;
+        boolean isParent =
+            segLen == 2 && target.charAt(segStart) == '.' && target.charAt(segStart + 1) == '.';
+        boolean isCurrent = segLen == 1 && target.charAt(segStart) == '.';
+        boolean isEmpty = segLen == 0;
+        if (isParent) {
+          if (--depth < 0) {
+            return false;
+          }
+        } else if (!isEmpty && !isCurrent) {
+          depth++;
+        }
+        segStart = i + 1;
+      }
+    }
+    return true;
+  }
+
+  private static List<String> directoryPathSegments(String directoryPath) {
+    if (directoryPath.isEmpty()) {
+      return ImmutableList.of();
+    }
+    return ImmutableList.copyOf(directoryPath.split("/", -1));
+  }
+
+  private static boolean isTargetWithinInputRoot(
+      String directoryPath,
+      Directory rootDirectory,
+      String target,
+      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex) {
+    if (target.isEmpty()) {
+      return false;
+    }
+    List<String> candidate = ImmutableList.copyOf(directoryPathSegments(directoryPath));
+    ImmutableList.Builder<String> remaining = ImmutableList.builder();
+    for (String segment : target.split("/", -1)) {
+      remaining.add(segment);
+    }
+    return isPathWithinInputRoot(
+        rootDirectory, candidate, remaining.build(), directoriesIndex, new HashSet<>());
+  }
+
+  private static boolean isPathWithinInputRoot(
+      Directory rootDirectory,
+      List<String> currentPath,
+      List<String> remaining,
+      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex,
+      Set<String> resolvingSymlinks) {
+    if (remaining.isEmpty()) {
+      return true;
+    }
+    String segment = remaining.get(0);
+    List<String> tail = remaining.subList(1, remaining.size());
+    if (segment.isEmpty() || segment.equals(".")) {
+      return isPathWithinInputRoot(
+          rootDirectory, currentPath, tail, directoriesIndex, resolvingSymlinks);
+    }
+    if (segment.equals("..")) {
+      if (currentPath.isEmpty()) {
+        return false;
+      }
+      return isPathWithinInputRoot(
+          rootDirectory,
+          currentPath.subList(0, currentPath.size() - 1),
+          tail,
+          directoriesIndex,
+          resolvingSymlinks);
+    }
+
+    Directory currentDirectory = directoryAtPath(rootDirectory, currentPath, directoriesIndex);
+    if (currentDirectory == null) {
+      return true;
+    }
+
+    for (SymlinkNode symlinkNode : currentDirectory.getSymlinksList()) {
+      if (!symlinkNode.getName().equals(segment)) {
+        continue;
+      }
+      String symlinkTarget = symlinkNode.getTarget();
+      if (symlinkTarget.isEmpty() || symlinkTarget.charAt(0) == '/') {
+        return true;
+      }
+      String symlinkKey = String.join("/", currentPath) + "/" + segment;
+      if (!resolvingSymlinks.add(symlinkKey)) {
+        return true;
+      }
+      try {
+        ImmutableList.Builder<String> expanded = ImmutableList.builder();
+        for (String targetSegment : symlinkTarget.split("/", -1)) {
+          expanded.add(targetSegment);
+        }
+        expanded.addAll(tail);
+        return isPathWithinInputRoot(
+            rootDirectory, currentPath, expanded.build(), directoriesIndex, resolvingSymlinks);
+      } finally {
+        resolvingSymlinks.remove(symlinkKey);
+      }
+    }
+
+    for (DirectoryNode directoryNode : currentDirectory.getDirectoriesList()) {
+      if (directoryNode.getName().equals(segment)) {
+        Directory childDirectory = directoryFromDigest(directoryNode.getDigest(), directoriesIndex);
+        if (childDirectory == null) {
+          return true;
+        }
+        ImmutableList.Builder<String> nextPath = ImmutableList.builder();
+        nextPath.addAll(currentPath);
+        nextPath.add(segment);
+        return isPathWithinInputRoot(
+            rootDirectory, nextPath.build(), tail, directoriesIndex, resolvingSymlinks);
+      }
+    }
+
+    return true;
+  }
+
+  private static Directory directoryAtPath(
+      Directory rootDirectory,
+      List<String> path,
+      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex) {
+    Directory directory = rootDirectory;
+    for (String segment : path) {
+      Directory nextDirectory = null;
+      for (DirectoryNode directoryNode : directory.getDirectoriesList()) {
+        if (directoryNode.getName().equals(segment)) {
+          nextDirectory = directoryFromDigest(directoryNode.getDigest(), directoriesIndex);
+          break;
+        }
+      }
+      if (nextDirectory == null) {
+        return null;
+      }
+      directory = nextDirectory;
+    }
+    return directory;
+  }
+
+  private static Directory directoryFromDigest(
+      build.bazel.remote.execution.v2.Digest digest,
+      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex) {
+    if (digest.getSizeBytes() == 0) {
+      return Directory.getDefaultInstance();
+    }
+    return directoriesIndex.get(digest);
+  }
+
+  /**
+   * Whether the subtree at {@code digest} contains any symlink. {@code symlinkMemo} is shared
+   * across the whole validation so a subtree referenced by many parents is walked once, not once
+   * per reference — without it a wide DAG input makes validation superlinear (a client-reachable
+   * DoS).
+   */
+  private static boolean directoryTreeContainsSymlinks(
+      build.bazel.remote.execution.v2.Digest digest,
+      Directory directory,
+      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex,
+      Map<build.bazel.remote.execution.v2.Digest, Boolean> symlinkMemo) {
+    Boolean memoized = symlinkMemo.get(digest);
+    if (memoized != null) {
+      return memoized;
+    }
+    // Tentative false before recursing guards against cycles; overwritten below.
+    symlinkMemo.put(digest, false);
+    boolean containsSymlinks = directory.getSymlinksCount() > 0;
+    if (!containsSymlinks) {
+      for (DirectoryNode directoryNode : directory.getDirectoriesList()) {
+        build.bazel.remote.execution.v2.Digest childDigest = directoryNode.getDigest();
+        Directory subDirectory = directoryFromDigest(childDigest, directoriesIndex);
+        if (subDirectory != null
+            && directoryTreeContainsSymlinks(
+                childDigest, subDirectory, directoriesIndex, symlinkMemo)) {
+          containsSymlinks = true;
+          break;
+        }
+      }
+    }
+    symlinkMemo.put(digest, containsSymlinks);
+    return containsSymlinks;
+  }
+
+  private static int directoryPathDepth(String directoryPath) {
+    if (directoryPath.isEmpty()) {
+      return 0;
+    }
+    int depth = 1;
+    for (int i = 0; i < directoryPath.length(); i++) {
+      if (directoryPath.charAt(i) == '/') {
+        depth++;
+      }
+    }
+    return depth;
+  }
+
   @VisibleForTesting
   public static void validateActionInputDirectory(
       DigestFunction.Value digestFunction,
       String directoryPath,
       Directory directory,
       Stack<build.bazel.remote.execution.v2.Digest> pathDigests,
-      Set<build.bazel.remote.execution.v2.Digest> visited,
+      Map<build.bazel.remote.execution.v2.Digest, Integer> visited,
       Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex,
       boolean allowSymlinkTargetAbsolute,
       Consumer<String> onInputFile,
       Consumer<String> onInputDirectory,
       Consumer<build.bazel.remote.execution.v2.Digest> onInputDigest,
       PreconditionFailure.Builder preconditionFailure) {
+    Map<build.bazel.remote.execution.v2.Digest, Boolean> symlinkMemo = new HashMap<>();
+    validateActionInputDirectory(
+        digestFunction,
+        directoryPath,
+        directoryPath.isEmpty() ? directory : null,
+        directory,
+        pathDigests,
+        visited,
+        symlinkMemo,
+        directoriesIndex,
+        allowSymlinkTargetAbsolute,
+        onInputFile,
+        onInputDirectory,
+        onInputDigest,
+        preconditionFailure,
+        directoryPathDepth(directoryPath));
+  }
+
+  private static void validateActionInputDirectory(
+      DigestFunction.Value digestFunction,
+      String directoryPath,
+      @Nullable Directory rootDirectory,
+      Directory directory,
+      Stack<build.bazel.remote.execution.v2.Digest> pathDigests,
+      Map<build.bazel.remote.execution.v2.Digest, Integer> visited,
+      Map<build.bazel.remote.execution.v2.Digest, Boolean> symlinkMemo,
+      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex,
+      boolean allowSymlinkTargetAbsolute,
+      Consumer<String> onInputFile,
+      Consumer<String> onInputDirectory,
+      Consumer<build.bazel.remote.execution.v2.Digest> onInputDigest,
+      PreconditionFailure.Builder preconditionFailure,
+      int parentDepth) {
     Set<String> entryNames = new HashSet<>();
 
     String lastFileName = "";
@@ -1024,12 +1271,25 @@ public abstract class NodeInstance extends InstanceBase {
             .setDescription(DIRECTORY_NOT_SORTED);
       }
       String symlinkTarget = symlinkNode.getTarget();
-      if (!allowSymlinkTargetAbsolute && symlinkTarget.charAt(0) == '/') {
+      boolean targetIsAbsolute = !symlinkTarget.isEmpty() && symlinkTarget.charAt(0) == '/';
+      if (targetIsAbsolute) {
+        if (!allowSymlinkTargetAbsolute) {
+          preconditionFailure
+              .addViolationsBuilder()
+              .setType(VIOLATION_TYPE_INVALID)
+              .setSubject("/" + directoryPath + ": " + symlinkName + " -> " + symlinkTarget)
+              .setDescription(SYMLINK_TARGET_ABSOLUTE);
+        }
+      } else if (!isTargetWithinInputRoot(symlinkTarget, parentDepth)
+          || (rootDirectory != null
+              && !isTargetWithinInputRoot(
+                  directoryPath, rootDirectory, symlinkTarget, directoriesIndex))) {
+        symlinkTargetInvalidCounter.inc();
         preconditionFailure
             .addViolationsBuilder()
             .setType(VIOLATION_TYPE_INVALID)
             .setSubject("/" + directoryPath + ": " + symlinkName + " -> " + symlinkTarget)
-            .setDescription(SYMLINK_TARGET_ABSOLUTE);
+            .setDescription(SYMLINK_TARGET_INVALID);
       }
       /* FIXME serverside validity check? regex?
       Preconditions.checkState(
@@ -1038,7 +1298,6 @@ public abstract class NodeInstance extends InstanceBase {
       Preconditions.checkState(
           isValidFilename(symlinkNode.getTarget()),
           INVALID_FILE_NAME);
-      // FIXME verify that any relative pathing for the target is within the input root
       */
       lastSymlinkName = symlinkName;
       entryNames.add(symlinkName);
@@ -1079,13 +1338,21 @@ public abstract class NodeInstance extends InstanceBase {
         String subDirectoryPath =
             directoryPath.isEmpty() ? directoryName : (directoryPath + "/" + directoryName);
         onInputDirectory.accept(subDirectoryPath);
-        if (visited.contains(directoryDigest)) {
-          Directory subDirectory;
-          if (directoryDigest.getSizeBytes() == 0) {
-            subDirectory = Directory.getDefaultInstance();
-          } else {
-            subDirectory = directoriesIndex.get(directoryDigest);
-          }
+        // Symlink validation depends on parentDepth. If a digest has already been validated at the
+        // current depth or shallower, the prior validation strictly subsumes a deeper re-check, so
+        // dedup via enumerate is safe. Otherwise (first visit, or a shallower parent reached the
+        // same digest later) we must run the full validator so the symlinks are checked against
+        // the more restrictive depth.
+        Integer prevDepth = visited.get(directoryDigest);
+        int childParentDepth = parentDepth + 1;
+        Directory subDirectory = directoryFromDigest(directoryDigest, directoriesIndex);
+        boolean canReuseValidation =
+            prevDepth != null
+                && childParentDepth >= prevDepth
+                && subDirectory != null
+                && !directoryTreeContainsSymlinks(
+                    directoryDigest, subDirectory, directoriesIndex, symlinkMemo);
+        if (canReuseValidation) {
           enumerateActionInputDirectory(
               digestFunction,
               subDirectoryPath,
@@ -1100,12 +1367,15 @@ public abstract class NodeInstance extends InstanceBase {
               DigestUtil.fromDigest(directoryDigest, digestFunction),
               pathDigests,
               visited,
+              symlinkMemo,
               directoriesIndex,
               allowSymlinkTargetAbsolute,
               onInputFile,
               onInputDirectory,
               onInputDigest,
-              preconditionFailure);
+              preconditionFailure,
+              rootDirectory,
+              childParentDepth);
         }
       }
     }
@@ -1116,13 +1386,16 @@ public abstract class NodeInstance extends InstanceBase {
       // based on usage might want to make this bazel and pass function
       Digest directoryDigest,
       Stack<build.bazel.remote.execution.v2.Digest> pathDigests,
-      Set<build.bazel.remote.execution.v2.Digest> visited,
+      Map<build.bazel.remote.execution.v2.Digest, Integer> visited,
+      Map<build.bazel.remote.execution.v2.Digest, Boolean> symlinkMemo,
       Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex,
       boolean allowSymlinkTargetAbsolute,
       Consumer<String> onInputFile,
       Consumer<String> onInputDirectory,
       Consumer<build.bazel.remote.execution.v2.Digest> onInputDigest,
-      PreconditionFailure.Builder preconditionFailure) {
+      PreconditionFailure.Builder preconditionFailure,
+      @Nullable Directory rootDirectory,
+      int parentDepth) {
     build.bazel.remote.execution.v2.Digest digest = DigestUtil.toDigest(directoryDigest);
     pathDigests.push(digest);
     final Directory directory;
@@ -1138,23 +1411,30 @@ public abstract class NodeInstance extends InstanceBase {
           .setSubject("blobs/" + DigestUtil.toString(directoryDigest))
           .setDescription("The directory `/" + directoryPath + "` was not found in the CAS.");
     } else {
+      Directory effectiveRootDirectory = rootDirectory == null ? directory : rootDirectory;
       validateActionInputDirectory(
           directoryDigest.getDigestFunction(),
           directoryPath,
+          effectiveRootDirectory,
           directory,
           pathDigests,
           visited,
+          symlinkMemo,
           directoriesIndex,
           allowSymlinkTargetAbsolute,
           onInputFile,
           onInputDirectory,
           onInputDigest,
-          preconditionFailure);
+          preconditionFailure,
+          parentDepth);
     }
     pathDigests.pop();
     if (directory != null) {
       // missing directories are not visited and will appear in violations list each time
-      visited.add(digest);
+      Integer prevDepth = visited.get(digest);
+      if (prevDepth == null || parentDepth < prevDepth) {
+        visited.put(digest, parentDepth);
+      }
     }
   }
 
@@ -1446,13 +1726,16 @@ public abstract class NodeInstance extends InstanceBase {
         ACTION_INPUT_ROOT_DIRECTORY_PATH,
         DigestUtil.fromDigest(action.getInputRootDigest(), digestFunction),
         new Stack<>(),
-        new HashSet<>(),
+        new HashMap<>(),
+        /* symlinkMemo= */ new HashMap<>(),
         directoriesIndex,
         allowSymlinkTargetAbsolute,
         inputFilesBuilder::add,
         inputDirectoriesBuilder::add,
         onInputDigest,
-        preconditionFailure);
+        preconditionFailure,
+        /* rootDirectory= */ null,
+        /* parentDepth= */ 0);
 
     if (command == null) {
       preconditionFailure
