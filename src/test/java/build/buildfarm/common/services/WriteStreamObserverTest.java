@@ -6,6 +6,7 @@ import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -31,13 +32,14 @@ import com.google.common.util.concurrent.SettableFuture;
 import com.google.protobuf.ByteString;
 import io.grpc.Context;
 import io.grpc.Context.CancellableContext;
-import io.grpc.stub.StreamObserver;
+import io.grpc.stub.ServerCallStreamObserver;
 import java.io.IOException;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
+import org.mockito.InOrder;
 import org.mockito.stubbing.Answer;
 
 @RunWith(JUnit4.class)
@@ -48,7 +50,7 @@ public class WriteStreamObserverTest {
   public void cancelledBeforeGetOutputIsSilent() throws Exception {
     CancellableContext context = Context.current().withCancellation();
     Instance instance = mock(Instance.class);
-    StreamObserver<WriteResponse> responseObserver = mock(StreamObserver.class);
+    ServerCallStreamObserver<WriteResponse> responseObserver = mock(ServerCallStreamObserver.class);
     ByteString cancelled = ByteString.copyFromUtf8("cancelled data");
     Digest cancelledDigest = DIGEST_UTIL.compute(cancelled);
     UUID uuid = UUID.randomUUID();
@@ -101,7 +103,7 @@ public class WriteStreamObserverTest {
   public void noErrorWhenContextCancelled() throws Exception {
     CancellableContext context = Context.current().withCancellation();
     Instance instance = mock(Instance.class);
-    StreamObserver<WriteResponse> responseObserver = mock(StreamObserver.class);
+    ServerCallStreamObserver<WriteResponse> responseObserver = mock(ServerCallStreamObserver.class);
     ByteString cancelled = ByteString.copyFromUtf8("cancelled data");
     Digest cancelledDigest = DIGEST_UTIL.compute(cancelled);
     UUID uuid = UUID.randomUUID();
@@ -164,7 +166,7 @@ public class WriteStreamObserverTest {
     when(write.getOutput(
             any(Long.class), any(Long.class), any(TimeUnit.class), any(Runnable.class)))
         .thenReturn(outputStream);
-    StreamObserver<WriteResponse> responseObserver = mock(StreamObserver.class);
+    ServerCallStreamObserver<WriteResponse> responseObserver = mock(ServerCallStreamObserver.class);
 
     // Mark write complete on getCommittedSize() call.
     doAnswer(
@@ -197,6 +199,7 @@ public class WriteStreamObserverTest {
     // verify that write is not called on already completed write
     verify(outputStream, never()).write(completed.toByteArray());
     verify(responseObserver, times(1)).onNext(any(WriteResponse.class));
+    verify(responseObserver, times(1)).request(Integer.MAX_VALUE);
     verify(responseObserver, times(1)).onCompleted();
     verify(responseObserver, never()).onError(any(Throwable.class));
   }
@@ -231,7 +234,7 @@ public class WriteStreamObserverTest {
             .setBlob(BlobInformation.newBuilder().setDigest(completedDigest))
             .setUuid(uuid.toString())
             .build();
-    StreamObserver<WriteResponse> responseObserver = mock(StreamObserver.class);
+    ServerCallStreamObserver<WriteResponse> responseObserver = mock(ServerCallStreamObserver.class);
     WriteStreamObserver observer =
         new WriteStreamObserver(instance, 1, SECONDS, () -> {}, responseObserver);
     observer.onNext(
@@ -251,7 +254,65 @@ public class WriteStreamObserverTest {
     verify(write, times(1))
         .getOutput(any(Long.class), any(Long.class), any(TimeUnit.class), any(Runnable.class));
     verify(responseObserver, times(1)).onNext(any(WriteResponse.class));
+    verify(responseObserver, times(1)).request(Integer.MAX_VALUE);
     verify(responseObserver, times(1)).onCompleted();
     verifyNoMoreInteractions(responseObserver);
+  }
+
+  @Test
+  public void commitActiveDrainsInboundBeforeOnCompleted() throws Exception {
+    // Verifies that on commit, commitActive sends onNext, then requests Integer.MAX_VALUE
+    // inbound credit (so any in-flight DATA frames from the client get deframed and
+    // WINDOW_UPDATEs flow back), and only then sends onCompleted.
+    ByteString committed = ByteString.copyFromUtf8("committed data");
+    Digest committedDigest = DIGEST_UTIL.compute(committed);
+    UUID uuid = UUID.randomUUID();
+    Instance instance = mock(Instance.class);
+    Write write = mock(Write.class);
+    SettableFuture<Long> future = SettableFuture.create();
+    when(write.getFuture()).thenReturn(future);
+    when(write.isComplete()).thenAnswer((Answer<Boolean>) invocation -> future.isDone());
+    when(instance.getBlobWrite(
+            eq(Compressor.Value.IDENTITY),
+            eq(committedDigest),
+            eq(uuid),
+            any(RequestMetadata.class)))
+        .thenReturn(write);
+    FeedbackOutputStream outputStream = mock(FeedbackOutputStream.class);
+    when(write.getOutput(
+            any(Long.class), any(Long.class), any(TimeUnit.class), any(Runnable.class)))
+        .thenReturn(outputStream);
+    ServerCallStreamObserver<WriteResponse> responseObserver = mock(ServerCallStreamObserver.class);
+
+    // Trip commit when getCommittedSize is queried during the first onNext.
+    doAnswer(
+            invocation -> {
+              long size = committedDigest.getSize();
+              future.set(size);
+              return size;
+            })
+        .when(write)
+        .getCommittedSize();
+
+    UploadBlobRequest uploadBlobRequest =
+        UploadBlobRequest.newBuilder()
+            .setBlob(BlobInformation.newBuilder().setDigest(committedDigest))
+            .setUuid(uuid.toString())
+            .build();
+    WriteStreamObserver observer =
+        new WriteStreamObserver(instance, 1, SECONDS, () -> {}, responseObserver);
+    observer.onNext(
+        WriteRequest.newBuilder()
+            .setResourceName(uploadResourceName(uploadBlobRequest))
+            .setData(committed)
+            .setFinishWrite(true)
+            .build());
+
+    // The drain credit must be issued BEFORE onCompleted — without it, no further
+    // WINDOW_UPDATEs flow to the client and its pendingWriteQueue stays stuck.
+    InOrder inOrder = inOrder(responseObserver);
+    inOrder.verify(responseObserver).onNext(any(WriteResponse.class));
+    inOrder.verify(responseObserver).request(Integer.MAX_VALUE);
+    inOrder.verify(responseObserver).onCompleted();
   }
 }
