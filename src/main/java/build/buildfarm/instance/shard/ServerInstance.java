@@ -86,6 +86,7 @@ import build.buildfarm.common.TreeIterator;
 import build.buildfarm.common.TreeIterator.DirectoryEntry;
 import build.buildfarm.common.Watcher;
 import build.buildfarm.common.Write;
+import build.buildfarm.common.WritesHelper;
 import build.buildfarm.common.config.BuildfarmConfigs;
 import build.buildfarm.common.function.CountingConsumer;
 import build.buildfarm.common.grpc.UniformDelegateServerCallStreamObserver;
@@ -148,7 +149,6 @@ import io.prometheus.client.Gauge;
 import io.prometheus.client.Histogram;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.URI;
 import java.time.Instant;
 import java.util.AbstractMap;
@@ -1915,30 +1915,10 @@ public class ServerInstance extends NodeInstance {
       Duration timeout)
       throws EntryLimitException {
     checkState(digest.getSize() == content.size());
-    SettableFuture<Long> writtenFuture = SettableFuture.create();
     Write write =
         getBlobWrite(Compressor.Value.IDENTITY, digest, UUID.randomUUID(), requestMetadata);
-    addCallback(
-        write.getFuture(),
-        new FutureCallback<Long>() {
-          @Override
-          public void onSuccess(Long committedSize) {
-            writtenFuture.set(committedSize);
-          }
-
-          @Override
-          public void onFailure(Throwable t) {
-            writtenFuture.setException(t);
-          }
-        },
-        directExecutor());
-    try (OutputStream out = write.getOutput(timeout.getSeconds(), SECONDS, () -> {})) {
-      content.writeTo(out);
-    } catch (IOException e) {
-      // if the stream is complete already, we will have already set the future value
-      writtenFuture.setException(e);
-    }
-    return writtenFuture;
+    return WritesHelper.streamIntoWriteFuture(
+        content::newInput, write, digest, timeout.getSeconds(), SECONDS);
   }
 
   private ListenableFuture<QueuedOperation> buildQueuedOperation(
