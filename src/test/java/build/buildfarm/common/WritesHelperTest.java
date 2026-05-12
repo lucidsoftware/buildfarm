@@ -65,7 +65,9 @@ public class WritesHelperTest {
     final AtomicInteger cancelCount = new AtomicInteger();
     boolean isReadyValue = true;
 
-    CapturingWrite() {}
+    CapturingWrite() {
+      // Field initializers provide all the state needed to capture uploads.
+    }
 
     @Override
     public boolean isReady() {
@@ -226,7 +228,7 @@ public class WritesHelperTest {
             () -> new ByteArrayInputStream(new byte[0]), alreadyFailed, digestOf(0), 1, SECONDS);
 
     assertThat(future.isDone()).isTrue();
-    ExecutionException ee = assertThrows(ExecutionException.class, () -> future.get());
+    ExecutionException ee = assertThrows(ExecutionException.class, future::get);
     assertThat(ee.getCause()).isSameInstanceAs(cause);
   }
 
@@ -470,7 +472,7 @@ public class WritesHelperTest {
             () -> throwingStream, capturing, digestOf(100), 1, SECONDS);
 
     assertThat(future.isDone()).isTrue();
-    ExecutionException ee = assertThrows(ExecutionException.class, () -> future.get());
+    ExecutionException ee = assertThrows(ExecutionException.class, future::get);
     assertThat(ee.getCause()).isSameInstanceAs(readFailure);
     // write.cancel was invoked when the producer body caught the IOException.
     assertThat(capturing.cancelCount.get()).isEqualTo(1);
@@ -541,7 +543,7 @@ public class WritesHelperTest {
     writeFuture.setException(cause);
 
     assertThat(writtenFuture.isDone()).isTrue();
-    ExecutionException ee = assertThrows(ExecutionException.class, () -> writtenFuture.get());
+    ExecutionException ee = assertThrows(ExecutionException.class, writtenFuture::get);
     assertThat(ee.getCause()).isSameInstanceAs(cause);
     // cleanup invoked write.cancel on the setException path so the underlying call is torn
     // down explicitly rather than relying on out.close() finding it already broken.
@@ -857,7 +859,7 @@ public class WritesHelperTest {
             () -> new ByteArrayInputStream(new byte[5]), failingClose, digestOf(5), 1, SECONDS);
 
     assertThat(writtenFuture.isDone()).isTrue();
-    ExecutionException ee = assertThrows(ExecutionException.class, () -> writtenFuture.get());
+    ExecutionException ee = assertThrows(ExecutionException.class, writtenFuture::get);
     assertThat(ee.getCause()).isSameInstanceAs(closeFailure);
     // close() was attempted exactly once — cleanup did NOT retry.
     assertThat(closeCount.get()).isEqualTo(1);

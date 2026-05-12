@@ -39,16 +39,16 @@ import javax.annotation.Nullable;
  * synchronized list, and atomic counters; listener callbacks fire without holding any monitor so
  * the producer can re-enter this call from its {@code onReady} handler without deadlocking.
  */
-public final class ControllableClientCall<ReqT, RespT> extends ClientCall<ReqT, RespT> {
-  public final List<ReqT> sendMessages = Collections.synchronizedList(new ArrayList<>());
+public final class ControllableClientCall<Q, R> extends ClientCall<Q, R> {
+  public final List<Q> sendMessages = Collections.synchronizedList(new ArrayList<>());
   public final AtomicInteger cancelCount = new AtomicInteger();
   public final AtomicInteger halfCloseCount = new AtomicInteger();
 
-  private volatile @Nullable Listener<RespT> listener;
+  private volatile @Nullable Listener<R> listener;
   private volatile boolean ready = true;
 
   @Override
-  public void start(Listener<RespT> listener, Metadata headers) {
+  public void start(Listener<R> listener, Metadata headers) {
     this.listener = listener;
     // Fire onReady once at startup so producers using onReady-as-producer enter their loop.
     listener.onReady();
@@ -70,7 +70,7 @@ public final class ControllableClientCall<ReqT, RespT> extends ClientCall<ReqT, 
   }
 
   @Override
-  public void sendMessage(ReqT message) {
+  public void sendMessage(Q message) {
     sendMessages.add(message);
   }
 
@@ -93,7 +93,7 @@ public final class ControllableClientCall<ReqT, RespT> extends ClientCall<ReqT, 
     fireListener(Listener::onReady);
   }
 
-  public void deliverResponse(RespT response) {
+  public void deliverResponse(R response) {
     fireListener(l -> l.onMessage(response));
   }
 
@@ -105,8 +105,8 @@ public final class ControllableClientCall<ReqT, RespT> extends ClientCall<ReqT, 
     fireListener(l -> l.onClose(status, new Metadata()));
   }
 
-  private void fireListener(Consumer<Listener<RespT>> action) {
-    Listener<RespT> snapshot = listener;
+  private void fireListener(Consumer<Listener<R>> action) {
+    Listener<R> snapshot = listener;
     if (snapshot != null) {
       action.accept(snapshot);
     }
