@@ -2,24 +2,23 @@ package build.buildfarm.tools;
 
 import static build.bazel.remote.execution.v2.Compressor.Value.ZSTD;
 import static build.buildfarm.common.grpc.Channels.createChannel;
+import static java.util.concurrent.TimeUnit.DAYS;
 
 import build.bazel.remote.execution.v2.RequestMetadata;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.Write;
+import build.buildfarm.common.WritesHelper;
 import build.buildfarm.common.ZstdCompressingInputStream;
 import build.buildfarm.instance.Instance;
 import build.buildfarm.instance.stub.StubInstance;
 import build.buildfarm.v1test.Digest;
-import com.google.common.io.ByteStreams;
+import com.google.common.util.concurrent.ListenableFuture;
 import com.google.protobuf.util.Durations;
 import io.grpc.ManagedChannel;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.UUID;
 import java.util.concurrent.Callable;
-import java.util.concurrent.TimeUnit;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Parameters;
@@ -55,11 +54,21 @@ class Upload implements Callable<Integer> {
       Write write =
           instance.getBlobWrite(
               ZSTD, digest, UUID.randomUUID(), RequestMetadata.getDefaultInstance());
-      try (OutputStream out = write.getOutput(0l, 10, TimeUnit.DAYS, () -> {});
-          InputStream in = new ZstdCompressingInputStream(Files.newInputStream(path))) {
-        ByteStreams.copy(in, out);
+      // WritesHelper handles closing the InputStream, so the Zstd stream shouldn't leak
+      ListenableFuture<Long> writtenFuture =
+          WritesHelper.streamIntoWriteFuture(
+              () -> new ZstdCompressingInputStream(Files.newInputStream(path)),
+              write,
+              digest,
+              10,
+              DAYS);
+      try {
+        writtenFuture.get();
+      } catch (InterruptedException e) {
+        writtenFuture.cancel(true);
+        Thread.currentThread().interrupt();
+        throw e;
       }
-      write.getFuture().get();
       System.out.println("Completed uploading " + DigestUtil.toString(digest));
     } finally {
       instance.stop();
