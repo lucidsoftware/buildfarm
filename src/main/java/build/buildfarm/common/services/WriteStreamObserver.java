@@ -206,6 +206,7 @@ public class WriteStreamObserver implements StreamObserver<WriteRequest> {
         log.log(Level.SEVERE, format("error delivering committed_size to %s", name), e);
       }
     }
+    closeOutboundQuietly();
   }
 
   @GuardedBy("this")
@@ -303,6 +304,7 @@ public class WriteStreamObserver implements StreamObserver<WriteRequest> {
       // We do not need to drain the client's data here because onError sends RST_STREAM, which
       // hard closes the stream on both sides.
       responseObserver.onError(t);
+      closeOutboundQuietly();
       if (isEntryLimitException) {
         RequestMetadata requestMetadata = TracingMetadataUtils.fromCurrentContext();
         log.log(
@@ -513,15 +515,15 @@ public class WriteStreamObserver implements StreamObserver<WriteRequest> {
       if (out != null) {
         withCancellation.addListener(
             context -> {
+              // We close the output stream and then cancel the Write to free any resources that
+              // may be held by either.
+              closeOutboundQuietly();
+              Write snapshot;
               synchronized (this) {
-                if (out != null) {
-                  try {
-                    out.close();
-                  } catch (IOException e) {
-                    log.log(Level.SEVERE, format("error closing on cancellation for %s", name), e);
-                  }
-                  out = null;
-                }
+                snapshot = write;
+              }
+              if (snapshot != null) {
+                snapshot.cancel("inbound gRPC context cancelled", context.cancellationCause());
               }
             },
             directExecutor());
@@ -532,6 +534,27 @@ public class WriteStreamObserver implements StreamObserver<WriteRequest> {
       }
     }
     return out;
+  }
+
+  /**
+   * Closes the outbound stream to the worker so things are properly cleaned up and Netty doesn't
+   * leak off-heap memory. If we don't close we can get stuck in a HALF_CLOSED_REMOTE state in which
+   * the Netty buffers don't get cleaned up. Closing here sends END_STREAM and triggers the cleanup.
+   */
+  private void closeOutboundQuietly() {
+    FeedbackOutputStream toClose;
+    synchronized (this) {
+      toClose = out;
+      out = null;
+    }
+
+    if (toClose != null) {
+      try {
+        toClose.close();
+      } catch (IOException e) {
+        log.log(Level.FINE, format("error closing outbound for %s", name), e);
+      }
+    }
   }
 
   @Override

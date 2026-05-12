@@ -95,7 +95,14 @@ public class WriteStreamObserverTest {
             any(RequestMetadata.class));
     verify(write, times(1))
         .getOutput(any(Long.class), any(Long.class), any(TimeUnit.class), any(Runnable.class));
-    verify(out, times(1)).close();
+    // Cancellation listener closes out (releasing wrapper-held resources such as the zstd
+    // decompressor's FixedBufferPool borrow) and then calls write.cancel (which on stub-backed
+    // writes releases the gRPC observer's pendingWriteQueue). Closing first lets us free
+    // wrapper state even for CASFileCache writes, whose cancel(String, Throwable) is the
+    // interface default no-op.
+    InOrder cancellation = inOrder(out, write);
+    cancellation.verify(out).close();
+    cancellation.verify(write).cancel(any(String.class), any(RuntimeException.class));
     verifyNoInteractions(responseObserver);
   }
 
