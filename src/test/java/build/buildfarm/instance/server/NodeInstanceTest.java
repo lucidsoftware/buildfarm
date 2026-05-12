@@ -26,6 +26,7 @@ import static build.buildfarm.instance.server.NodeInstance.OUTPUT_FILE_IS_OUTPUT
 import static build.buildfarm.instance.server.NodeInstance.SYMLINK_TARGET_ABSOLUTE;
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
+import static org.junit.Assert.assertThrows;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.eq;
@@ -81,12 +82,15 @@ import com.google.rpc.PreconditionFailure.Violation;
 import io.grpc.StatusException;
 import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
+import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
+import java.nio.file.NoSuchFileException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Stack;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.logging.Logger;
@@ -878,21 +882,8 @@ public class NodeInstanceTest {
     Write write = mock(Write.class);
     SettableFuture<Long> future = SettableFuture.create();
 
-    FeedbackOutputStream writeCompleteOutputStream =
-        new FeedbackOutputStream() {
-          @Override
-          public void write(int n) throws WriteCompleteException {
-            future.set((long) content.size());
-            throw new WriteCompleteException();
-          }
-
-          @Override
-          public boolean isReady() {
-            return true;
-          }
-        };
     when(write.getOutput(any(Long.class), any(TimeUnit.class), any(Runnable.class)))
-        .thenReturn(writeCompleteOutputStream);
+        .thenReturn(newWriteCompleteOutputStream(future, content.size()));
     when(write.getFuture()).thenReturn(future);
     when(contentAddressableStorage.getWrite(
             eq(Compressor.Value.IDENTITY), eq(contentDigest), any(UUID.class), eq(requestMetadata)))
@@ -931,5 +922,130 @@ public class NodeInstanceTest {
     verify(httpURLConnection, times(1)).setRequestProperty(customTokenHeader, customToken);
     verifyNoMoreInteractions(httpURLConnection);
     verify(url, times(1)).openConnection();
+  }
+
+  @Test
+  public void fetchBlobMultiMirrorFailoverSucceeds() throws Exception {
+    // First mirror returns HTTP 200 but the body stream throws mid-read, exercising the async
+    // failure path through WritesHelper.streamIntoWriteFuture. The catchingAsync chain must
+    // route that async failure to the next mirror, which succeeds.
+    ByteString content = ByteString.copyFromUtf8("Fetch Blob Content");
+    Digest contentDigest = DIGEST_UTIL.compute(content);
+
+    ContentAddressableStorage contentAddressableStorage = mock(ContentAddressableStorage.class);
+    NodeInstance instance = new DummyServerInstance(contentAddressableStorage, null);
+    RequestMetadata requestMetadata = RequestMetadata.getDefaultInstance();
+
+    // Shared Write mock — both mirrors resolve to the same content digest, so getBlobWrite
+    // hands back the same Write either way. Second mirror's bytes drive it to completion via
+    // WriteCompleteException.
+    Write write = mock(Write.class);
+    SettableFuture<Long> writeFuture = SettableFuture.create();
+    when(write.getOutput(any(Long.class), any(TimeUnit.class), any(Runnable.class)))
+        .thenReturn(newWriteCompleteOutputStream(writeFuture, content.size()));
+    when(write.getFuture()).thenReturn(writeFuture);
+    when(contentAddressableStorage.getWrite(
+            eq(Compressor.Value.IDENTITY), eq(contentDigest), any(UUID.class), eq(requestMetadata)))
+        .thenReturn(write);
+
+    // First mirror: HTTP 200, advertised content length matches, but read() throws mid-stream.
+    HttpURLConnection failingHttp = mock(HttpURLConnection.class);
+    when(failingHttp.getContentLengthLong()).thenReturn(contentDigest.getSize());
+    when(failingHttp.getResponseCode()).thenReturn(HttpURLConnection.HTTP_OK);
+    InputStream throwingStream =
+        new InputStream() {
+          @Override
+          public int read() throws IOException {
+            throw new IOException("mid-stream failure");
+          }
+
+          @Override
+          public int read(byte[] b, int off, int len) throws IOException {
+            throw new IOException("mid-stream failure");
+          }
+        };
+    when(failingHttp.getInputStream()).thenReturn(throwingStream);
+    URL failingUrl = mock(URL.class);
+    when(failingUrl.openConnection()).thenReturn(failingHttp);
+
+    // Second mirror: HTTP 200, content streams successfully.
+    HttpURLConnection workingHttp = mock(HttpURLConnection.class);
+    when(workingHttp.getContentLengthLong()).thenReturn(contentDigest.getSize());
+    when(workingHttp.getResponseCode()).thenReturn(HttpURLConnection.HTTP_OK);
+    when(workingHttp.getInputStream()).thenReturn(content.newInput());
+    URL workingUrl = mock(URL.class);
+    when(workingUrl.openConnection()).thenReturn(workingHttp);
+
+    assertThat(
+            instance
+                .fetchBlobUrls(
+                    ImmutableList.of(failingUrl, workingUrl),
+                    ImmutableMap.of(),
+                    contentDigest,
+                    requestMetadata)
+                .get())
+        .isEqualTo(contentDigest);
+    // Both mirrors were opened — the first async-failed, the second supplied the bytes.
+    verify(failingUrl, times(1)).openConnection();
+    verify(workingUrl, times(1)).openConnection();
+  }
+
+  @Test
+  public void fetchBlobAllMirrorsFailReturnsNoSuchFileExceptionWithSuppressedCause()
+      throws Exception {
+    // All mirrors return HTTP 500. The final ExecutionException cause must be
+    // NoSuchFileException keyed on the digest hash, with the last mirror's IOException
+    // preserved via addSuppressed for operator diagnostics.
+    ByteString content = ByteString.copyFromUtf8("Fetch Blob Content");
+    Digest contentDigest = DIGEST_UTIL.compute(content);
+
+    ContentAddressableStorage contentAddressableStorage = mock(ContentAddressableStorage.class);
+    NodeInstance instance = new DummyServerInstance(contentAddressableStorage, null);
+    RequestMetadata requestMetadata = RequestMetadata.getDefaultInstance();
+
+    HttpURLConnection failingHttp1 = mock(HttpURLConnection.class);
+    when(failingHttp1.getResponseCode()).thenReturn(HttpURLConnection.HTTP_INTERNAL_ERROR);
+    when(failingHttp1.getResponseMessage()).thenReturn("Internal Server Error");
+    URL failingUrl1 = mock(URL.class);
+    when(failingUrl1.openConnection()).thenReturn(failingHttp1);
+
+    HttpURLConnection failingHttp2 = mock(HttpURLConnection.class);
+    when(failingHttp2.getResponseCode()).thenReturn(HttpURLConnection.HTTP_INTERNAL_ERROR);
+    when(failingHttp2.getResponseMessage()).thenReturn("Internal Server Error");
+    URL failingUrl2 = mock(URL.class);
+    when(failingUrl2.openConnection()).thenReturn(failingHttp2);
+
+    ExecutionException ee =
+        assertThrows(
+            ExecutionException.class,
+            () ->
+                instance
+                    .fetchBlobUrls(
+                        ImmutableList.of(failingUrl1, failingUrl2),
+                        ImmutableMap.of(),
+                        contentDigest,
+                        requestMetadata)
+                    .get());
+    assertThat(ee.getCause()).isInstanceOf(NoSuchFileException.class);
+    assertThat(ee.getCause().getMessage()).isEqualTo(contentDigest.getHash());
+    Throwable[] suppressed = ee.getCause().getSuppressed();
+    assertThat(suppressed).isNotEmpty();
+    assertThat(suppressed[0]).isInstanceOf(IOException.class);
+  }
+
+  private static FeedbackOutputStream newWriteCompleteOutputStream(
+      SettableFuture<Long> writeFuture, long committedSize) {
+    return new FeedbackOutputStream() {
+      @Override
+      public void write(int n) throws WriteCompleteException {
+        writeFuture.set(committedSize);
+        throw new WriteCompleteException();
+      }
+
+      @Override
+      public boolean isReady() {
+        return true;
+      }
+    };
   }
 }

@@ -26,6 +26,7 @@ import static com.google.common.net.HttpHeaders.AUTHORIZATION;
 import static com.google.common.util.concurrent.Futures.catchingAsync;
 import static com.google.common.util.concurrent.Futures.immediateFailedFuture;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
+import static com.google.common.util.concurrent.Futures.submitAsync;
 import static com.google.common.util.concurrent.Futures.transform;
 import static com.google.common.util.concurrent.Futures.transformAsync;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
@@ -65,6 +66,7 @@ import build.buildfarm.actioncache.ActionCache;
 import build.buildfarm.cas.ContentAddressableStorage;
 import build.buildfarm.cas.ContentAddressableStorage.Blob;
 import build.buildfarm.cas.DigestMismatchException;
+import build.buildfarm.common.BuildfarmExecutors;
 import build.buildfarm.common.CasIndexResults;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.DigestUtil.ActionKey;
@@ -75,6 +77,7 @@ import build.buildfarm.common.Size;
 import build.buildfarm.common.TokenizableIterator;
 import build.buildfarm.common.TreeIterator.DirectoryEntry;
 import build.buildfarm.common.Write;
+import build.buildfarm.common.WritesHelper;
 import build.buildfarm.common.config.BuildfarmConfigs;
 import build.buildfarm.common.function.IOSupplier;
 import build.buildfarm.common.net.URL;
@@ -98,7 +101,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
-import com.google.common.io.ByteStreams;
+import com.google.common.util.concurrent.AsyncCallable;
 import com.google.common.util.concurrent.AsyncFunction;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
@@ -121,7 +124,6 @@ import io.grpc.stub.ServerCallStreamObserver;
 import io.netty.handler.codec.http.QueryStringDecoder;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -152,6 +154,13 @@ import org.jspecify.annotations.Nullable;
 @Log
 public abstract class NodeInstance extends InstanceBase {
   private static BuildfarmConfigs configs = BuildfarmConfigs.getInstance();
+
+  // This ExecutorService is used to avoid inadvertently running non-gRPC code on a gRPC thread.
+  // Without this, async failures fire on whatever thread set the helper's writtenFuture, which
+  // is typically a gRPC thread. Then the next mirror's synchronous HTTP setup would run on that
+  // same gRPC thread.
+  private static final ExecutorService FETCH_BLOB_EXECUTOR =
+      BuildfarmExecutors.getFetchBlobFailoverPool();
 
   protected final ContentAddressableStorage contentAddressableStorage;
   protected final ActionCache actionCache;
@@ -717,14 +726,9 @@ public abstract class NodeInstance extends InstanceBase {
 
     Write write = getContentWrite.create(digest);
 
-    try (InputStream in = inSupplier.get();
-        OutputStream out = write.getOutput(1, DAYS, () -> {})) {
-      ByteStreams.copy(in, out);
-    } catch (Write.WriteCompleteException e) {
-      // ignore - completed write transform below delivers early result, future should be done
-    }
-
-    return transform(write.getFuture(), committedSize -> digest, directExecutor());
+    ListenableFuture<Long> writtenFuture =
+        WritesHelper.streamIntoWriteFuture(inSupplier::get, write, digest, 1, DAYS);
+    return transform(writtenFuture, committedSize -> digest, directExecutor());
   }
 
   @Override
@@ -805,32 +809,66 @@ public abstract class NodeInstance extends InstanceBase {
     Map<String, String> globalHeaders = calculateGlobalHeaders(headers);
     // generate a map of headers for each URL, indexed by URL index
     Map<Integer, Map<String, String>> headersMapView = createHeadersMapView(headers, globalHeaders);
+
+    ListenableFuture<Digest> chain = null;
     int urlIndex = 0;
     for (URL url : urls) {
-      try {
-        // some minor abuse here, we want the download to set our built digest size as side effect
-        return downloadUrl(
-            url,
-            expectedDigest.getHash(),
-            headersMapView.getOrDefault(urlIndex, globalHeaders),
-            new DigestUtil(HashFunction.get(expectedDigest.getDigestFunction())),
-            actualDigest -> {
-              if (!expectedDigest.getHash().isEmpty()
-                  && expectedDigest.getSize() >= 0
-                  && expectedDigest.getSize() != actualDigest.getSize()) {
-                // TODO digestFunction
-                throw new DigestMismatchException(actualDigest, expectedDigest);
-              }
-              return getBlobWrite(
-                  Compressor.Value.IDENTITY, actualDigest, UUID.randomUUID(), requestMetadata);
-            });
-      } catch (Exception e) {
-        log.log(Level.WARNING, "download attempt failed", e);
-        // ignore?
+      Map<String, String> effectiveHeaders = headersMapView.getOrDefault(urlIndex, globalHeaders);
+      AsyncCallable<Digest> attempt =
+          () -> {
+            try {
+              // some minor abuse here, we want the download to set our built digest size as
+              // side effect
+              return downloadUrl(
+                  url,
+                  expectedDigest.getHash(),
+                  effectiveHeaders,
+                  new DigestUtil(HashFunction.get(expectedDigest.getDigestFunction())),
+                  actualDigest -> {
+                    if (!expectedDigest.getHash().isEmpty()
+                        && expectedDigest.getSize() >= 0
+                        && expectedDigest.getSize() != actualDigest.getSize()) {
+                      // TODO digestFunction
+                      throw new DigestMismatchException(actualDigest, expectedDigest);
+                    }
+                    return getBlobWrite(
+                        Compressor.Value.IDENTITY,
+                        actualDigest,
+                        UUID.randomUUID(),
+                        requestMetadata);
+                  });
+            } catch (Exception e) {
+              return immediateFailedFuture(e);
+            }
+          };
+      if (chain == null) {
+        chain = submitAsync(attempt, FETCH_BLOB_EXECUTOR);
+      } else {
+        chain =
+            catchingAsync(
+                chain,
+                Exception.class,
+                prev -> {
+                  log.log(Level.WARNING, "download attempt failed", prev);
+                  return attempt.call();
+                },
+                FETCH_BLOB_EXECUTOR);
       }
       urlIndex++;
     }
-    return immediateFailedFuture(new NoSuchFileException(expectedDigest.getHash()));
+    if (chain == null) {
+      return immediateFailedFuture(new NoSuchFileException(expectedDigest.getHash()));
+    }
+    return catchingAsync(
+        chain,
+        Exception.class,
+        prev -> {
+          log.log(Level.WARNING, "download attempt failed", prev);
+          NoSuchFileException exception = new NoSuchFileException(expectedDigest.getHash());
+          exception.addSuppressed(prev);
+          return immediateFailedFuture(exception);
+        },
+        FETCH_BLOB_EXECUTOR);
   }
 
   private static void stringsUniqueAndSortedPrecondition(

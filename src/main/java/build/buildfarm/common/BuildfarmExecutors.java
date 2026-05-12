@@ -94,4 +94,11 @@ public class BuildfarmExecutors {
     int nThreads = 128;
     return Executors.newWorkStealingPool(nThreads);
   }
+
+  public static ExecutorService getFetchBlobFailoverPool() {
+    int nThreads = 64;
+    String threadNameFormat = "fetch-blob-failover-pool-%d";
+    return Executors.newFixedThreadPool(
+        nThreads, new ThreadFactoryBuilder().setNameFormat(threadNameFormat).build());
+  }
 }
