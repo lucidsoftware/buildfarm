@@ -15,23 +15,22 @@
 package build.buildfarm.instance;
 
 import static com.google.common.util.concurrent.Futures.immediateFailedFuture;
+import static com.google.common.util.concurrent.Futures.transform;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 
 import build.bazel.remote.execution.v2.Compressor;
 import build.bazel.remote.execution.v2.RequestMetadata;
+import build.buildfarm.common.EntryLimitException;
 import build.buildfarm.common.Write;
+import build.buildfarm.common.WritesHelper;
 import build.buildfarm.v1test.Digest;
-import com.google.common.util.concurrent.FutureCallback;
-import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
-import com.google.common.util.concurrent.SettableFuture;
 import com.google.protobuf.ByteString;
 import io.grpc.Status;
 import io.grpc.StatusException;
 import io.grpc.StatusRuntimeException;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -76,7 +75,6 @@ public final class Utils {
         String.format("digest size %d did not match content size %d", digestSize, contentSize));
   }
 
-  // TODO make this *actually* async with onReady for FeedbackOutputStream
   public static ListenableFuture<Digest> putBlobFuture(
       Instance instance,
       Compressor.Value compressor,
@@ -89,32 +87,16 @@ public final class Utils {
       return immediateFailedFuture(
           invalidDigestSize(digest.getSize(), data.size()).asRuntimeException());
     }
-    SettableFuture<Digest> future = SettableFuture.create();
+    Write write;
     try {
-      Write write = instance.getBlobWrite(compressor, digest, UUID.randomUUID(), requestMetadata);
-      Futures.addCallback(
-          write.getFuture(),
-          new FutureCallback<Long>() {
-            @Override
-            public void onSuccess(Long committedSize) {
-              future.set(digest);
-            }
-
-            @SuppressWarnings("NullableProblems")
-            @Override
-            public void onFailure(Throwable t) {
-              future.setException(t);
-            }
-          },
-          directExecutor());
-      try (OutputStream out =
-          write.getOutput(writeDeadlineAfter, writeDeadlineAfterUnits, () -> {})) {
-        data.writeTo(out);
-      }
-    } catch (Exception e) {
-      future.setException(e);
+      write = instance.getBlobWrite(compressor, digest, UUID.randomUUID(), requestMetadata);
+    } catch (EntryLimitException e) {
+      return immediateFailedFuture(e);
     }
-    return future;
+    ListenableFuture<Long> writtenFuture =
+        WritesHelper.streamIntoWriteFuture(
+            data::newInput, write, digest, writeDeadlineAfter, writeDeadlineAfterUnits);
+    return transform(writtenFuture, committedSize -> digest, directExecutor());
   }
 
   public static Digest putBlob(
