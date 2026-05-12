@@ -16,6 +16,7 @@ package build.buildfarm.cas;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
+import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static java.util.concurrent.TimeUnit.MINUTES;
 
 import build.bazel.remote.execution.v2.BatchReadBlobsResponse.Response;
@@ -23,10 +24,14 @@ import build.bazel.remote.execution.v2.Compressor;
 import build.bazel.remote.execution.v2.DigestFunction;
 import build.bazel.remote.execution.v2.RequestMetadata;
 import build.buildfarm.common.DigestUtil;
+import build.buildfarm.common.EntryLimitException;
 import build.buildfarm.common.Write;
+import build.buildfarm.common.WritesHelper;
 import build.buildfarm.v1test.Digest;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Maps;
+import com.google.common.util.concurrent.FutureCallback;
+import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.protobuf.ByteString;
 import com.google.rpc.Status;
@@ -34,7 +39,6 @@ import io.grpc.protobuf.StatusProto;
 import io.grpc.stub.ServerCallStreamObserver;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.nio.file.NoSuchFileException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -344,19 +348,41 @@ public class MemoryCAS implements ContentAddressableStorage {
         DigestUtil.buildDigest(e.key, e.value.size(), e.value.getDigest().getDigestFunction());
     log.log(Level.INFO, "MemoryLRUCAS: expiring " + DigestUtil.toString(digest));
     if (delegate != null) {
+      Write write;
       try {
-        Write write =
+        write =
             delegate.getWrite(
                 Compressor.Value.IDENTITY,
                 digest,
                 UUID.randomUUID(),
                 RequestMetadata.getDefaultInstance());
-        try (OutputStream out = write.getOutput(1, MINUTES, () -> {})) {
-          e.value.getData().writeTo(out);
-        }
-      } catch (IOException ioEx) {
+      } catch (EntryLimitException limitEx) {
         log.log(
-            Level.SEVERE, String.format("error delegating %s", DigestUtil.toString(digest)), ioEx);
+            Level.SEVERE,
+            String.format("error delegating %s", DigestUtil.toString(digest)),
+            limitEx);
+        write = null;
+      }
+      if (write != null) {
+        // We don't wait for the future in order to avoid holding the CAS lock during IO
+        ListenableFuture<Long> future =
+            WritesHelper.streamIntoWriteFuture(
+                () -> e.value.getData().newInput(), write, digest, 1, MINUTES);
+        Futures.addCallback(
+            future,
+            new FutureCallback<Long>() {
+              @Override
+              public void onSuccess(Long committedSize) {}
+
+              @Override
+              public void onFailure(Throwable t) {
+                log.log(
+                    Level.SEVERE,
+                    String.format("error delegating %s", DigestUtil.toString(digest)),
+                    t);
+              }
+            },
+            directExecutor());
       }
     }
     storage.remove(e.key);
