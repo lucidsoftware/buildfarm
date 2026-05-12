@@ -14,18 +14,16 @@
 
 package build.buildfarm.worker.shard;
 
-import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
-import static java.lang.String.format;
 import static java.util.concurrent.TimeUnit.DAYS;
 
 import build.bazel.remote.execution.v2.Compressor;
 import build.bazel.remote.execution.v2.RequestMetadata;
 import build.buildfarm.backplane.Backplane;
-import build.buildfarm.common.Size;
 import build.buildfarm.common.Write;
+import build.buildfarm.common.WritesHelper;
+import build.buildfarm.common.function.IOSupplier;
 import build.buildfarm.common.grpc.Retrier;
 import build.buildfarm.common.grpc.RetryException;
-import build.buildfarm.common.io.FeedbackOutputStream;
 import build.buildfarm.instance.Instance;
 import build.buildfarm.instance.shard.Shard;
 import build.buildfarm.instance.stub.StubInstance;
@@ -33,12 +31,10 @@ import build.buildfarm.v1test.Digest;
 import com.google.common.base.Throwables;
 import com.google.common.cache.LoadingCache;
 import com.google.common.util.concurrent.ListenableFuture;
-import com.google.common.util.concurrent.SettableFuture;
 import com.google.protobuf.ByteString;
 import io.grpc.Status;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Random;
@@ -70,25 +66,32 @@ public class RemoteCasWriter implements CasWriter {
 
   private void insertFileToCasMember(Digest digest, Path file)
       throws IOException, InterruptedException {
-    try (InputStream in = Files.newInputStream(file)) {
-      retrier.execute(() -> writeToCasMember(digest, in));
+    try {
+      // Create a fresh stream per attempt to avoid a half-consumed stream from a failed retry
+      // corrupting the next attempt.
+      retrier.execute(() -> writeToCasMember(digest, () -> Files.newInputStream(file)));
     } catch (RetryException e) {
-      Throwable cause = e.getCause();
-      Throwables.throwIfInstanceOf(cause, IOException.class);
-      Throwables.throwIfUnchecked(cause);
-      throw new IOException(cause);
+      throwUnwrapped(e);
     }
   }
 
-  private long writeToCasMember(Digest digest, InputStream in)
+  private long writeToCasMember(Digest digest, IOSupplier<InputStream> inFactory)
       throws IOException, InterruptedException {
     // create a write for inserting into another CAS member.
     String workerName = getRandomWorker();
     Write write = getCasMemberWrite(digest, workerName);
 
     write.reset();
+
+    ListenableFuture<Long> writtenFuture =
+        WritesHelper.streamIntoWriteFuture(inFactory, write, digest, 1, DAYS);
     try {
-      return streamIntoWriteFuture(in, write, digest).get();
+      return writtenFuture.get();
+    } catch (InterruptedException e) {
+      // Cancel the future so the cleanup listener closes the InputStream and cancels the gRPC call.
+      writtenFuture.cancel(true);
+      Thread.currentThread().interrupt();
+      throw e;
     } catch (ExecutionException e) {
       Throwable cause = e.getCause();
       Throwables.throwIfInstanceOf(cause, IOException.class);
@@ -108,14 +111,18 @@ public class RemoteCasWriter implements CasWriter {
   @Override
   public void insertBlob(Digest digest, ByteString content)
       throws IOException, InterruptedException {
-    try (InputStream in = content.newInput()) {
-      retrier.execute(() -> writeToCasMember(digest, in));
+    try {
+      retrier.execute(() -> writeToCasMember(digest, content::newInput));
     } catch (RetryException e) {
-      Throwable cause = e.getCause();
-      Throwables.throwIfInstanceOf(cause, IOException.class);
-      Throwables.throwIfUnchecked(cause);
-      throw new IOException(cause);
+      throwUnwrapped(e);
     }
+  }
+
+  private static void throwUnwrapped(RetryException e) throws IOException {
+    Throwable cause = e.getCause();
+    Throwables.throwIfInstanceOf(cause, IOException.class);
+    Throwables.throwIfUnchecked(cause);
+    throw new IOException(cause);
   }
 
   private String getRandomWorker() throws IOException {
@@ -131,73 +138,5 @@ public class RemoteCasWriter implements CasWriter {
       log.log(Level.SEVERE, "error getting worker stub for " + worker, e.getCause());
       throw new IllegalStateException("stub instance creation must not fail");
     }
-  }
-
-  private ListenableFuture<Long> streamIntoWriteFuture(InputStream in, Write write, Digest digest)
-      throws IOException {
-    SettableFuture<Long> writtenFuture = SettableFuture.create();
-    int chunkSizeBytes = (int) Size.kbToBytes(128);
-
-    // The following callback is performed each time the write stream is ready.
-    // For each callback we only transfer a small part of the input stream in order to avoid
-    // accumulating a large buffer.  When the file is done being transfered,
-    // the callback closes the stream and prepares the future.
-    FeedbackOutputStream out =
-        write.getOutput(
-            /* deadlineAfter= */ 1,
-            /* deadlineAfterUnits= */ DAYS,
-            () -> {
-              try {
-                FeedbackOutputStream outStream = (FeedbackOutputStream) write;
-                while (outStream.isReady()) {
-                  if (!copyBytes(in, outStream, chunkSizeBytes)) {
-                    return;
-                  }
-                }
-
-              } catch (IOException e) {
-                if (!write.isComplete()) {
-                  write.reset();
-                  log.log(Level.SEVERE, "unexpected error transferring file for " + digest, e);
-                }
-              }
-            });
-
-    write
-        .getFuture()
-        .addListener(
-            () -> {
-              try {
-                try {
-                  out.close();
-                } catch (IOException e) {
-                  // ignore
-                }
-                long committedSize = write.getCommittedSize();
-                if (committedSize != digest.getSize()) {
-                  log.log(
-                      Level.WARNING,
-                      format(
-                          "committed size %d did not match expectation for digestUtil",
-                          committedSize));
-                }
-                writtenFuture.set(digest.getSize());
-              } catch (RuntimeException e) {
-                writtenFuture.setException(e);
-              }
-            },
-            directExecutor());
-
-    return writtenFuture;
-  }
-
-  private boolean copyBytes(InputStream in, OutputStream out, int bytesAmount) throws IOException {
-    byte[] buf = new byte[bytesAmount];
-    int n = in.read(buf);
-    if (n > 0) {
-      out.write(buf, 0, n);
-      return true;
-    }
-    return false;
   }
 }
