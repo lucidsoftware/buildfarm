@@ -61,6 +61,7 @@ import build.buildfarm.common.InputStreamFactory;
 import build.buildfarm.common.Time;
 import build.buildfarm.common.Write;
 import build.buildfarm.common.Write.CompleteWrite;
+import build.buildfarm.common.WritesHelper;
 import build.buildfarm.common.ZstdCompressingInputStream;
 import build.buildfarm.common.ZstdDecompressingOutputStream;
 import build.buildfarm.common.ZstdDecompressingOutputStream.FixedBufferPool;
@@ -83,6 +84,8 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.hash.HashingOutputStream;
 import com.google.common.io.ByteStreams;
+import com.google.common.util.concurrent.FutureCallback;
+import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
 import com.google.common.util.concurrent.UncheckedExecutionException;
@@ -1890,28 +1893,19 @@ public abstract class CASFileCache implements ContentAddressableStorage {
                 + e.referenceCount
                 + " references");
       }
-      boolean interrupted = false;
       if (!e.key.endsWith("_dir")) {
         FileEntryKey fileEntryKey = parseFileEntryKey(e.key, e.size);
         if (fileEntryKey == null) {
           log.log(Level.SEVERE, format("error parsing expired key %s", e.key));
         } else {
-          try {
-            expireEntryFallback(fileEntryKey);
-          } catch (IOException ioEx) {
-            interrupted = causedByInterrupted(ioEx);
-          }
+          expireEntryFallback(fileEntryKey);
           invalidateWrite(fileEntryKey.digest());
         }
       }
       Entry removedEntry = safeStorageRemoval(e.key);
       // reference compare on purpose
       if (removedEntry == e) {
-        ListenableFuture<Entry> entryFuture = dischargeEntryFuture(e, service);
-        if (interrupted) {
-          Thread.currentThread().interrupt();
-        }
-        return entryFuture;
+        return dischargeEntryFuture(e, service);
       }
       if (removedEntry == null) {
         log.log(Level.SEVERE, format("entry %s was already removed during expiration", e.key));
@@ -1934,7 +1928,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         storage.put(e.key, removedEntry);
       }
       // possibly delegated, but no removal, if we're interrupted, abort loop
-      if (interrupted || Thread.currentThread().isInterrupted()) {
+      if (Thread.currentThread().isInterrupted()) {
         throw new InterruptedException();
       }
     }
@@ -2858,34 +2852,72 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         write);
   }
 
-  private void expireEntryFallback(FileEntryKey fileEntryKey) throws IOException {
+  private void expireEntryFallback(FileEntryKey fileEntryKey) {
     if (delegate != null) {
-      Write write =
-          delegate.getWrite(
-              Compressor.Value.IDENTITY,
-              fileEntryKey.digest(),
-              UUID.randomUUID(),
-              RequestMetadata.getDefaultInstance());
+      Write write;
+      try {
+        write =
+            delegate.getWrite(
+                Compressor.Value.IDENTITY,
+                fileEntryKey.digest(),
+                UUID.randomUUID(),
+                RequestMetadata.getDefaultInstance());
+      } catch (EntryLimitException e) {
+        log.log(
+            Level.SEVERE,
+            format("error opening delegate write for expired entry %s", fileEntryKey.key()),
+            e);
+        return;
+      }
       if (write != null) {
-        performCopy(write, fileEntryKey.key());
+        performCopy(write, fileEntryKey.digest(), fileEntryKey.key());
       }
     }
   }
 
-  private void performCopy(Write write, String key) throws IOException {
-    try (OutputStream out = write.getOutput(1, MINUTES, () -> {});
-        InputStream in = Files.newInputStream(getPath(key))) {
-      ByteStreams.copy(in, out);
-    } catch (IOException ioEx) {
-      boolean interrupted = causedByInterrupted(ioEx);
-      if (interrupted || !write.isComplete()) {
-        write.reset();
-        log.log(Level.SEVERE, format("error delegating expired entry %s", key), ioEx);
-        if (interrupted) {
+  /**
+   * Kicks off an asynchronous copy. Does not wait for it to complete. That way we don't do IO while
+   * holding the lock.
+   *
+   * <p>Async upload failures (arriving on the gRPC SerializingExecutor after this thread has
+   * returned) do NOT propagate interrupts back to the eviction thread. The eviction loop has
+   * already moved on. This should be ok because interruption during the async phase is meaningful
+   * only at graceful shutdown where higher-level shutdown logic terminates the worker
+   * independently.
+   *
+   * <p>Synchronous setup failures DO restore the interrupt flag. The eviction loop is still on this
+   * thread and its end-of-iteration {@code isInterrupted()} check needs to see the flag to
+   * propagate {@link InterruptedException} up through {@code charge} to the {@code put} caller.
+   */
+  private void performCopy(Write write, Digest digest, String key) {
+    // We need to synchronously open the InputStream for streamIntoWriteFuture because
+    // safeStorageRemoval unlinks the file right after this function returns.
+    ListenableFuture<Long> future =
+        WritesHelper.streamIntoWriteFuture(
+            () -> Files.newInputStream(getPath(key)), write, digest, 1, MINUTES);
+    if (future.isDone()) {
+      try {
+        future.get();
+      } catch (ExecutionException e) {
+        if (e.getCause() instanceof IOException
+            && causedByInterrupted((IOException) e.getCause())) {
           Thread.currentThread().interrupt();
         }
-        throw ioEx;
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
       }
     }
+    Futures.addCallback(
+        future,
+        new FutureCallback<Long>() {
+          @Override
+          public void onSuccess(Long committedSize) {}
+
+          @Override
+          public void onFailure(Throwable t) {
+            log.log(Level.SEVERE, format("error delegating expired entry %s", key), t);
+          }
+        },
+        directExecutor());
   }
 }
