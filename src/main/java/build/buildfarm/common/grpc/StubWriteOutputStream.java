@@ -47,6 +47,7 @@ import java.io.IOException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 import lombok.extern.java.Log;
 
@@ -206,6 +207,31 @@ public class StubWriteOutputStream extends FeedbackOutputStream implements Write
           // IllegalStateException
         }
       }
+    }
+  }
+
+  @Override
+  public void cancel(String message, @Nullable Throwable cause) {
+    writeFuture.setException(Write.cancelledException(message, cause));
+
+    ClientCallStreamObserver<WriteRequest> observer;
+    synchronized (this) {
+      if (writeObserver == null) {
+        // Already cancelled or close() ran first
+        isFullyClosed = true;
+        return;
+      }
+      observer = (ClientCallStreamObserver<WriteRequest>) writeObserver;
+      writeObserver = null;
+      isGrpcRemoteCallClosed = true;
+      isFullyClosed = true;
+    }
+
+    try {
+      observer.cancel(message, cause);
+    } catch (IllegalStateException ignored) {
+      // If gRPC has already terminated things we want to avoid needlessly throwing an
+      // IllegalStateException
     }
   }
 

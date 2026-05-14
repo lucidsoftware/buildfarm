@@ -40,6 +40,7 @@ import io.grpc.ClientInterceptors;
 import io.grpc.ForwardingClientCall.SimpleForwardingClientCall;
 import io.grpc.MethodDescriptor;
 import io.grpc.Status;
+import io.grpc.StatusException;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.stub.StreamObserver;
@@ -48,6 +49,7 @@ import io.grpc.util.MutableHandlerRegistry;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Before;
@@ -399,6 +401,66 @@ public class StubWriteOutputStreamTest {
   }
 
   @Test
+  public void cancel_completesFutureExceptionallyAndCancelsObserver() throws IOException {
+    AtomicInteger cancelCount = new AtomicInteger();
+    registerMockByteStreamService();
+    StubWriteOutputStream write =
+        newWrite(
+            ClientInterceptors.intercept(channel, recordingCancelInterceptor(cancelCount)),
+            "cancel-resource",
+            /* expectedSize= */ 100);
+
+    write.getOutput(1, SECONDS, () -> {});
+    write.cancel("test cancel", null);
+
+    assertThat(write.getFuture().isDone()).isTrue();
+    ExecutionException ee = assertThrows(ExecutionException.class, () -> write.getFuture().get());
+    assertThat(ee.getCause()).isInstanceOf(StatusException.class);
+    assertThat(Status.fromThrowable(ee.getCause()).getCode()).isEqualTo(Status.Code.CANCELLED);
+    assertThat(cancelCount.get()).isEqualTo(1);
+    assertThat(write.hasActiveWriteObserver()).isFalse();
+  }
+
+  @Test
+  public void cancel_isIdempotent_secondCallDoesNothing() throws IOException {
+    AtomicInteger cancelCount = new AtomicInteger();
+    registerMockByteStreamService();
+    StubWriteOutputStream write =
+        newWrite(
+            ClientInterceptors.intercept(channel, recordingCancelInterceptor(cancelCount)),
+            "idempotent-cancel-resource",
+            /* expectedSize= */ 100);
+
+    write.getOutput(1, SECONDS, () -> {});
+    write.cancel("first", null);
+    write.cancel("second", null);
+
+    assertThat(cancelCount.get()).isEqualTo(1);
+  }
+
+  @Test
+  public void closeAfterCancel_isNoOp() throws IOException {
+    AtomicInteger cancelCount = new AtomicInteger();
+    registerMockByteStreamService();
+    StubWriteOutputStream write =
+        newWrite(
+            ClientInterceptors.intercept(channel, recordingCancelInterceptor(cancelCount)),
+            "cancel-then-close-resource",
+            /* expectedSize= */ 100);
+
+    OutputStream out = write.getOutput(1, SECONDS, () -> {});
+    write.cancel("oops", null);
+
+    // close() must not throw any RuntimeException (UncheckedExecutionException of the prior
+    // CANCELLED status would otherwise propagate out of checkComplete()).
+    out.close();
+
+    // The cancel happened exactly once — close() did NOT re-issue cancel via the observer.
+    assertThat(cancelCount.get()).isEqualTo(1);
+    assertThat(write.hasActiveWriteObserver()).isFalse();
+  }
+
+  @Test
   public void closeWhenWriteFutureFailedFromOnError_isQuiet() throws IOException {
     // close() must not re-throw the prior failure: WriteStreamObserver's cancellation listener
     // catches only IOException, so a RuntimeException would log SEVERE on every cancellation.
@@ -485,6 +547,42 @@ public class StubWriteOutputStreamTest {
     // onError; absent the checkComplete guard, write(...) would have realized a fresh
     // writeObserver.
     assertThat(writeCallCount.get()).isEqualTo(1);
+  }
+
+  @SuppressWarnings("unchecked")
+  @Test
+  public void getOutput_afterCancel_throwsIOExceptionAndDoesNotOpenNewCall() throws IOException {
+    // After cancel, isFullyClosed is set. A second getOutput must NOT open a fresh gRPC call —
+    // close() short-circuits on isFullyClosed, so any new call would leak. initiateWrite's
+    // guard refuses under the same monitor that cancel flips the flag, so check-and-create is
+    // atomic with teardown.
+    AtomicInteger writeCallCount = new AtomicInteger();
+    serviceRegistry.addService(
+        new ByteStreamImplBase() {
+          @Override
+          public StreamObserver<WriteRequest> write(
+              StreamObserver<WriteResponse> responseObserver) {
+            writeCallCount.incrementAndGet();
+            return mock(StreamObserver.class);
+          }
+        });
+
+    StubWriteOutputStream write =
+        newWrite(channel, "cancel-then-getoutput-resource", /* expectedSize= */ 100);
+    write.getOutput(1, SECONDS, () -> {});
+    assertThat(writeCallCount.get()).isEqualTo(1);
+
+    write.cancel("test cancel", null);
+    assertThat(write.getisFullyClosed()).isTrue();
+
+    IOException ex = assertThrows(IOException.class, () -> write.getOutput(1, SECONDS, () -> {}));
+    // The cancel's CANCELLED StatusException is preserved as the cause, so callers/logs see the
+    // real reason rather than a generic "terminated".
+    assertThat(Status.fromThrowable(ex).getCode()).isEqualTo(Status.Code.CANCELLED);
+
+    // No fresh gRPC call was opened.
+    assertThat(writeCallCount.get()).isEqualTo(1);
+    assertThat(write.hasActiveWriteObserver()).isFalse();
   }
 
   @SuppressWarnings("unchecked")
