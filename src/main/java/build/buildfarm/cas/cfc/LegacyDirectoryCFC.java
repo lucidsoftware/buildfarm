@@ -351,13 +351,20 @@ public class LegacyDirectoryCFC extends CASFileCache {
     return b.build();
   }
 
-  public synchronized void decrementReferences(
+  public void decrementReferences(
       Iterable<String> inputFiles,
       Iterable<build.bazel.remote.execution.v2.Digest> inputDirectories,
       DigestFunction.Value digestFunction)
       throws IOException, InterruptedException {
     try {
-      decrementReferencesSynchronized(inputFiles, inputDirectories, digestFunction);
+      ImmutableList<ImmutableList<String>> directoryInputs;
+      synchronized (this) {
+        directoryInputs = getDirectoryInputsSynchronized(inputDirectories, digestFunction);
+      }
+      decrementInputReferences(inputFiles);
+      for (ImmutableList<String> inputs : directoryInputs) {
+        decrementInputReferences(inputs);
+      }
     } catch (ClosedByInterruptException e) {
       InterruptedException intEx = new InterruptedException();
       intEx.addSuppressed(e);
@@ -366,14 +373,11 @@ public class LegacyDirectoryCFC extends CASFileCache {
   }
 
   @GuardedBy("this")
-  private void decrementReferencesSynchronized(
-      Iterable<String> inputFiles,
+  private ImmutableList<ImmutableList<String>> getDirectoryInputsSynchronized(
       Iterable<build.bazel.remote.execution.v2.Digest> inputDirectories,
       DigestFunction.Value digestFunction)
       throws IOException {
-    // decrement references and notify if any dropped to 0
-    // insert after the last 0-reference count entry in list
-    int entriesDereferenced = decrementInputReferences(inputFiles);
+    ImmutableList.Builder<ImmutableList<String>> directoryInputs = ImmutableList.builder();
     for (build.bazel.remote.execution.v2.Digest inputDirectory : inputDirectories) {
       DirectoryEntry dirEntry =
           directoryStorage.get(DigestUtil.fromDigest(inputDirectory, digestFunction));
@@ -383,24 +387,43 @@ public class LegacyDirectoryCFC extends CASFileCache {
                 + DigestUtil.toString(DigestUtil.fromDigest(inputDirectory, digestFunction))
                 + " is not in directoryStorage");
       }
-      entriesDereferenced +=
-          decrementInputReferences(
+      directoryInputs.add(
+          ImmutableList.copyOf(
               directoriesIndex.directoryEntries(
-                  DigestUtil.fromDigest(inputDirectory, digestFunction)));
+                  DigestUtil.fromDigest(inputDirectory, digestFunction))));
     }
-    if (entriesDereferenced > 0) {
-      notify();
+    return directoryInputs.build();
+  }
+
+  @GuardedBy("this")
+  private void decrementReferencesSynchronized(
+      Iterable<String> inputFiles,
+      Iterable<build.bazel.remote.execution.v2.Digest> inputDirectories,
+      DigestFunction.Value digestFunction)
+      throws IOException {
+    decrementInputReferences(inputFiles);
+    for (ImmutableList<String> inputs :
+        getDirectoryInputsSynchronized(inputDirectories, digestFunction)) {
+      decrementInputReferences(inputs);
     }
   }
 
-  @SuppressWarnings("NonAtomicOperationOnVolatileField")
+  // Do not add `synchronized` here — caller holds lruLock, and `this` is the parent
+  // CASFileCache instance (extends-relationship), so `synchronized` would invert lock
+  // order against putDirectorySynchronized (`this` -> lruLock).
+  @GuardedBy("lruLock")
   @Override
-  protected synchronized List<ListenableFuture<Void>> unlinkAndExpireDirectories(
+  protected List<ListenableFuture<Void>> unlinkAndExpireDirectories(
       Entry entry, ExecutorService service) {
     ImmutableList.Builder<ListenableFuture<Void>> builder = ImmutableList.builder();
     Iterable<Digest> containingDirectories;
     try {
-      containingDirectories = directoriesIndex.removeEntry(entry.key);
+      // Serialize this index delete against the synchronized directoryEntries() reads (both touch
+      // the same _dir_inputs files); a racing read could otherwise see a half-deleted entry. This
+      // restores the pre-async-evictor invariant where both sides were synchronized methods.
+      synchronized (this) {
+        containingDirectories = directoriesIndex.removeEntry(entry.key);
+      }
     } catch (Exception e) {
       log.log(Level.SEVERE, "error removing entry " + entry.key + " from directoriesIndex", e);
       containingDirectories = ImmutableList.of();
@@ -409,17 +432,16 @@ public class LegacyDirectoryCFC extends CASFileCache {
       builder.add(expireDirectory(containingDirectory, service));
     }
 
-    // candidate for parent-only method
-
-    entry.unlink();
-    unreferencedEntryCount--;
-    if (entry.referenceCount != 0) {
+    // Route through unlinkReferenced so the isLinked() gate applies: an entry whose
+    // linkUnreferenced was skipped (release-then-acquire race) can still be selected
+    // by tryEvict, and unlink() against !isLinked() would NPE.
+    unlinkReferenced(entry);
+    if (entry.refCount() != 0) {
       log.severe("removed referenced entry " + entry.key);
     }
     return builder.build();
   }
 
-  @GuardedBy("this")
   private ListenableFuture<Void> expireDirectory(Digest digest, ExecutorService service) {
     DirectoryEntry e = directoryStorage.remove(digest);
     if (e == null) {
@@ -561,8 +583,7 @@ public class LegacyDirectoryCFC extends CASFileCache {
         ImmutableList.Builder<String> inputsBuilder = ImmutableList.builder();
         // this seems to be a point that would be great to not be synchronized on...
         for (String input : directoriesIndex.directoryEntries(digest)) {
-          Entry fileEntry = storage.get(input);
-          if (fileEntry == null) {
+          if (!referenceIfExists(input)) {
             log.severe(
                 format(
                     "CASFileCache::putDirectory(%s) exists, but input %s does not, purging it with"
@@ -570,9 +591,6 @@ public class LegacyDirectoryCFC extends CASFileCache {
                     DigestUtil.toString(digest), input));
             e = null;
             break;
-          }
-          if (fileEntry.incrementReference()) {
-            unreferencedEntryCount--;
           }
           checkNotNull(input);
           inputsBuilder.add(input);

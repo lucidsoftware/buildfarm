@@ -63,6 +63,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.logging.Level;
+import javax.annotation.concurrent.GuardedBy;
 import lombok.extern.java.Log;
 import org.jspecify.annotations.Nullable;
 
@@ -123,19 +124,22 @@ public class DirectoryEntryCFC extends CASFileCache {
               return FileVisitResult.CONTINUE;
             }
           });
-      Entry e = new Entry(key, blobSizeInBytes.get(), Deadline.after(10, HOURS));
+      Entry e = Entry.orphan(key, blobSizeInBytes.get(), Deadline.after(10, HOURS));
       // this is now a little gross
-      if (sizeInBytes + e.size > maxSizeInBytes || e.size > maxEntrySizeInBytes || e.size == 0) {
+      if (totalBytes.sum() + e.size > maxSizeInBytes
+          || e.size > maxEntrySizeInBytes
+          || e.size == 0) {
         synchronized (invalidDirectories) {
           invalidDirectories.add(path);
         }
       } else {
         storage.put(key, e);
-        synchronized (this) {
-          if (e.decrementReference(header)) {
-            unreferencedEntryCount++;
-          }
-          sizeInBytes += estimateSizeOnDisk(e.size, blockSize, /* isHardlink= */ false);
+        totalBytes.add(estimateSizeOnDisk(e.size, blockSize, /* isHardlink= */ false));
+        lruLock.lock();
+        try {
+          linkUnreferenced(e);
+        } finally {
+          lruLock.unlock();
         }
       }
     } catch (Exception e) {
@@ -379,7 +383,7 @@ public class DirectoryEntryCFC extends CASFileCache {
   }
 
   @Override
-  public synchronized void decrementReferences(
+  public void decrementReferences(
       Iterable<String> inputFiles,
       Iterable<build.bazel.remote.execution.v2.Digest> inputDirectories,
       DigestFunction.Value digestFunction)
@@ -388,22 +392,18 @@ public class DirectoryEntryCFC extends CASFileCache {
         Iterables.transform(
             inputDirectories,
             digest -> getDirectoryKey(DigestUtil.fromDigest(digest, digestFunction)));
-    // decrement references and notify if any dropped to 0
-    // insert after the last 0-reference count entry in list
-    inputFiles = Iterables.concat(inputFiles, directoryDigests);
-    if (decrementInputReferences(inputFiles) > 0) {
-      notify();
-    }
-    // this is very funky as is, it smells like something we should elevate to parent
-    // even funkier with the synchronized requirement
+    decrementInputReferences(Iterables.concat(inputFiles, directoryDigests));
   }
 
+  @GuardedBy("lruLock")
   @Override
-  protected synchronized List<ListenableFuture<Void>> unlinkAndExpireDirectories(
+  protected List<ListenableFuture<Void>> unlinkAndExpireDirectories(
       Entry entry, ExecutorService service) {
-    entry.unlink();
-    unreferencedEntryCount--;
-    if (entry.referenceCount != 0) {
+    // Route through unlinkReferenced so the isLinked() gate applies: an entry whose
+    // linkUnreferenced was skipped (release-then-acquire race) can still be selected
+    // by tryEvict, and unlink() against !isLinked() would NPE.
+    unlinkReferenced(entry);
+    if (entry.refCount() != 0) {
       log.log(Level.SEVERE, "removed referenced entry " + entry.key);
     }
     // we have no expiration that can be triggered by an entry
