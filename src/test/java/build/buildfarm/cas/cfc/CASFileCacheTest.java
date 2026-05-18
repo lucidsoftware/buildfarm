@@ -17,6 +17,7 @@ package build.buildfarm.cas.cfc;
 import static build.buildfarm.common.io.Utils.getInterruptiblyOrIOException;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.common.truth.Truth.assertWithMessage;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static com.google.common.util.concurrent.MoreExecutors.shutdownAndAwaitTermination;
 import static java.lang.Thread.State.TERMINATED;
@@ -30,6 +31,7 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.fail;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -61,6 +63,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Maps;
+import com.google.common.io.ByteStreams;
 import com.google.common.jimfs.Configuration;
 import com.google.common.jimfs.Jimfs;
 import com.google.common.util.concurrent.FutureCallback;
@@ -73,6 +76,9 @@ import io.grpc.Status;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
 import java.nio.channels.ClosedChannelException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileStore;
@@ -86,6 +92,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -94,6 +101,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Consumer;
 import java.util.logging.Handler;
 import java.util.logging.Level;
@@ -452,9 +460,10 @@ class CASFileCacheTest {
   public void newInputRemovesNonExistentEntry() throws IOException, InterruptedException {
     Digest nonexistentDigest = DIGEST_UTIL.compute(ByteString.copyFromUtf8("file does not exist"));
     String nonexistentKey = fileCache.getKey(nonexistentDigest, false);
-    Entry entry = new Entry(nonexistentKey, 1, Deadline.after(10, SECONDS));
-    entry.before = entry;
-    entry.after = entry;
+    // Use the orphan factory: refCount = 0 with self-pointered LRU links, matching the
+    // post-startup-scan state. The previous test poked entry.before/after directly; the
+    // orphan factory is now the supported construction path for this shape.
+    Entry entry = Entry.orphan(nonexistentKey, 1, Deadline.after(10, SECONDS));
     storage.put(nonexistentKey, entry);
     NoSuchFileException noSuchFileException = null;
     try (InputStream ignored =
@@ -580,23 +589,26 @@ class CASFileCacheTest {
   }
 
   @Test
+  @SuppressWarnings("GuardedBy")
   public void waitForLastUnreferencedEntryStillThrowsWhenStorageEmpty()
       throws InterruptedException {
     // Storage starts empty in the test fixture; the LRU header is unlinked so the
     // method enters the wait loop and immediately throws on the empty-storage check.
     IllegalStateException thrown = null;
-    synchronized (fileCache) {
-      try {
-        fileCache.waitForLastUnreferencedEntry(1024L);
-      } catch (IllegalStateException e) {
-        thrown = e;
-      }
+    fileCache.lruLockForTesting().lock();
+    try {
+      fileCache.waitForLastUnreferencedEntry(1024L);
+    } catch (IllegalStateException e) {
+      thrown = e;
+    } finally {
+      fileCache.lruLockForTesting().unlock();
     }
     assertThat(thrown).isNotNull();
     assertThat(thrown).hasMessageThat().contains("there are no keys to wait for expiration on");
   }
 
   @Test
+  @SuppressWarnings("GuardedBy")
   public void waitForLastUnreferencedEntryExitsOnSizeDropBelowLimit()
       throws IOException, InterruptedException {
     // Populate one referenced entry so storage isn't empty; with the entry referenced,
@@ -613,32 +625,51 @@ class CASFileCacheTest {
         new Thread(
             () -> {
               try {
-                synchronized (fileCache) {
-                  // Force sizeInBytes above the cap so the wait()-then-check sees the
+                fileCache.lruLockForTesting().lock();
+                try {
+                  // Force totalBytes above the cap so the await-then-check sees the
                   // over-cap state initially.
                   fileCache.setSizeInBytesForTesting(fileCache.maxSize() + TEST_BLOCK_SIZE);
                   result.set(fileCache.waitForLastUnreferencedEntry(1024L));
+                } finally {
+                  fileCache.lruLockForTesting().unlock();
                 }
               } catch (Throwable t) {
                 error.set(t);
               }
             });
     caller.start();
-    // Wait for the caller to release the monitor inside Object.wait().
+    // Detect "caller is parked on lruCondition" via hasWaiters() under the lock.
+    // Thread.State.WAITING is a scheduler hint that GC pauses or vCPU contention
+    // can leave stale; hasWaiters() is atomic w.r.t. the condition. Once true,
+    // drop totalBytes back to the cap and signal in the same critical section so
+    // the await-recheck branch returns null.
     long deadline = System.nanoTime() + SECONDS.toNanos(5);
-    while (caller.getState() != WAITING && System.nanoTime() < deadline) {
+    while (true) {
+      fileCache.lruLockForTesting().lock();
+      try {
+        if (fileCache.lruLockForTesting().hasWaiters(fileCache.lruConditionForTesting())) {
+          fileCache.setSizeInBytesForTesting(fileCache.maxSize());
+          fileCache.lruConditionForTesting().signalAll();
+          break;
+        }
+      } finally {
+        fileCache.lruLockForTesting().unlock();
+      }
+      if (System.nanoTime() > deadline) {
+        caller.interrupt();
+        fail("caller did not enter Condition.await() within budget");
+      }
       Thread.yield();
     }
-    assertThat(caller.getState()).isEqualTo(WAITING);
-
-    // Drop sizeInBytes back to the cap and notify so the wait()er rechecks the
-    // size-drop branch and returns null.
-    synchronized (fileCache) {
-      fileCache.setSizeInBytesForTesting(fileCache.maxSize());
-      fileCache.notifyAll();
-    }
     caller.join(SECONDS.toMillis(5));
-    assertThat(caller.isAlive()).isFalse();
+    if (caller.isAlive()) {
+      // Interrupt before fail so a parked caller doesn't sit on lruCondition through
+      // tearDown and cascade noise into subsequent tests — matching the discipline
+      // applied to the sibling stall-regression tests.
+      caller.interrupt();
+      fail("caller still parked on lruCondition after signalAll");
+    }
     assertThat(error.get()).isNull();
     assertThat(result.get()).isNull();
   }
@@ -1127,6 +1158,84 @@ class CASFileCacheTest {
   }
 
   @Test
+  public void legacyDecrementReferencesShouldReleaseDirectoryInputsOutsideMonitor()
+      throws Exception {
+    class ObservingLegacyDirectoryCFC extends LegacyDirectoryCFC {
+      final AtomicBoolean observeReleases = new AtomicBoolean();
+      final AtomicBoolean releasedWhileHoldingMonitor = new AtomicBoolean();
+
+      ObservingLegacyDirectoryCFC(Path legacyRoot) {
+        super(
+            legacyRoot,
+            /* maxSizeInBytes= */ 24576,
+            /* maxEntrySizeInBytes= */ 24576,
+            /* hexBucketLevels= */ 1,
+            /* storeFileDirsIndexInMemory= */ true,
+            /* execRootFallback= */ false,
+            expireService,
+            /* accessRecorder= */ directExecutor(),
+            Maps.newConcurrentMap(),
+            LegacyDirectoryCFC.DIRECTORIES_INDEX_NAME_MEMORY,
+            /* zstdBufferPool= */ null,
+            onPut,
+            onExpire,
+            delegate,
+            /* delegateSkipLoad= */ false,
+            (compressor, digest, offset) -> {
+              ByteString content = blobs.get(digest);
+              assertThat(content).isNotNull();
+              checkArgument(compressor == Compressor.Value.IDENTITY);
+              return content.substring((int) offset).newInput();
+            });
+      }
+
+      @Override
+      protected int decrementInputReferences(Iterable<String> inputFiles) {
+        ImmutableList<String> inputs = ImmutableList.copyOf(inputFiles);
+        if (observeReleases.get() && !inputs.isEmpty() && Thread.holdsLock(this)) {
+          releasedWhileHoldingMonitor.set(true);
+        }
+        return super.decrementInputReferences(inputs);
+      }
+    }
+
+    ObservingLegacyDirectoryCFC legacy =
+        new ObservingLegacyDirectoryCFC(root.resolve("legacy-monitor"));
+    legacy.initializeRootDirectory();
+    legacy.setBlockSizeForTesting(TEST_BLOCK_SIZE);
+    try {
+      ByteString content = ByteString.copyFromUtf8("legacy-directory-input");
+      Digest fileDigest = DIGEST_UTIL.compute(content);
+      blobs.put(fileDigest, content);
+      Directory directory =
+          Directory.newBuilder()
+              .addFiles(
+                  FileNode.newBuilder()
+                      .setName("input")
+                      .setDigest(DigestUtil.toDigest(fileDigest))
+                      .build())
+              .build();
+      Digest directoryDigest = DIGEST_UTIL.compute(directory);
+      build.bazel.remote.execution.v2.Digest directoryApiDigest =
+          DigestUtil.toDigest(directoryDigest);
+
+      getInterruptiblyOrIOException(
+          legacy.putDirectory(
+              directoryDigest, ImmutableMap.of(directoryApiDigest, directory), putService));
+
+      legacy.observeReleases.set(true);
+      legacy.decrementReferences(
+          ImmutableList.of(),
+          ImmutableList.of(directoryApiDigest),
+          DIGEST_UTIL.getDigestFunction());
+
+      assertThat(legacy.releasedWhileHoldingMonitor.get()).isFalse();
+    } finally {
+      legacy.stop();
+    }
+  }
+
+  @Test
   public void duplicateExpiredEntrySuppressesDigestExpiration()
       throws IOException, InterruptedException {
     Blob expiringBlob;
@@ -1492,6 +1601,12 @@ class CASFileCacheTest {
             Compressor.Value.IDENTITY, digest, uuid, RequestMetadata.getDefaultInstance());
 
     CyclicBarrier barrier = new CyclicBarrier(3);
+    // awaitThreadState throws AssertionError, which is a Throwable but not an Exception.
+    // Without capture, a timed-out probe inside write2 would silently terminate the worker
+    // and the TERMINATED-state assertion below would pass on a thread that never reached
+    // its critical-section call — masking the race this test exists to pin.
+    AtomicReference<Throwable> write1Error = new AtomicReference<>();
+    AtomicReference<Throwable> write2Error = new AtomicReference<>();
 
     Thread write1 =
         new Thread(
@@ -1505,11 +1620,13 @@ class CASFileCacheTest {
                 writeStreamObserver.write(blob);
                 writeStreamObserver.close();
               } catch (Exception e) {
-                // do nothing
+                // write completion races are expected here, matching the original test's
+                // tolerance of one path observing the write already done.
+              } catch (Throwable t) {
+                write1Error.set(t);
               }
             },
             "FirstRequest");
-    @SuppressWarnings("PMD.EmptyControlStatement")
     Thread write2 =
         new Thread(
             () -> {
@@ -1519,12 +1636,16 @@ class CASFileCacheTest {
                 writeStreamObserver.registerCallback();
                 writeStreamObserver.ownStream(); // this thread will get the ownership of stream
                 barrier.await(); // let both the threads get same write stream.
-                while (write1.getState() != WAITING)
-                  ; // wait for first request to go in wait state
+                // Wait for the first thread to actually park inside getOutput's wait()
+                // rather than racing on a thread-state probe with a fixed timeout. The
+                // observation is what the downstream assertion is anchored to.
+                awaitThreadState(write1, WAITING, SECONDS.toNanos(5));
                 writeStreamObserver.write(blob);
                 writeStreamObserver.close();
               } catch (Exception e) {
-                // do nothing
+                // see comment in write1.
+              } catch (Throwable t) {
+                write2Error.set(t);
               }
             },
             "SecondRequest");
@@ -1532,19 +1653,86 @@ class CASFileCacheTest {
     write2.start();
     barrier.await(); // let both the requests reach the critical section
 
-    // Wait for each write operation to complete, allowing a maximum of 100ms per write.
-    // Note: A 100ms wait time allowed 1000 * 8 successful test runs.
-    // In certain scenario, even this wait time may not be enough and test still be called flaky.
-    // But setting wait time 0 may cause test to wait forever (if there is issue in code) and the
-    // build might fail with timeout error.
-    write1.join(100);
-    write2.join(100);
+    // With the barrier handshake and the WAITING-state probe above, completion is
+    // deterministic; the long timeout exists only to surface a hung rendezvous as a
+    // distinct failure rather than a test runner timeout.
+    write1.join(SECONDS.toMillis(30));
+    write2.join(SECONDS.toMillis(30));
 
+    assertThat(write1Error.get()).isNull();
+    assertThat(write2Error.get()).isNull();
     assertThat(write1.getState()).isEqualTo(TERMINATED);
     assertThat(write2.getState()).isEqualTo(TERMINATED);
   }
 
+  private static void awaitThreadState(Thread t, Thread.State target, long timeoutNanos) {
+    long deadline = System.nanoTime() + timeoutNanos;
+    while (t.getState() != target) {
+      if (System.nanoTime() > deadline) {
+        throw new AssertionError(
+            "thread "
+                + t.getName()
+                + " did not reach state "
+                + target
+                + " within budget (current state: "
+                + t.getState()
+                + ")");
+      }
+      Thread.yield();
+    }
+  }
+
   // -- Block-aligned size tracking tests --
+
+  @Test
+  public void expireEntryShouldRemoveFromStorageWhenFallbackThrowsRuntimeException()
+      throws IOException, InterruptedException {
+    // expireEntryFallback runs BEFORE safeStorageRemoval. A RuntimeException from
+    // delegate.getWrite (anything other than EntryLimitException, which is the only
+    // checked-caught throw) used to escape past safeStorageRemoval, so the entry
+    // strands in storage as a permanent zombie: state=EVICTED, file on disk,
+    // unevictable + unacquirable. The fix wraps the fallback+invalidateWrite call in
+    // log-and-continue so storage cleanup runs unconditionally. Pin the behavior by
+    // forcing the fallback to throw RuntimeException and asserting the evicted entry
+    // is gone from both storage and disk.
+    byte[] data1 = new byte[22000]; // on-disk: 24576 = maxSizeInBytes
+    Arrays.fill(data1, (byte) 1);
+    ByteString blob1 = ByteString.copyFrom(data1);
+    Digest digest1 = DIGEST_UTIL.compute(blob1);
+    blobs.put(digest1, blob1);
+    Path path1 = fileCache.put(digest1, false).path();
+    decrementReference(path1);
+    String key1 = path1.getFileName().toString();
+    assertThat(storage.containsKey(key1)).isTrue();
+
+    // Reconfigure delegate.getWrite to throw a RuntimeException (not the
+    // EntryLimitException expireEntryFallback explicitly catches). Without the fix,
+    // this would escape expireEntry's body before safeStorageRemoval. Use doThrow so
+    // the override doesn't reset the other stubs (newInput/findMissingBlobs) the put
+    // path needs.
+    doThrow(new RuntimeException("injected fallback failure"))
+        .when(delegate)
+        .getWrite(
+            any(Compressor.Value.class),
+            any(Digest.class),
+            any(UUID.class),
+            any(RequestMetadata.class));
+
+    // Second put triggers eviction of blob1.
+    byte[] data2 = new byte[100];
+    Arrays.fill(data2, (byte) 2);
+    ByteString blob2 = ByteString.copyFrom(data2);
+    Digest digest2 = DIGEST_UTIL.compute(blob2);
+    blobs.put(digest2, blob2);
+    Path path2 = fileCache.put(digest2, false).path();
+    decrementReference(path2);
+
+    // Eviction must have cleaned up storage despite the fallback throw.
+    assertThat(storage.containsKey(key1)).isFalse();
+    assertThat(Files.exists(path1)).isFalse();
+    // The new entry made it in.
+    assertThat(storage.containsKey(path2.getFileName().toString())).isTrue();
+  }
 
   @Test
   public void evictionTriggersAtBlockAlignedThreshold() throws IOException, InterruptedException {
@@ -1633,6 +1821,873 @@ class CASFileCacheTest {
     Path path = smallEntryCache.put(digest, false).path();
     assertThat(Files.exists(path)).isTrue();
     assertThat(smallEntryCache.size()).isEqualTo(estimateSizeOnDisk(1500));
+  }
+
+  // Entry state machine and atomic refcount tests live in EntryTest — the sentinel-entry
+  // tests below stay here because they need the cache's header sentinel via the test fixture.
+
+  @Test
+  public void sentinelEntryRefcountOperationsShouldThrow() {
+    // The LRU header is a SentinelEntry; it must never participate in refcount/state
+    // transitions. A regression that let the sentinel be acquired/released/evicted would
+    // corrupt the LRU's header invariant. Pin each override via the fileCache's header.
+    Entry sentinel = fileCache.headerForTesting();
+    assertThrows(UnsupportedOperationException.class, sentinel::tryAcquire);
+    assertThrows(UnsupportedOperationException.class, sentinel::release);
+    assertThrows(UnsupportedOperationException.class, sentinel::tryEvict);
+    assertThrows(UnsupportedOperationException.class, sentinel::completeEviction);
+    assertThrows(UnsupportedOperationException.class, sentinel::unlink);
+    assertThrows(UnsupportedOperationException.class, () -> sentinel.recordAccess(sentinel));
+    // isEvictable returns false unconditionally; not an exception, but pin the contract.
+    assertThat(sentinel.isEvictable()).isFalse();
+  }
+
+  @Test
+  public void sentinelEntryShouldNotSatisfyPlaceholderPredicate() {
+    // SentinelEntry inherits the parent's no-arg Entry() constructor which sets
+    // refCount=-1, so the inherited isPlaceholder() (refCount < 0) would otherwise be
+    // true. The header is the LRU anchor, not the STARTING/STOPPED dummy returned by
+    // getEntry() — a future change that exposes the header through getEntry() must not
+    // have it pass isPlaceholder() and bypass the real-entry checks downstream.
+    assertThat(fileCache.headerForTesting().isPlaceholder()).isFalse();
+  }
+
+  @Test
+  public void refcountedInputStreamShouldReleaseRefcountWhenInnerCloseThrows() throws Exception {
+    // The release-on-close discipline must hold even when the wrapped stream's close()
+    // throws — a regression that ran releaseRef BEFORE super.close() or that propagated
+    // the exception without entering the finally would leak refcounts on every failed
+    // close. RefcountedInputStream uses try/finally so this can't happen — pin it.
+    AtomicBoolean released = new AtomicBoolean(false);
+    InputStream throwingClose =
+        new InputStream() {
+          @Override
+          public int read() {
+            return -1;
+          }
+
+          @Override
+          public void close() throws IOException {
+            throw new IOException("close failure");
+          }
+        };
+    RefcountedInputStream wrapper =
+        new RefcountedInputStream(throwingClose, () -> released.set(true));
+    IOException thrown = null;
+    try {
+      wrapper.close();
+    } catch (IOException ioe) {
+      thrown = ioe;
+    }
+    assertThat(thrown).isNotNull();
+    assertThat(thrown).hasMessageThat().contains("close failure");
+    // The refcount must have been released regardless of the inner close failure.
+    assertThat(released.get()).isTrue();
+    // Second close must be a no-op (idempotent release).
+    released.set(false);
+    try {
+      wrapper.close();
+    } catch (IOException ignored) {
+      // inner close throws again; we only care that releaseRef did not re-fire.
+    }
+    assertThat(released.get()).isFalse();
+  }
+
+  @Test
+  public void refcountedInputStreamShouldReleaseRefcountWhenInnerCloseThrowsRuntimeException()
+      throws Exception {
+    // A wrapped stream's close() may throw a RuntimeException (e.g. JNI unwind from a
+    // ZstdCompressingInputStream or any assertion in a guava-style invariant). Before the
+    // fix, only IOException was caught — a RuntimeException escaped the try block and
+    // skipped the closed.compareAndSet release path, pinning the Entry LIVE permanently.
+    // The fix catches Throwable on super.close() so the refcount discipline holds.
+    AtomicBoolean released = new AtomicBoolean(false);
+    RuntimeException innerThrow = new RuntimeException("native unwind");
+    InputStream throwingClose =
+        new InputStream() {
+          @Override
+          public int read() {
+            return -1;
+          }
+
+          @Override
+          public void close() {
+            throw innerThrow;
+          }
+        };
+    RefcountedInputStream wrapper =
+        new RefcountedInputStream(throwingClose, () -> released.set(true));
+    RuntimeException thrown = null;
+    try {
+      wrapper.close();
+    } catch (RuntimeException re) {
+      thrown = re;
+    }
+    assertThat(thrown).isSameInstanceAs(innerThrow);
+    // The release ran despite the non-IOException throw.
+    assertThat(released.get()).isTrue();
+    // Second close is idempotent: releaseRef must not re-fire even though the inner
+    // close still throws.
+    released.set(false);
+    try {
+      wrapper.close();
+    } catch (RuntimeException ignored) {
+      // inner close throws again; we only care that releaseRef did not re-fire.
+    }
+    assertThat(released.get()).isFalse();
+  }
+
+  @Test
+  @SuppressWarnings("GuardedBy")
+  public void evictionShouldDischargeExactlyOnceWhenDirectoryExpirationFails() throws Exception {
+    // Cluster F/G regression pin: dischargeEntry calls discharge() and then rethrows
+    // a directory-expiration failure. Without setting discharged=true BEFORE unlinkEntry,
+    // the caller's !completed finally would observe discharged=false and decrement
+    // totalBytes a second time — recreating the useless-eviction-loop dynamic Phase 1
+    // was written to eliminate.
+    //
+    // Build a custom CFC whose unlinkAndExpireDirectories returns a failed future,
+    // then trigger the failure path via referenceIfExists on an entry whose file no
+    // longer exists. Assert that totalBytes returns to its pre-eviction value (single
+    // discharge), not a negative drift (double discharge).
+    ConcurrentMap<String, Entry> failingStorage = Maps.newConcurrentMap();
+    Path failingRoot = root.resolveSibling("failing-cache");
+    DirectoryEntryCFC failingCache =
+        new DirectoryEntryCFC(
+            failingRoot,
+            /* maxSizeInBytes= */ 24576,
+            /* maxEntrySizeInBytes= */ 24576,
+            /* hexBucketLevels= */ 1,
+            expireService,
+            /* accessRecorder= */ directExecutor(),
+            failingStorage,
+            /* zstdBufferPool= */ null,
+            onPut,
+            onExpire,
+            delegate,
+            /* delegateSkipLoad= */ false,
+            (compressor, digest, offset) -> {
+              throw new NoSuchFileException("not used");
+            }) {
+          @Override
+          protected List<ListenableFuture<Void>> unlinkAndExpireDirectories(
+              Entry entry, ExecutorService service) {
+            return ImmutableList.of(
+                Futures.immediateFailedFuture(new IOException("injected expiration failure")));
+          }
+        };
+    failingCache.initializeRootDirectory();
+    failingCache.setBlockSizeForTesting(TEST_BLOCK_SIZE);
+
+    // Synthesize one unreferenced entry: orphan + linkUnreferenced under lruLock, plus
+    // totalBytes += entry.size. existsDeadline starts in the past so entryExists() goes
+    // straight to Files.exists (which returns false: the file was never created).
+    // Use a digest-shaped key so HexBucketEntryPathStrategy's hex-prefix regex passes.
+    ByteString syntheticContent = ByteString.copyFromUtf8("synthetic-blob-content");
+    Digest syntheticDigest = DIGEST_UTIL.compute(syntheticContent);
+    String key = CASFileCache.getKey(syntheticDigest, /* isExecutable= */ false);
+    long size = 4096L;
+    Entry e = Entry.orphan(key, size, Deadline.after(-1, SECONDS));
+    failingStorage.put(key, e);
+    failingCache.setSizeInBytesForTesting(size);
+    failingCache.lruLockForTesting().lock();
+    try {
+      failingCache.linkUnreferenced(e);
+    } finally {
+      failingCache.lruLockForTesting().unlock();
+    }
+    assertThat(e.isLinked()).isTrue();
+    assertThat(failingCache.size()).isEqualTo(size);
+    long unreferencedBefore = failingCache.unreferencedEntryCount();
+
+    IOException thrown = null;
+    try {
+      failingCache.referenceIfExists(key);
+    } catch (IOException ex) {
+      thrown = ex;
+    }
+
+    assertThat(thrown).isNotNull();
+    // The expirationException is wrapped as IOException via unlinkEntry's catch.
+    assertThat(thrown).hasCauseThat().hasMessageThat().contains("injected expiration failure");
+    // Single discharge: totalBytes back to zero, not negative. Without the fix, this
+    // would be -size because dischargeEntry's internal discharge AND the finally's
+    // discharge would both run.
+    assertThat(failingCache.size()).isEqualTo(0L);
+    assertThat(failingStorage.containsKey(key)).isFalse();
+    assertThat(e.state()).isEqualTo(Entry.State.EVICTED);
+    assertThat(e.isLinked()).isFalse();
+    assertThat(failingCache.unreferencedEntryCount()).isEqualTo(unreferencedBefore - 1);
+  }
+
+  @Test
+  @SuppressWarnings("GuardedBy")
+  public void linkUnreferencedShouldRefuseReferencedEntry() throws Exception {
+    // Race-safety pin: linkUnreferenced must observe refCount() == 0 under lruLock
+    // before linking, so a release-then-acquire race (e.release() commits 1->0 outside
+    // lruLock, then a concurrent tryAcquire bumps to 1 before the batched
+    // linkUnreferenced runs) does not publish a referenced entry onto the LRU tail.
+    Entry e = Entry.orphan("k", 7L, Deadline.after(10, SECONDS));
+    e.tryAcquire(); // simulate the racing acquirer winning the 0 -> 1 transition.
+    assertThat(e.refCount()).isEqualTo(1);
+
+    long unreferencedBefore = fileCache.unreferencedEntryCount();
+    fileCache.lruLockForTesting().lock();
+    try {
+      fileCache.linkUnreferenced(e);
+    } finally {
+      fileCache.lruLockForTesting().unlock();
+    }
+    // Must not have linked the referenced entry into the LRU. The unreferencedCount
+    // assertion catches a regression that incremented the counter unconditionally
+    // while still skipping the addBefore call — isLinked() alone would false-pass.
+    assertThat(e.isLinked()).isFalse();
+    assertThat(fileCache.unreferencedEntryCount()).isEqualTo(unreferencedBefore);
+  }
+
+  @Test
+  @SuppressWarnings("GuardedBy")
+  public void linkUnreferencedShouldRefuseNonLiveEntry() throws Exception {
+    // Pin the state-guard arm: an EVICTING entry has already been chosen as a victim;
+    // re-linking it would let waitForLastUnreferencedEntry pick the same Entry twice.
+    Entry e = Entry.orphan("k", 7L, Deadline.after(10, SECONDS));
+    assertThat(e.tryEvict()).isTrue();
+    assertThat(e.state()).isEqualTo(Entry.State.EVICTING);
+    assertThat(e.refCount()).isEqualTo(0);
+
+    fileCache.lruLockForTesting().lock();
+    try {
+      fileCache.linkUnreferenced(e);
+    } finally {
+      fileCache.lruLockForTesting().unlock();
+    }
+    assertThat(e.isLinked()).isFalse();
+  }
+
+  @Test
+  @SuppressWarnings("GuardedBy")
+  public void linkUnreferencedShouldRefuseAlreadyLinkedEntry() throws Exception {
+    // Pin the linkage-guard arm: a double-link corrupts the doubly-linked list and
+    // double-counts unreferencedCount. The first call publishes; the second must be
+    // a no-op even with state==LIVE && refCount==0.
+    Entry e = Entry.orphan("k", 7L, Deadline.after(10, SECONDS));
+    long before = fileCache.unreferencedEntryCount();
+    fileCache.lruLockForTesting().lock();
+    try {
+      fileCache.linkUnreferenced(e);
+      assertThat(e.isLinked()).isTrue();
+      assertThat(fileCache.unreferencedEntryCount()).isEqualTo(before + 1);
+
+      fileCache.linkUnreferenced(e);
+      assertThat(e.isLinked()).isTrue();
+      assertThat(fileCache.unreferencedEntryCount()).isEqualTo(before + 1);
+    } finally {
+      fileCache.lruLockForTesting().unlock();
+    }
+  }
+
+  @Test
+  @SuppressWarnings("GuardedBy")
+  public void unlinkReferencedShouldBeNoOpOnUnlinkedEntry() throws Exception {
+    // Pin the Cluster E NPE fix: a release-then-acquire race can leave an entry with
+    // refCount==0 && !isLinked() (linkUnreferenced's recheck skipped publication
+    // because a concurrent tryAcquire bumped refCount back to 1, then released).
+    // tryEvict succeeds on such an entry; the subclass unlinkAndExpireDirectories
+    // override routes through unlinkReferenced, which MUST gate on isLinked() so
+    // entry.unlink() does not NPE on null before/after links.
+    Entry e = Entry.orphan("k", 7L, Deadline.after(10, SECONDS));
+    assertThat(e.isLinked()).isFalse();
+    long unreferencedBefore = fileCache.unreferencedEntryCount();
+
+    fileCache.lruLockForTesting().lock();
+    try {
+      fileCache.unlinkReferenced(e); // must not throw, must not decrement.
+    } finally {
+      fileCache.lruLockForTesting().unlock();
+    }
+
+    assertThat(e.isLinked()).isFalse();
+    assertThat(fileCache.unreferencedEntryCount()).isEqualTo(unreferencedBefore);
+  }
+
+  @Test
+  public void concurrentAcquireReleaseShouldConvergeToInitialRefCount() throws Exception {
+    Entry e = new Entry("k", 7L, Deadline.after(10, SECONDS));
+    int threadCount = 16;
+    int iterationsPerThread = 5000;
+    CyclicBarrier start = new CyclicBarrier(threadCount);
+    List<Thread> threads = new ArrayList<>();
+    AtomicReference<Throwable> error = new AtomicReference<>();
+    // Tracking the sum of previous-refcount values + final 1->0 transitions catches
+    // off-by-one drift the final-state check alone can miss.
+    LongAdder previousSum = new LongAdder();
+    LongAdder acquireCount = new LongAdder();
+    LongAdder finalOneTransitions = new LongAdder();
+    for (int i = 0; i < threadCount; i++) {
+      Thread t =
+          new Thread(
+              () -> {
+                try {
+                  start.await();
+                  for (int j = 0; j < iterationsPerThread; j++) {
+                    int prev = e.tryAcquire();
+                    assertThat(prev).isAtLeast(1); // initial refcount is 1, never EVICTING
+                    previousSum.add(prev);
+                    acquireCount.increment();
+                    boolean wasFinal = e.release();
+                    if (wasFinal) {
+                      finalOneTransitions.increment();
+                    }
+                  }
+                } catch (Throwable th) {
+                  error.set(th);
+                }
+              });
+      // daemon so a stuck worker doesn't keep the JVM alive past test failure.
+      t.setDaemon(true);
+      threads.add(t);
+    }
+    for (Thread t : threads) {
+      t.start();
+    }
+    for (Thread t : threads) {
+      t.join(SECONDS.toMillis(30));
+      if (t.isAlive()) {
+        // Interrupt every worker before fail so the other surviving threads don't keep
+        // hammering the entry through tearDown and cascade noise into subsequent tests.
+        for (Thread other : threads) {
+          other.interrupt();
+        }
+        fail("worker thread did not terminate within 30s");
+      }
+    }
+    assertThat(error.get()).isNull();
+    // After all pairs settle, only the constructor's initial reference remains.
+    assertThat(e.refCount()).isEqualTo(1);
+    assertThat(e.state()).isEqualTo(Entry.State.LIVE);
+    // Total acquires must be threadCount * iterationsPerThread.
+    long totalAcquires = (long) threadCount * iterationsPerThread;
+    assertThat(acquireCount.sum()).isEqualTo(totalAcquires);
+    // Sum of previous-refcount values must be at least totalAcquires (each acquire
+    // observes refcount >= 1 because the constructor reference is held throughout).
+    assertThat(previousSum.sum()).isAtLeast(totalAcquires);
+    // Final 1 -> 0 transitions should never fire: every release happens while the
+    // constructor's reference (refCount = 1) is still held, so the minimum refcount
+    // observed by any release is 2 -> 1. A regression that double-released would
+    // make this counter positive.
+    assertThat(finalOneTransitions.sum()).isEqualTo(0);
+  }
+
+  @Test
+  public void referenceIfExistsShouldUseAtomicAcquireAndReturnTrueOnSuccess() throws Exception {
+    ByteString content = ByteString.copyFromUtf8("ref-check");
+    Digest digest = DIGEST_UTIL.compute(content);
+    blobs.put(digest, content);
+    Path path = fileCache.put(digest, false).path();
+    decrementReference(path); // drop to refCount 0 so the entry is on the LRU.
+    String key = path.getFileName().toString();
+    Entry e = storage.get(key);
+    assertThat(e.refCount()).isEqualTo(0);
+    assertThat(e.isLinked()).isTrue();
+
+    // Call the protected referenceIfExists directly (same-package access). This pins
+    // the atomic 0 -> 1 revive: tryAcquire success + unlinkReferenced under lruLock.
+    boolean acquired = fileCache.referenceIfExists(key);
+    assertThat(acquired).isTrue();
+    assertThat(e.refCount()).isEqualTo(1);
+    // After a 0 -> 1 revival the entry must be unlinked from the LRU.
+    assertThat(e.isLinked()).isFalse();
+    decrementReference(path);
+  }
+
+  @Test
+  public void referenceIfExistsConcurrentAcquiresShouldUnlinkExactlyOnce() throws Exception {
+    // Atomicity pin: many concurrent referenceIfExists calls on a refCount==0 entry
+    // must all succeed (the entry is LIVE), but exactly one acquirer wins the 0->1
+    // transition and drives the unlink. A regression to non-atomic check-then-increment
+    // could let two threads both observe previous==0 and both attempt the unlink,
+    // double-decrementing unreferencedCount. The single-threaded happy-path test
+    // above cannot distinguish atomic from non-atomic on this dimension.
+    ByteString content = ByteString.copyFromUtf8("ref-atomic-concurrent");
+    Digest digest = DIGEST_UTIL.compute(content);
+    blobs.put(digest, content);
+    Path path = fileCache.put(digest, false).path();
+    decrementReference(path);
+    String key = path.getFileName().toString();
+    Entry e = storage.get(key);
+    assertThat(e.refCount()).isEqualTo(0);
+    assertThat(e.isLinked()).isTrue();
+    long unreferencedBefore = fileCache.unreferencedEntryCount();
+
+    int threadCount = 16;
+    CyclicBarrier start = new CyclicBarrier(threadCount);
+    AtomicInteger successCount = new AtomicInteger();
+    AtomicReference<Throwable> error = new AtomicReference<>();
+    List<Thread> threads = new ArrayList<>();
+    for (int i = 0; i < threadCount; i++) {
+      Thread t =
+          new Thread(
+              () -> {
+                try {
+                  start.await();
+                  if (fileCache.referenceIfExists(key)) {
+                    successCount.incrementAndGet();
+                  }
+                } catch (Throwable th) {
+                  error.compareAndSet(null, th);
+                }
+              });
+      t.setDaemon(true);
+      threads.add(t);
+    }
+    for (Thread t : threads) {
+      t.start();
+    }
+    for (Thread t : threads) {
+      t.join(SECONDS.toMillis(10));
+      if (t.isAlive()) {
+        for (Thread other : threads) {
+          other.interrupt();
+        }
+        fail("worker thread did not terminate within 10s");
+      }
+    }
+
+    assertThat(error.get()).isNull();
+    assertThat(successCount.get()).isEqualTo(threadCount);
+    assertThat(e.refCount()).isEqualTo(threadCount);
+    // The 0 -> 1 winner drove the unlink; all subsequent acquirers found
+    // !isLinked. unreferencedCount drops by exactly one — the signature of a single
+    // unlink, not multiple competing unlinks.
+    assertThat(e.isLinked()).isFalse();
+    assertThat(fileCache.unreferencedEntryCount()).isEqualTo(unreferencedBefore - 1);
+
+    // Drain references so the entry is evictable for tearDown.
+    for (int i = 0; i < threadCount; i++) {
+      decrementReference(path);
+    }
+  }
+
+  @Test
+  public void lockFreeReadersShouldNotBlockEvictionLock() throws Exception {
+    // Populate one entry. While a thread holds lruLock for an extended period, the public
+    // metric readers (size(), getEvictedCount(), getEvictedSize(), entryCount()) must
+    // not enqueue on the lock. A regression that re-introduced synchronized() on a
+    // reader would show up as the reader thread queueing on lruLock while the holder
+    // sits on it — `lock.getQueueLength() > 0` is the binary check, not wall-clock.
+    //
+    // The readers run on a separate thread so a regression manifests as a bounded
+    // join timeout with a queue-length-observed-non-zero diagnostic rather than the
+    // test thread blocking inside size() until bazel's outer timeout (no diagnostic).
+    ByteString content = ByteString.copyFromUtf8("metric-read");
+    Digest digest = DIGEST_UTIL.compute(content);
+    blobs.put(digest, content);
+    fileCache.put(digest, false);
+
+    java.util.concurrent.locks.ReentrantLock lock = fileCache.lruLockForTesting();
+    CountDownLatch lockHeld = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    CountDownLatch readsDone = new CountDownLatch(1);
+    AtomicReference<Throwable> readerError = new AtomicReference<>();
+    Thread holder =
+        new Thread(
+            () -> {
+              lock.lock();
+              try {
+                lockHeld.countDown();
+                release.await();
+              } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+              } finally {
+                lock.unlock();
+              }
+            },
+            "lru-lock-holder");
+    Thread reader =
+        new Thread(
+            () -> {
+              try {
+                for (int i = 0; i < 200; i++) {
+                  fileCache.size();
+                  fileCache.entryCount();
+                  fileCache.getEvictedCount();
+                  fileCache.getEvictedSize();
+                }
+              } catch (Throwable th) {
+                readerError.compareAndSet(null, th);
+              } finally {
+                readsDone.countDown();
+              }
+            },
+            "lock-free-reader");
+    reader.setDaemon(true);
+    holder.setDaemon(true);
+    holder.start();
+    try {
+      assertThat(lockHeld.await(5, SECONDS)).isTrue();
+      reader.start();
+      // Poll the lock's queue length while the reader runs. A regression that made
+      // any reader acquire lruLock would park the reader thread on this lock, and
+      // getQueueLength would observe it before the await(1ms) returns true.
+      int maxQueueLengthObserved = 0;
+      long deadlineNanos = System.nanoTime() + SECONDS.toNanos(5);
+      while (!readsDone.await(1, MILLISECONDS)) {
+        int q = lock.getQueueLength();
+        if (q > maxQueueLengthObserved) {
+          maxQueueLengthObserved = q;
+        }
+        if (System.nanoTime() > deadlineNanos) {
+          break;
+        }
+      }
+      assertThat(readerError.get()).isNull();
+      assertWithMessage("reader did not complete within 5s — likely queued on lruLock")
+          .that(readsDone.getCount())
+          .isEqualTo(0);
+      assertThat(maxQueueLengthObserved).isEqualTo(0);
+    } finally {
+      release.countDown();
+      holder.join(SECONDS.toMillis(5));
+      reader.join(SECONDS.toMillis(5));
+    }
+    assertThat(lock.getQueueLength()).isEqualTo(0);
+  }
+
+  @Test
+  public void newLocalInputShouldHoldRefcountAcrossOpenLifetime() throws Exception {
+    ByteString content = ByteString.copyFromUtf8("read-path-refcount");
+    Digest digest = DIGEST_UTIL.compute(content);
+    blobs.put(digest, content);
+    Path path = fileCache.put(digest, false).path();
+    decrementReference(path); // drop initial put refcount so the entry is evictable.
+
+    String key = path.getFileName().toString();
+    Entry e = storage.get(key);
+    assertThat(e.refCount()).isEqualTo(0);
+
+    InputStream in = fileCache.newInput(Compressor.Value.IDENTITY, digest, 0);
+    try {
+      // While the stream is open the entry must be held by exactly one reference and
+      // therefore unlinked from the LRU.
+      assertThat(e.refCount()).isEqualTo(1);
+      assertThat(e.isLinked()).isFalse();
+      // Read all bytes — the open fd survives even if eviction unlinks the file.
+      ByteString actual = ByteString.readFrom(in);
+      assertThat(actual).isEqualTo(content);
+    } finally {
+      in.close();
+    }
+    // After close the refcount returns to zero and the entry is back on the LRU.
+    assertThat(e.refCount()).isEqualTo(0);
+    assertThat(e.isLinked()).isTrue();
+  }
+
+  @Test
+  public void newLocalInputCloseShouldBeIdempotentForRefcountRelease() throws Exception {
+    ByteString content = ByteString.copyFromUtf8("close-idempotent");
+    Digest digest = DIGEST_UTIL.compute(content);
+    blobs.put(digest, content);
+    Path path = fileCache.put(digest, false).path();
+    decrementReference(path);
+
+    String key = path.getFileName().toString();
+    Entry e = storage.get(key);
+
+    InputStream in = fileCache.newInput(Compressor.Value.IDENTITY, digest, 0);
+    assertThat(e.refCount()).isEqualTo(1);
+    in.close();
+    assertThat(e.refCount()).isEqualTo(0);
+    in.close(); // second close must not double-release.
+    assertThat(e.refCount()).isEqualTo(0);
+  }
+
+  @Test
+  public void newLocalInputUnsupportedCompressorShouldNotLeakRefcount() throws Exception {
+    // Pin the Cluster D validation hoist: an unsupported Compressor.Value must
+    // fail with IllegalArgumentException BEFORE any tryAcquire runs. Without the
+    // hoist, the inner compressorInputStream's checkArgument would throw past the
+    // outer IOException catch, leaving the entry pinned LIVE with no live holder —
+    // unevictable and unacquirable forever.
+    ByteString content = ByteString.copyFromUtf8("bad-compressor");
+    Digest digest = DIGEST_UTIL.compute(content);
+    blobs.put(digest, content);
+    Path path = fileCache.put(digest, false).path();
+    decrementReference(path); // drop initial put refcount so the entry is at 0.
+
+    String key = path.getFileName().toString();
+    Entry e = storage.get(key);
+    assertThat(e.refCount()).isEqualTo(0);
+    assertThat(e.state()).isEqualTo(Entry.State.LIVE);
+
+    try {
+      fileCache.newInput(Compressor.Value.DEFLATE, digest, 0);
+      fail("expected IllegalArgumentException for unsupported compressor");
+    } catch (IllegalArgumentException expected) {
+      // expected.
+    }
+
+    // Refcount unchanged: the validation rejected the call before tryAcquire ran.
+    // A leak here would manifest as refCount == 1, pinning the entry LIVE forever.
+    assertThat(e.refCount()).isEqualTo(0);
+    assertThat(e.state()).isEqualTo(Entry.State.LIVE);
+    assertThat(e.isLinked()).isTrue();
+  }
+
+  // Sequential acquirer/evictor outcomes are pinned in EntryTest. The A3 race-handling
+  // path (acquirer's state recheck after refCount increment, when the evictor's CAS landed
+  // mid-acquire) is not exercised by deterministic tests — it would require either a
+  // brute-force racing test or invasive test hooks on Entry's private state.
+
+  @Test
+  public void concurrentChargersShouldNotStallUnderSustainedPressure() throws Exception {
+    // Pin the 2026-04-13 incident pattern: pre-Phase-1, a thread holding the global
+    // synchronized(this) monitor across slow I/O wedged every other charger + reader,
+    // producing a 25-minute cluster-wide outage. The regression assertion is a fixed
+    // workload that must complete within a generous wall-clock budget: if any monitor
+    // wedges the hot path, the latch won't reach zero and we fail with a thread-dump.
+    // findDeadlockedThreads() distinguishes a literal deadlock from a slow stall.
+    //
+    // Pre-populate ALL digests into `blobs` up front so we never mutate the test's
+    // HashMap while concurrent fileCache.put threads read it.
+    final int chargerThreads = 4;
+    final int readerThreads = 2;
+    final int chargesPerThread = 200;
+    final int readsPerThread = 200;
+    final int readableCount = 4;
+
+    List<List<Digest>> chargerDigests = new ArrayList<>();
+    for (int t = 0; t < chargerThreads; t++) {
+      List<Digest> own = new ArrayList<>();
+      for (int s = 0; s < chargesPerThread; s++) {
+        // 30-byte content fits in one 4k block, so each put adds 4096 bytes to the
+        // 24576-byte cache; eviction kicks in after ~6 puts.
+        byte[] bytes = new byte[30];
+        bytes[0] = (byte) t;
+        bytes[1] = (byte) s;
+        bytes[2] = (byte) (s >>> 8);
+        ByteString content = ByteString.copyFrom(bytes);
+        Digest d = DIGEST_UTIL.compute(content);
+        blobs.put(d, content);
+        own.add(d);
+      }
+      chargerDigests.add(own);
+    }
+
+    List<Digest> readableDigests = new ArrayList<>();
+    for (int i = 0; i < readableCount; i++) {
+      byte[] bytes = new byte[10];
+      bytes[0] = (byte) (0x80 | i);
+      ByteString content = ByteString.copyFrom(bytes);
+      Digest d = DIGEST_UTIL.compute(content);
+      blobs.put(d, content);
+      Path p = fileCache.put(d, false).path();
+      decrementReference(p);
+      readableDigests.add(d);
+    }
+
+    AtomicReference<Throwable> error = new AtomicReference<>();
+    CountDownLatch done = new CountDownLatch(chargerThreads + readerThreads);
+    // Track successful reads so a regression that made every read silently fall into
+    // the NoSuchFileException branch (e.g. a refcount-pin bug that pinned readers'
+    // entries past their own decrement and made them evictable mid-read) would not
+    // pass this test with zero reads actually exercising the refcount-protected path.
+    LongAdder successfulReads = new LongAdder();
+    // Starting gate so all workers begin contending simultaneously — sequential
+    // Thread.start would let early threads finish their loops before late threads
+    // even begin, materially shrinking the contention window the test exists for.
+    CyclicBarrier start = new CyclicBarrier(chargerThreads + readerThreads);
+    List<Thread> threads = new ArrayList<>();
+    for (int t = 0; t < chargerThreads; t++) {
+      final List<Digest> myDigests = chargerDigests.get(t);
+      threads.add(
+          new Thread(
+              () -> {
+                try {
+                  start.await();
+                  for (int s = 0; s < chargesPerThread; s++) {
+                    Digest d = myDigests.get(s);
+                    Path p = fileCache.put(d, false).path();
+                    decrementReference(p);
+                  }
+                } catch (Throwable th) {
+                  error.compareAndSet(null, th);
+                } finally {
+                  done.countDown();
+                }
+              },
+              "charger-" + t));
+    }
+    for (int t = 0; t < readerThreads; t++) {
+      threads.add(
+          new Thread(
+              () -> {
+                try {
+                  start.await();
+                  for (int s = 0; s < readsPerThread; s++) {
+                    Digest d = readableDigests.get(s % readableDigests.size());
+                    try (InputStream in = fileCache.newInput(Compressor.Value.IDENTITY, d, 0)) {
+                      ByteStreams.exhaust(in);
+                      successfulReads.increment();
+                    } catch (NoSuchFileException nsfe) {
+                      // entry may have been evicted under pressure; expected.
+                    }
+                  }
+                } catch (Throwable th) {
+                  error.compareAndSet(null, th);
+                } finally {
+                  done.countDown();
+                }
+              },
+              "reader-" + t));
+    }
+    for (Thread t : threads) {
+      // Daemon so a stall doesn't keep the JVM alive past the test; the explicit
+      // interrupt on fail() below still bounds cleanup time within this test.
+      t.setDaemon(true);
+      t.start();
+    }
+    // Generous wall-clock budget: the workload completes in ~1-2s locally; 30s covers
+    // slow CI nodes. A timeout here is the deterministic signal that monitor
+    // wedging has regressed.
+    boolean finished = done.await(30, SECONDS);
+    if (!finished) {
+      ThreadMXBean tmx = ManagementFactory.getThreadMXBean();
+      long[] deadlocked = tmx.findDeadlockedThreads();
+      StringBuilder failure =
+          new StringBuilder(
+              "workload did not complete within 30s — this is the 2026-04-13 stall pattern\n");
+      if (deadlocked != null && deadlocked.length > 0) {
+        failure.append("findDeadlockedThreads reported ").append(deadlocked.length).append(":\n");
+        for (ThreadInfo info : tmx.getThreadInfo(deadlocked, true, true)) {
+          failure.append(info).append('\n');
+        }
+      } else {
+        failure.append("no literal deadlock detected; live-lock or held-too-long stall.\n");
+        for (Thread t : threads) {
+          failure.append(t.getName()).append(' ').append(t.getState()).append('\n');
+        }
+      }
+      // Surface any worker-side throwable that may have caused the stall by leaving
+      // other workers parked on the CyclicBarrier — without this, fail() would only
+      // report the timeout and hide the real cause.
+      Throwable workerError = error.get();
+      if (workerError != null) {
+        failure.append("worker error captured before stall: ").append(workerError).append('\n');
+      }
+      // Interrupt before fail() so the threads don't keep hammering fileCache while
+      // tearDown() shuts down the put service and wipes the root — subsequent tests
+      // would otherwise see cascading errors that obscure this stall.
+      for (Thread t : threads) {
+        t.interrupt();
+      }
+      fail(failure.toString());
+    }
+    for (Thread t : threads) {
+      t.join(SECONDS.toMillis(1));
+      assertThat(t.isAlive()).isFalse();
+    }
+    assertThat(error.get()).isNull();
+    // At least one read must have succeeded — otherwise a regression that made
+    // every read fall to NoSuchFileException (the eviction-during-read failure
+    // mode this test's read path exercises) would pass without ever exercising
+    // the refcount-protected newLocalInput happy path.
+    assertWithMessage("no reads succeeded — regression in read-path refcount discipline?")
+        .that(successfulReads.sum())
+        .isGreaterThan(0L);
+  }
+
+  @Test
+  @SuppressWarnings("GuardedBy")
+  public void unreferencedCountShouldMatchLruSizeAfterConcurrentPutRelease() throws Exception {
+    // Cluster A invariant pin: at quiescence, unreferencedCount must equal the number
+    // of entries actually on the LRU. The orphan/acquirer/evictor race had paths
+    // where the counter could drift (missed increment when linkUnreferenced refused
+    // a referenced entry; missed decrement when unlinkReferenced ran against an
+    // already-unlinked entry). Drift is invisible to throughput or stalls but
+    // corrupts size() reporting and eventually starves eviction.
+    //
+    // The workload pre-populates the shared digests, then hammers them through the
+    // referenceIfExists -> release -> linkUnreferenced path that Cluster A's race
+    // operates on. Without pre-population, a separate race in charge() between
+    // the optimistic totalBytes.add and storage.put trips waitForLastUnreferencedEntry
+    // before the new entry is published — not the invariant under test here.
+    final int workerThreads = 4;
+    final int opsPerThread = 200;
+    final int sharedKeyCount = 4;
+    List<Digest> sharedDigests = new ArrayList<>();
+    for (int i = 0; i < sharedKeyCount; i++) {
+      byte[] bytes = new byte[16];
+      bytes[0] = (byte) (0xA0 | i);
+      ByteString content = ByteString.copyFrom(bytes);
+      Digest d = DIGEST_UTIL.compute(content);
+      blobs.put(d, content);
+      sharedDigests.add(d);
+      Path p = fileCache.put(d, false).path();
+      decrementReference(p);
+    }
+
+    AtomicReference<Throwable> error = new AtomicReference<>();
+    CyclicBarrier start = new CyclicBarrier(workerThreads);
+    CountDownLatch done = new CountDownLatch(workerThreads);
+    List<Thread> workers = new ArrayList<>();
+    for (int t = 0; t < workerThreads; t++) {
+      workers.add(
+          new Thread(
+              () -> {
+                try {
+                  start.await();
+                  for (int i = 0; i < opsPerThread; i++) {
+                    Digest d = sharedDigests.get(i % sharedDigests.size());
+                    Path p = fileCache.put(d, false).path();
+                    decrementReference(p);
+                  }
+                } catch (Throwable th) {
+                  error.compareAndSet(null, th);
+                } finally {
+                  done.countDown();
+                }
+              },
+              "uref-worker-" + t));
+    }
+    for (Thread w : workers) {
+      w.setDaemon(true);
+      w.start();
+    }
+    boolean finished = done.await(30, SECONDS);
+    if (!finished) {
+      // Interrupt before fail() so workers don't keep hammering fileCache through
+      // tearDown() and cascade errors into subsequent tests — matching the
+      // Cluster F/G discipline established for the sibling stall-regression tests.
+      for (Thread w : workers) {
+        w.interrupt();
+      }
+      Throwable workerError = error.get();
+      fail(
+          "workload did not complete within 30s"
+              + (workerError != null ? "; worker error: " + workerError : ""));
+    }
+    for (Thread w : workers) {
+      w.join(SECONDS.toMillis(1));
+      assertThat(w.isAlive()).isFalse();
+    }
+    assertThat(error.get()).isNull();
+
+    // All decrementReference calls have completed → no held refcounts → every entry
+    // in storage must be on the LRU and unreferencedCount must agree.
+    fileCache.lruLockForTesting().lock();
+    try {
+      long onLru = 0;
+      Entry header = fileCache.headerForTesting();
+      for (Entry e = header.after; e != header; e = e.after) {
+        onLru++;
+        // Defense in depth: every LRU entry must be unreferenced and LIVE.
+        assertThat(e.refCount()).isEqualTo(0);
+        assertThat(e.state()).isEqualTo(Entry.State.LIVE);
+      }
+      assertThat(fileCache.unreferencedEntryCount()).isEqualTo(onLru);
+    } finally {
+      fileCache.lruLockForTesting().unlock();
+    }
   }
 
   static class ConcurrentWriteStreamObserver {
