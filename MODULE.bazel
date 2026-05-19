@@ -163,6 +163,7 @@ maven.install(
         "org.apache.tomcat:annotations-api:6.0.53",
         "org.bouncycastle:bcprov-jdk15on:1.70",
         "org.checkerframework:checker-qual:3.55.1",
+        "org.jctools:jctools-core-jdk11:4.0.6",
         "org.jetbrains:annotations:26.1.0",
         "org.jspecify:jspecify:1.0.0",
         "org.mockito:mockito-core:5.23.0",

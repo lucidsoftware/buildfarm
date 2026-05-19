@@ -332,6 +332,53 @@ public final class BuildfarmConfigs {
   }
 
   @VisibleForTesting
+  static void validateCasEvictorConfig(Cas storage) throws ConfigurationException {
+    int lowWatermarkPercent = storage.getLowWatermarkPercent();
+    int maxSizePercent = storage.getMaxSizePercent();
+    long maxSizeBytes = storage.getMaxSizeBytes();
+    // 0 is the auto-derive sentinel. The bound must match Worker.computeLowBytes' interpretation:
+    // in percent-mode (maxSizePercent > 0) both percentages share filesystem-total as their base,
+    // so the sweep target must stay below the hard cap (lowWatermarkPercent < maxSizePercent);
+    // in bytes-mode (maxSizePercent == 0) lowWatermarkPercent is a percent of the cap itself,
+    // so the upper bound is 100.
+    int upperBoundExclusive = maxSizePercent > 0 ? maxSizePercent : 100;
+    if (lowWatermarkPercent < 0 || lowWatermarkPercent >= upperBoundExclusive) {
+      throw new ConfigurationException(
+          "lowWatermarkPercent must be < "
+              + (maxSizePercent > 0 ? "maxSizePercent (" + maxSizePercent + ")" : "100")
+              + " (with 0 = auto-derive); got: "
+              + lowWatermarkPercent);
+    }
+    if (lowWatermarkPercent > 0 && maxSizePercent == 0 && maxSizeBytes == 0) {
+      throw new ConfigurationException(
+          "lowWatermarkPercent is set but neither maxSizeBytes nor maxSizePercent is configured;"
+              + " there is no cap to compute a watermark against");
+    }
+    long wakeBudgetMillis = storage.getEvictorWakeBudgetMillis();
+    // Floor at 1 ms so a misconfiguration cannot starve actual eviction work; cap at
+    // 1 s so a misconfiguration cannot wedge MPSC drain behind a long sweep.
+    if (wakeBudgetMillis < 1L || wakeBudgetMillis > 1000L) {
+      throw new ConfigurationException(
+          "evictorWakeBudgetMillis must be in [1, 1000]; got: " + wakeBudgetMillis);
+    }
+    long heartbeatMillis = storage.getEvictorIdleHeartbeatMillis();
+    if (heartbeatMillis < 100L || heartbeatMillis > 60_000L) {
+      throw new ConfigurationException(
+          "evictorIdleHeartbeatMillis must be in [100, 60000] (100 ms to 1 min); got: "
+              + heartbeatMillis);
+    }
+    if (wakeBudgetMillis >= heartbeatMillis) {
+      throw new ConfigurationException(
+          "evictorWakeBudgetMillis ("
+              + wakeBudgetMillis
+              + ") must be < evictorIdleHeartbeatMillis ("
+              + heartbeatMillis
+              + "); the heartbeat is the backstop for missed wake signals and must outlast a"
+              + " sweep");
+    }
+  }
+
+  @VisibleForTesting
   static void deriveCasStorage(Cas storage) throws ConfigurationException {
     validateCasStorageSizeConfig(storage);
     if (storage.getMaxSizeBytes() == 0) {
@@ -350,6 +397,7 @@ public final class BuildfarmConfigs {
       }
       log.info(String.format("CAS size changed to %d", storage.getMaxSizeBytes()));
     }
+    validateCasEvictorConfig(storage);
   }
 
   @SuppressWarnings("PMD.ConfusingArgumentToVarargsMethod")
