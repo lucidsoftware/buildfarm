@@ -136,11 +136,14 @@ class DirectoryEntryCFCTest {
     fileCache.initializeRootDirectory();
     // Force a known block size so tests are hermetic and don't depend on the host filesystem.
     fileCache.setBlockSizeForTesting(4096);
+    // Phase 2.1: start the evictor so eviction-triggering operations work in the fixture.
+    fileCache.evictorForTesting().start();
   }
 
   @After
   public void tearDown() throws IOException, InterruptedException {
     FileStore fileStore = Files.getFileStore(root);
+    fileCache.evictorForTesting().stop();
     if (!shutdownAndAwaitTermination(putService, 1, SECONDS)) {
       throw new RuntimeException("could not shut down put service");
     }

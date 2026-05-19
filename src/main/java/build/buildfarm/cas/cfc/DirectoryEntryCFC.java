@@ -63,7 +63,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.logging.Level;
-import javax.annotation.concurrent.GuardedBy;
 import lombok.extern.java.Log;
 import org.jspecify.annotations.Nullable;
 
@@ -101,6 +100,44 @@ public class DirectoryEntryCFC extends CASFileCache {
         externalInputStreamFactory);
   }
 
+  public DirectoryEntryCFC(
+      Path root,
+      long maxSizeInBytes,
+      long maxEntrySizeInBytes,
+      int hexBucketLevels,
+      ExecutorService expireService,
+      Executor accessRecorder,
+      ConcurrentMap<String, Entry> storage,
+      FixedBufferPool zstdBufferPool,
+      Consumer<Digest> onPut,
+      Consumer<Iterable<Digest>> onExpire,
+      @Nullable ContentAddressableStorage delegate,
+      boolean delegateSkipLoad,
+      InputStreamFactory externalInputStreamFactory,
+      long lowBytes,
+      long wakeBudgetNanos,
+      long idleHeartbeatNanos,
+      java.time.Clock clock) {
+    super(
+        root,
+        maxSizeInBytes,
+        maxEntrySizeInBytes,
+        hexBucketLevels,
+        expireService,
+        accessRecorder,
+        storage,
+        zstdBufferPool,
+        onPut,
+        onExpire,
+        delegate,
+        delegateSkipLoad,
+        externalInputStreamFactory,
+        lowBytes,
+        wakeBudgetNanos,
+        idleHeartbeatNanos,
+        clock);
+  }
+
   private void computeDirectory(Path path, ImmutableList.Builder<Path> invalidDirectories) {
     String key = path.getFileName().toString();
     try {
@@ -125,8 +162,11 @@ public class DirectoryEntryCFC extends CASFileCache {
             }
           });
       Entry e = Entry.orphan(key, blobSizeInBytes.get(), Deadline.after(10, HOURS));
-      // this is now a little gross
-      if (totalBytes.sum() + e.size > maxSizeInBytes
+      // Block-align e.size the same way charge() does so the admission check tests the bytes
+      // actually reserved below (estimateSizeOnDisk), not the raw aggregate — otherwise a
+      // directory could be admitted whose charged cost slightly exceeds the cap.
+      long diskSize = estimateSizeOnDisk(e.size, blockSize, /* isHardlink= */ false);
+      if (evictor.currentTotalBytes() + diskSize > maxSizeInBytes
           || e.size > maxEntrySizeInBytes
           || e.size == 0) {
         synchronized (invalidDirectories) {
@@ -134,13 +174,16 @@ public class DirectoryEntryCFC extends CASFileCache {
         }
       } else {
         storage.put(key, e);
-        totalBytes.add(estimateSizeOnDisk(e.size, blockSize, /* isHardlink= */ false));
-        lruLock.lock();
-        try {
-          linkUnreferenced(e);
-        } finally {
-          lruLock.unlock();
+        // Startup runs before the evictor thread starts, so the LRU is not yet under the
+        // evictor's single-writer contract. synchronized(header) serializes against other
+        // scan-thread linkages.
+        synchronized (header) {
+          if (!e.isLinked() && e.state() == Entry.State.LIVE && e.refCount() == 0) {
+            e.addBefore(header);
+            evictor.noteUnreferencedAtStartup();
+          }
         }
+        evictor.addBytesAtStartup(diskSize);
       }
     } catch (Exception e) {
       log.log(Level.SEVERE, "error processing directory " + path.toString(), e);
@@ -395,18 +438,14 @@ public class DirectoryEntryCFC extends CASFileCache {
     decrementInputReferences(Iterables.concat(inputFiles, directoryDigests));
   }
 
-  @GuardedBy("lruLock")
   @Override
   protected List<ListenableFuture<Void>> unlinkAndExpireDirectories(
       Entry entry, ExecutorService service) {
-    // Route through unlinkReferenced so the isLinked() gate applies: an entry whose
-    // linkUnreferenced was skipped (release-then-acquire race) can still be selected
-    // by tryEvict, and unlink() against !isLinked() would NPE.
-    unlinkReferenced(entry);
+    // The evictor has already detached this entry from the LRU before calling. No
+    // directory-table state to drain (DirectoryEntryCFC uses inline trees).
     if (entry.refCount() != 0) {
       log.log(Level.SEVERE, "removed referenced entry " + entry.key);
     }
-    // we have no expiration that can be triggered by an entry
     return ImmutableList.of(immediateFuture(null));
   }
 }

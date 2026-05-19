@@ -435,6 +435,9 @@ Unless specified, options are only relevant for FILESYSTEM type
 | maxSizePercent               | Integer (0-100), _0_          | Limit in percent of the _root_/_path_ underlying filesystem space for contents of files retained from CAS in the cache. Mutually exclusive with maxSizeBytes. 0 means not set. If both maxSizePercent and maxSizeBytes are 0, then maxSizePercent is used at 90%. |
 | fileDirectoriesIndexInMemory | boolean, _false_              | Determines if the file directories bidirectional mapping should be stored in memory or in sqlite                                                  |
 | skipLoad                     | boolean, _false_              | Determines if transient data on the worker should be loaded into CAS on worker startup (affects startup time)                                |
+| lowWatermarkPercent          | Integer, _0_                  | Eviction sweep target. The evictor sweeps until the cache drops to this watermark. In percent-mode (maxSizePercent set) it is a percent of the filesystem total; in bytes-mode (maxSizeBytes set) it is a percent of the cap. 0 auto-derives to 80% of the cap. |
+| evictorWakeBudgetMillis      | Integer, _50_                 | Wall-clock budget per evictor sweep wake; the evictor yields after roughly this many ms regardless of per-eviction cost. Must be in [1, 1000] and less than evictorIdleHeartbeatMillis. |
+| evictorIdleHeartbeatMillis   | Integer, _2000_               | Idle heartbeat for the evictor's wait; a backstop against missed wake signals. Must be in [100, 60000]. |
 | target                       | String, _null_                | For GRPC CAS type, target for external CAS endpoint                                                                                                |
 
 Example:

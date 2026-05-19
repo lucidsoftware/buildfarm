@@ -16,7 +16,6 @@ package build.buildfarm.cas.cfc;
 
 import static build.buildfarm.common.DigestUtil.OMITTED_DIGEST_FUNCTIONS;
 import static build.buildfarm.common.io.EvenMoreFiles.setReadOnlyPerms;
-import static build.buildfarm.common.io.Utils.getOrIOException;
 import static build.buildfarm.common.io.Utils.listDir;
 import static build.buildfarm.common.io.Utils.stat;
 import static com.google.common.base.Preconditions.checkArgument;
@@ -26,7 +25,6 @@ import static com.google.common.io.ByteStreams.nullOutputStream;
 import static com.google.common.util.concurrent.Futures.immediateFailedFuture;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
 import static com.google.common.util.concurrent.Futures.transformAsync;
-import static com.google.common.util.concurrent.Futures.whenAllComplete;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static com.google.common.util.concurrent.MoreExecutors.listeningDecorator;
 import static com.google.common.util.concurrent.MoreExecutors.newDirectExecutorService;
@@ -80,8 +78,6 @@ import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
 import com.google.common.cache.RemovalListener;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Iterables;
 import com.google.common.hash.HashingOutputStream;
 import com.google.common.io.ByteStreams;
 import com.google.common.util.concurrent.FutureCallback;
@@ -115,10 +111,10 @@ import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.AbstractMap;
-import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
@@ -133,14 +129,13 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.LongAdder;
-import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.logging.Level;
+import java.util.stream.Stream;
 import javax.annotation.concurrent.GuardedBy;
 import lombok.Getter;
 import lombok.extern.java.Log;
@@ -179,10 +174,10 @@ public abstract class CASFileCache implements ContentAddressableStorage {
   protected final ConcurrentMap<String, Entry> storage;
   private final Consumer<Digest> onPut;
   private final Consumer<Iterable<Digest>> onExpire;
-  private final Executor accessRecorder;
   private final ExecutorService expireService;
   private final LRUDB db = new TextLRUDB();
-  private volatile Deadline saveLRUAfter = Deadline.after(10, MINUTES);
+  // LRU snapshot file. Read on startup to seed the in-memory LRU; rewritten by the evictor on a
+  // periodic schedule and at shutdown.
   private final Path lru;
 
   private final FixedBufferPool zstdBufferPool;
@@ -209,10 +204,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
           .expireAfterAccess(1, HOURS)
           .removalListener(
               (RemovalListener<Digest, SettableFuture<Long>>)
-                  notification -> {
-                    // no effect if already done
-                    notification.getValue().setException(new IOException("write cancelled"));
-                  })
+                  notification -> cancelWriteFuture(notification.getValue()))
           .build(
               new CacheLoader<>() {
                 @SuppressWarnings("NullableProblems")
@@ -231,23 +223,18 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
   protected FileStore fileStore; // bound to root
   protected long blockSize = DEFAULT_BLOCK_SIZE;
-  // Eventually consistent; the eviction loop re-reads after each successful expiration.
-  protected final transient LongAdder totalBytes = new LongAdder();
+
+  // The LRU sentinel header is constructed once and handed to the Evictor; the evictor thread
+  // becomes its sole writer after start(). Startup scan populates the LRU before start() runs.
   protected final transient Entry header = new SentinelEntry();
-  protected final transient LongAdder unreferencedCount = new LongAdder();
+  protected final Evictor evictor;
 
   private State state = new State();
-
-  private final transient LongAdder removedBytes = new LongAdder();
-  private final transient LongAdder removedCount = new LongAdder();
-
-  protected final ReentrantLock lruLock = new ReentrantLock();
-  protected final Condition lruCondition = lruLock.newCondition();
 
   private Thread prometheusMetricsThread;
 
   public long size() {
-    return totalBytes.sum();
+    return evictor.currentTotalBytes();
   }
 
   public long maxSize() {
@@ -258,8 +245,14 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     return storage.size();
   }
 
+  /**
+   * Number of LIVE entries currently linked on the LRU. Most linked entries are unreferenced
+   * eviction candidates, but a concurrent acquire can temporarily leave a referenced entry linked;
+   * the sweep's refcount recheck still governs eviction. Best-effort operator-visibility metric;
+   * not consulted for any admission or capacity decision.
+   */
   public long unreferencedEntryCount() {
-    return unreferencedCount.sum();
+    return evictor.currentUnreferencedCount();
   }
 
   public long directoryStorageCount() {
@@ -267,21 +260,16 @@ public abstract class CASFileCache implements ContentAddressableStorage {
   }
 
   public int getEvictedCount() {
-    return (int) removedCount.sumThenReset();
+    return evictor.getEvictedCount();
   }
 
   public long getEvictedSize() {
-    return removedBytes.sumThenReset();
+    return evictor.getEvictedSize();
   }
 
   @VisibleForTesting
-  ReentrantLock lruLockForTesting() {
-    return lruLock;
-  }
-
-  @VisibleForTesting
-  Condition lruConditionForTesting() {
-    return lruCondition;
+  Evictor evictorForTesting() {
+    return evictor;
   }
 
   @VisibleForTesting
@@ -319,11 +307,65 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       @Nullable ContentAddressableStorage delegate,
       boolean delegateSkipLoad,
       InputStreamFactory externalInputStreamFactory) {
+    this(
+        root,
+        maxSizeInBytes,
+        maxEntrySizeInBytes,
+        hexBucketLevels,
+        expireService,
+        accessRecorder,
+        storage,
+        zstdBufferPool,
+        onPut,
+        onExpire,
+        delegate,
+        delegateSkipLoad,
+        externalInputStreamFactory,
+        /* lowBytes= */ 0, // sentinel; full-arg constructor fills in defaultLowBytes
+        Evictor.DEFAULT_WAKE_BUDGET_NANOS,
+        Evictor.DEFAULT_IDLE_HEARTBEAT_NANOS,
+        Clock.systemUTC());
+  }
+
+  /**
+   * Fallback low-watermark byte budget for direct constructor callers that pass {@code lowBytes <=
+   * 0}. Production callers go through {@code Worker.computeLowBytes}, which derives a percent-aware
+   * target; this 80% fallback is for tests and programmatic constructions without a {@link Cas}
+   * config in hand.
+   */
+  private static long defaultLowBytes(long maxSizeInBytes) {
+    return maxSizeInBytes * 80 / 100;
+  }
+
+  /**
+   * Full-arg constructor accepting evictor tunables explicitly. Used by tests that need to exercise
+   * specific watermarks / sweep budgets / heartbeats, and by the public constructor which fills in
+   * the defaults. {@code lowBytes <= 0} is the sentinel for "use {@link #defaultLowBytes(long)}";
+   * callers that have a Cas config with an unset {@code lowWatermarkPercent} pass 0 through to opt
+   * into the default.
+   */
+  public CASFileCache(
+      Path root,
+      long maxSizeInBytes,
+      long maxEntrySizeInBytes,
+      int hexBucketLevels,
+      ExecutorService expireService,
+      Executor accessRecorder,
+      ConcurrentMap<String, Entry> storage,
+      FixedBufferPool zstdBufferPool,
+      Consumer<Digest> onPut,
+      Consumer<Iterable<Digest>> onExpire,
+      @Nullable ContentAddressableStorage delegate,
+      boolean delegateSkipLoad,
+      InputStreamFactory externalInputStreamFactory,
+      long lowBytes,
+      long wakeBudgetNanos,
+      long idleHeartbeatNanos,
+      Clock clock) {
     this.root = root;
     this.maxSizeInBytes = maxSizeInBytes;
     this.maxEntrySizeInBytes = maxEntrySizeInBytes;
     this.expireService = expireService;
-    this.accessRecorder = accessRecorder;
     this.storage = storage;
     this.onPut = onPut;
     this.onExpire = onExpire;
@@ -333,6 +375,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         new EmptyInputStreamFactory(
             new FailoverInputStreamFactory(this::newTransparentInput, externalInputStreamFactory));
     this.zstdBufferPool = zstdBufferPool;
+    long effectiveLowBytes = lowBytes > 0 ? lowBytes : defaultLowBytes(maxSizeInBytes);
 
     lru = root.resolve("lru.txt");
 
@@ -354,6 +397,112 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     entryPathStrategy = new HexBucketEntryPathStrategy(root, hexBucketLevels);
 
     header.before = header.after = header;
+
+    this.evictor =
+        new Evictor(
+            new EvictorBackingImpl(),
+            expireService,
+            clock,
+            header,
+            maxSizeInBytes,
+            effectiveLowBytes,
+            wakeBudgetNanos,
+            idleHeartbeatNanos,
+            db,
+            lru);
+  }
+
+  /**
+   * Implementation of the {@link CasEvictorBacking} contract this cache provides to its evictor.
+   */
+  private final class EvictorBackingImpl implements CasEvictorBacking {
+    @Override
+    public @Nullable Entry lookupEntry(String key) {
+      Entry e = storage.get(key);
+      // The sentinel placeholder returned by getEntry() when state is STARTING/STOPPED is
+      // never published to MPSC queues, but a paranoid drain-side check costs nothing.
+      return (e instanceof SentinelEntry) ? null : e;
+    }
+
+    @Override
+    public @Nullable Entry safeStorageRemoval(String key) throws IOException {
+      return CASFileCache.this.safeStorageRemoval(key);
+    }
+
+    @Override
+    public void deleteExpiredKey(String key) throws IOException {
+      CASFileCache.this.deleteExpiredKey(key);
+    }
+
+    @Override
+    public void expireEntryFallback(String key, long size) {
+      FileEntryKey parsed = parseFileEntryKey(key, size);
+      if (parsed != null) {
+        CASFileCache.this.expireEntryFallback(parsed);
+      }
+    }
+
+    @Override
+    public void invalidateWriteForKey(String key, long size) {
+      FileEntryKey parsed = parseFileEntryKey(key, size);
+      if (parsed == null) {
+        return;
+      }
+      // Remove from writesInProgress synchronously so a post-eviction write cannot observe the
+      // stale completed future. The RemovalListener dispatches only listener completion off-thread.
+      invalidateWrite(parsed.digest());
+    }
+
+    @Override
+    public void restoreEntryAfterRaceLoss(String key, Entry replacement) {
+      CASFileCache.this.restoreEntryAfterRaceLoss(key, replacement);
+    }
+
+    @Override
+    public long onDiskSize(Entry entry) {
+      return estimateSizeOnDisk(entry.size, blockSize, /* isHardlink= */ false);
+    }
+
+    @Override
+    public void onEntryEvicted(Entry entry) {
+      // Drive any subclass-level directory cleanup (LegacyDirectoryCFC's directoriesIndex
+      // drain). The returned futures are best-effort: we kick them off and don't wait;
+      // they're shipped to expireService so the evictor sweep continues.
+      List<ListenableFuture<Void>> futures = unlinkAndExpireDirectories(entry, expireService);
+      for (ListenableFuture<Void> future : futures) {
+        future.addListener(
+            () -> {
+              try {
+                future.get();
+              } catch (Exception e) {
+                log.log(Level.WARNING, "directory expiration failed for " + entry.key, e);
+              }
+            },
+            expireService);
+      }
+    }
+
+    @Override
+    public void onDigestFullyExpired(String key, long size) {
+      FileEntryKey parsed = parseFileEntryKey(key, size);
+      if (parsed == null) {
+        // Unparseable key — best effort: increment the per-digest expiry counter only.
+        expiredKeyCounter.inc();
+        return;
+      }
+      // Duplicate-suppression: if the flipped-executable variant is still in storage, the
+      // digest is not yet fully expired and onExpire should NOT fire.
+      String otherKey = getKey(parsed.digest(), !parsed.isExecutable());
+      if (storage.containsKey(otherKey)) {
+        return;
+      }
+      expiredKeyCounter.inc();
+      try {
+        onExpire.accept(ImmutableList.of(parsed.digest()));
+      } catch (RuntimeException e) {
+        log.log(Level.WARNING, "onExpire callback threw for " + parsed.digest(), e);
+      }
+    }
   }
 
   protected static Digest keyToDigest(String key, long size, DigestUtil digestUtil)
@@ -450,81 +599,22 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     return false;
   }
 
-  private void saveLRU() {
-    List<SizeEntry> list;
-    lruLock.lock();
-    try {
-      list = lruSizeEntryList();
-    } finally {
-      lruLock.unlock();
-    }
-    try {
-      // synchronized(lru) serializes save() with db's commit ordering. Lock order is
-      // lruLock -> lru; the lruLock block above is closed before we acquire lru here.
-      synchronized (lru) {
-        db.save(list.iterator(), lru);
-      }
-    } catch (Exception e) {
-      log.log(Level.SEVERE, "error saving lru state", e);
-    }
-  }
-
-  /** Not reentrant, not thread safe */
-  private void maybeSaveLRU() {
-    if (saveLRUAfter == null || !saveLRUAfter.isExpired()) {
-      return;
-    }
-    saveLRUAfter = null;
-    expireService.execute(
-        () -> {
-          try {
-            saveLRU();
-          } finally {
-            saveLRUAfter = Deadline.after(10, MINUTES);
-          }
-        });
-  }
-
+  /**
+   * Forward access notifications to the evictor's lossy {@code accessEvents} queue. The evictor
+   * thread is the sole writer of the LRU, so a recordAccess from any other thread is just an MPSC
+   * offer. Drop-newest on full degrades recency only, never correctness.
+   *
+   * <p>The {@code Iterable} signature is permissive, so a mutable caller-owned collection could be
+   * iterated mid-mutation. Snapshot to an immutable list at the boundary — cheap on the small lists
+   * the call sites pass (a single key for {@code contains}, the found-keys list for {@code
+   * findMissingBlobs}).
+   */
   private void accessed(Iterable<String> keys) {
-    /* could also bucket these */
-    try {
-      accessRecorder.execute(
-          () -> {
-            recordAccess(keys);
-            maybeSaveLRU();
-          });
-    } catch (RejectedExecutionException e) {
-      log.log(Level.SEVERE, format("could not record access for %d keys", Iterables.size(keys)), e);
-    }
-  }
-
-  private void recordAccess(Iterable<String> keys) {
-    // Only entries currently on the LRU (refCount == 0) need to be re-positioned;
-    // referenced entries are a no-op. Filter outside the lock so a workload that
-    // accesses mostly-held tool digests skips the eviction lock entirely.
-    List<Entry> unreferenced = null;
-    for (String key : keys) {
-      Entry e = storage.get(key);
-      if (e != null && e.refCount() == 0) {
-        if (unreferenced == null) {
-          unreferenced = new ArrayList<>();
-        }
-        unreferenced.add(e);
-      }
-    }
-    if (unreferenced == null) {
+    ImmutableList<String> snapshot = ImmutableList.copyOf(keys);
+    if (snapshot.isEmpty()) {
       return;
     }
-    lruLock.lock();
-    try {
-      for (Entry e : unreferenced) {
-        if (e.recordAccess(header)) {
-          unreferencedCount.decrement();
-        }
-      }
-    } finally {
-      lruLock.unlock();
-    }
+    evictor.recordAccess(snapshot);
   }
 
   private boolean entryExists(Entry e) {
@@ -627,7 +717,6 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         compressor == Compressor.Value.IDENTITY || compressor == Compressor.Value.ZSTD,
         "unsupported compressor %s",
         compressor);
-    // branch here or above for STARTING
     log.log(Level.FINER, format("getting input stream for %s", DigestUtil.toString(digest)));
     boolean isExecutable = false;
     do {
@@ -642,14 +731,9 @@ public abstract class CASFileCache implements ContentAddressableStorage {
           e = null;
         } else {
           haveRefcount = true;
-          if (previous == 0) {
-            lruLock.lock();
-            try {
-              unlinkReferenced(e);
-            } finally {
-              lruLock.unlock();
-            }
-          }
+          // The acquirer does not unlink from the LRU; the evictor's sweep observes the
+          // bumped refcount via tryEvict's recheck and skips the entry. This preserves the
+          // evictor's single-writer ownership of the LRU list.
         }
       }
       if (e != null) {
@@ -688,7 +772,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
             // release or stream close — we make no attempt to clean up after an unrecoverable
             // error, since the JVM state is undefined.
             if (!(t instanceof IOException) && haveRefcount) {
-              releaseAndRelink(e);
+              releaseEntry(e);
               haveRefcount = false;
             }
             throw t;
@@ -703,102 +787,20 @@ public abstract class CASFileCache implements ContentAddressableStorage {
           }
 
           if (haveRefcount) {
-            // safeStorageRemoval needs refCount == 0 to discharge the entry.
-            releaseAndRelink(e);
+            releaseEntry(e);
             haveRefcount = false;
           }
 
           if (!(e instanceof SentinelEntry) && !placeholder) {
-            if (e.tryEvict()) {
-              // safeStorageRemoval / unlinkEntry can throw IOException; without the
-              // finally, a throw between tryEvict and completeEviction would strand
-              // the entry in EVICTING permanently. The !completed path also unlinks
-              // and discharges so a disk-pressure IOException does not leak bytes
-              // from totalBytes.
-              boolean discharged = false;
-              boolean completed = false;
-              try {
-                boolean removed = false;
-                lruLock.lock();
-                try {
-                  invalidateWrite(digest);
-                  Entry removedEntry = safeStorageRemoval(key);
-                  if (removedEntry == e) { // Intentional reference comparison
-                    // Set discharged before unlinkEntry: dischargeEntry's finally
-                    // guarantees discharge() always runs, but unlinkEntry can still
-                    // rethrow a directory-expiration failure past us. If we only set
-                    // discharged after the call, the outer finally would double-decrement
-                    // totalBytes on that path.
-                    discharged = true;
-                    unlinkEntry(removedEntry);
-                    removed = true;
-                  } else if (removedEntry != null) {
-                    log.severe(
-                        format(
-                            "nonexistent entry %s did not match last unreferenced entry,"
-                                + " restoring it",
-                            key));
-                    storage.put(key, removedEntry);
-                    // e was on the LRU and its bytes were charged, but storage now holds
-                    // a different Entry for this key. Without unlinking + discharging, e
-                    // strands on the LRU as EVICTED with its bytes permanently in
-                    // totalBytes — the resurrection branch in expireEntry would later
-                    // unlink but never discharge.
-                    unlinkReferenced(e);
-                    dischargeLocked(e.key, e.size);
-                    discharged = true;
-                  } else {
-                    // Defensive: per the protocol the tryEvict winner is the unique remover,
-                    // so safeStorageRemoval should always find e in storage. If it doesn't,
-                    // e's bytes remain in totalBytes and e is still on the LRU — discharge
-                    // here so accounting does not slow-leak under a crash-recovery or
-                    // corruption scenario.
-                    log.severe(
-                        format(
-                            "entry %s was already removed from storage before this evictor"
-                                + " could remove it, discharging",
-                            key));
-                    unlinkReferenced(e);
-                    dischargeLocked(e.key, e.size);
-                    discharged = true;
-                  }
-                } finally {
-                  lruLock.unlock();
-                }
-                e.completeEviction();
-                completed = true;
-                if (removed && isExecutable) {
-                  onExpire.accept(ImmutableList.of(digest));
-                }
-              } catch (IOException secondaryEx) {
-                // The eviction body's !completed finally already restored the entry's
-                // protocol state (unlinked, discharged, EVICTED). A fresh IOException
-                // here is typically a Files.move/createLink/delete failure under disk
-                // pressure. Letting it escape would replace the original "error opening"
-                // ioEx as the caller-visible exception and skip the isExecutable retry
-                // below. Suppress onto ioEx instead so the original diagnostic survives
-                // and the do-while loop still falls through to the alternative key.
-                ioEx.addSuppressed(secondaryEx);
-              } finally {
-                if (!completed) {
-                  lruLock.lock();
-                  try {
-                    unlinkReferenced(e);
-                    if (!discharged) {
-                      dischargeLocked(e.key, e.size);
-                    }
-                  } finally {
-                    lruLock.unlock();
-                  }
-                  e.completeEviction();
-                }
-              }
-            }
+            // Stale-on-disk recovery: file is gone but entry remains in storage. Drive the
+            // entry through the same eviction state machine the evictor uses, then continue.
+            // We hold no refcount here (released above), so tryEvict can succeed.
+            evictStaleEntry(e);
             e = null;
           }
-          // input.skip may have left a partially-read stream that we no longer hold a
-          // refcount on; the caller would receive bare data without the eviction
-          // discipline that the RefcountedInputStream wrapper provides.
+          // input.skip may have left a partially-read stream we no longer hold a refcount
+          // on; close it before returning so the caller doesn't get bare data outside the
+          // RefcountedInputStream wrapper.
           if (input != null) {
             try {
               input.close();
@@ -814,13 +816,13 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         if (input != null) {
           if (haveRefcount) {
             final Entry refEntry = e;
-            return new RefcountedInputStream(input, () -> releaseAndRelink(refEntry));
+            return new RefcountedInputStream(input, () -> releaseEntry(refEntry));
           }
           return input;
         }
       }
       if (haveRefcount) {
-        releaseAndRelink(e);
+        releaseEntry(e);
       }
       isExecutable = !isExecutable;
     } while (isExecutable);
@@ -828,54 +830,46 @@ public abstract class CASFileCache implements ContentAddressableStorage {
   }
 
   /**
-   * Append a now-unreferenced entry to the LRU tail. Skips when the entry is already linked, has
-   * been picked up by a concurrent evictor (non-LIVE), or has been re-acquired between the caller's
-   * refcount transition and this lock acquisition (refCount != 0). The refCount recheck under
-   * {@code lruLock} closes the release-then-acquire race where the caller's {@link Entry#release}
-   * hit 0 but a concurrent {@link Entry#tryAcquire} bumped the count back to 1 before this method
-   * ran — without the recheck we would publish a referenced entry onto the LRU tail.
+   * Drive an entry whose file is unexpectedly absent through the same eviction state machine the
+   * evictor uses. Used by {@link #newLocalInput} when {@code Files.newInputStream} throws {@link
+   * NoSuchFileException} on an entry whose existsDeadline has expired. The caller must hold no
+   * refcount on {@code e}.
    */
-  @GuardedBy("lruLock")
-  protected void linkUnreferenced(Entry e) {
-    if (!e.isLinked() && e.state() == Entry.State.LIVE && e.refCount() == 0) {
-      e.addBefore(header);
-      unreferencedCount.increment();
+  private void evictStaleEntry(Entry e) {
+    try {
+      evictor.offerStaleEntry(e);
+    } catch (InterruptedException ie) {
+      Thread.currentThread().interrupt();
+      log.log(Level.WARNING, "interrupted enqueueing stale entry " + e.key, ie);
+    } catch (IOException ioe) {
+      log.log(Level.WARNING, "failed enqueueing stale entry " + e.key, ioe);
     }
   }
 
   /**
-   * Detach a now-referenced entry from the LRU list. The decrement is conditional on actually
-   * performing the unlink: when the entry is not on the LRU (e.g. publication raced with this
-   * acquire, or the inline evictor's resurrection branch already pulled it), {@code
-   * unreferencedCount} was never incremented for it and decrementing here would drive the counter
-   * negative.
+   * Drop one refcount on {@code e}; on 1->0 transition, enqueue the entry into the evictor's
+   * insertion queue so it lands on the LRU. The caller must hold a real reference to {@code e} —
+   * looking up storage.get(key) at release time can return a different Entry inserted after the
+   * caller's tryAcquire, causing underflow on the replacement or a leak on the original.
+   *
+   * <p>The insertion queue is unbounded because this notification is must-not-lose: dropping the
+   * final release would leave a charged, unreferenced entry off the LRU.
    */
-  @GuardedBy("lruLock")
-  protected void unlinkReferenced(Entry e) {
-    if (e.isLinked()) {
-      e.unlink();
-      unreferencedCount.decrement();
-    }
-  }
-
-  /**
-   * Drop one refcount on {@code e}; if the release transitions 1 -> 0, append the entry to the LRU
-   * tail under {@link #lruLock}. The caller must hold a real reference to {@code e} — looking up
-   * storage.get(key) at release time can return a different Entry inserted after the caller's
-   * tryAcquire, causing underflow on the replacement or a leak on the original.
-   */
-  private void releaseAndRelink(Entry e) {
+  protected void releaseEntry(Entry e) {
     if (e.release()) {
-      lruLock.lock();
       try {
-        linkUnreferenced(e);
-        // signalAll because multiple chargers can be parked in waitForLastUnreferencedEntry
-        // simultaneously (await releases lruLock so they queue at park, not at lock). A
-        // single signal would wake only one waiter; the rest would stay parked until the
-        // next release, producing latency tails under fill pressure.
-        lruCondition.signalAll();
-      } finally {
-        lruLock.unlock();
+        evictor.offerInsertion(e);
+      } catch (InterruptedException ie) {
+        Thread.currentThread().interrupt();
+        log.log(
+            Level.WARNING,
+            "interrupted during entry release for " + e.key + "; entry may delay landing on LRU",
+            ie);
+      } catch (IOException ioe) {
+        log.log(
+            Level.SEVERE,
+            "failed to enqueue released entry for " + e.key + "; entry may leak from LRU",
+            ioe);
       }
     }
   }
@@ -1042,6 +1036,15 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
   void invalidateWrite(Digest digest) {
     writesInProgress.invalidate(digest);
+  }
+
+  private void cancelWriteFuture(SettableFuture<Long> future) {
+    Runnable cancel = () -> future.setException(new IOException("write cancelled"));
+    try {
+      expireService.execute(cancel);
+    } catch (RejectedExecutionException e) {
+      cancel.run();
+    }
   }
 
   // TODO stop ignoring onExpiration
@@ -1553,22 +1556,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
   @VisibleForTesting
   void setSizeInBytesForTesting(long sizeInBytes) {
-    totalBytes.reset();
-    totalBytes.add(sizeInBytes);
-  }
-
-  @SuppressWarnings({"PMD.CompareObjectsWithEquals"})
-  @GuardedBy("lruLock")
-  private List<SizeEntry> lruSizeEntryList() {
-    /**
-     * Steps the entries in order from oldest to newest access The order is used here to insert into
-     * the lru on load
-     */
-    List<SizeEntry> list = new ArrayList<>(storage.size());
-    for (Entry current = header.after; current != header; current = checkNotNull(current.after)) {
-      list.add(new SizeEntry(current.key, current.size));
-    }
-    return list;
+    evictor.setTotalBytesForTesting(sizeInBytes);
   }
 
   public void stop() throws IOException, InterruptedException {
@@ -1576,7 +1564,8 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       prometheusMetricsThread.interrupt();
       prometheusMetricsThread.join();
     }
-    saveLRU();
+    // Final snapshot + evictor thread drain happens inside Evictor.stop.
+    evictor.stop();
     state.stop();
   }
 
@@ -1601,11 +1590,22 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     return listeningDecorator(expireService)
         .submit(
             () -> {
+              // scanRoot mutates the LRU and totalBytes directly; the evictor's
+              // single-LRU-writer invariant only kicks in once the evictor is running. If a
+              // caller (e.g., a test fixture) eagerly started the evictor, stop it now and
+              // restart after the scan. In production start() runs exactly once with the
+              // evictor not yet started, and this stop() is a no-op.
+              try {
+                evictor.stop();
+              } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw ie;
+              }
               startRoutine(onStartPut, removeDirectoryService, skipLoad);
               synchronized (this) {
-                saveLRUAfter = Deadline.after(10, MINUTES);
                 checkState(state.setReadOnly(!writable));
               }
+              evictor.start();
               return null;
             });
   }
@@ -1734,7 +1734,28 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       }
     }
 
-    // TODO test for hex bins
+    // Sweep any orphan _removed files left behind by JVM crashes between
+    // safeStorageRemoval's rename and the async Files.delete actually running. The basename
+    // ends in "_removed" — no parseFileEntryKey path ever sees this suffix.
+    Set<Path> orphansToDelete = null;
+    for (Path file : files) {
+      if (file.getFileName().toString().endsWith("_removed")) {
+        if (orphansToDelete == null) {
+          orphansToDelete = new HashSet<>();
+        }
+        orphansToDelete.add(file);
+        deleteFilesBuilder.add(file);
+      }
+    }
+    if (orphansToDelete != null) {
+      files.removeAll(orphansToDelete);
+      log.log(
+          Level.INFO,
+          format(
+              "scanRoot: reclaiming %d orphan _removed files left by prior crashes",
+              orphansToDelete.size()));
+    }
+
     try (BufferedReader br = Files.newBufferedReader(lru)) {
       for (SizeEntry entry : db.entries(br)) {
         // ignore files in the lru that are not present in the directories
@@ -1743,16 +1764,14 @@ public abstract class CASFileCache implements ContentAddressableStorage {
           processRootFile(onStartPut, path, entry, computeDirsBuilder, deleteFilesBuilder);
         }
       }
-      // prevent the lru db from being processed -> removed in the purge below
-      files.remove(lru);
     } catch (NoSuchFileException e) {
       // ignore - LRU file doesn't exist, will scan all files
     } catch (Exception e) {
       // Handle corrupted LRU file - delete it and fall back to full scan
       log.log(
           Level.WARNING,
-          "LRU file is corrupted and cannot be parsed. Deleting corrupted LRU file and falling back"
-              + " to full cache scan.",
+          "LRU file is corrupted and cannot be parsed. Deleting corrupted LRU file and falling"
+              + " back to full cache scan.",
           e);
       try {
         Files.deleteIfExists(lru);
@@ -1762,6 +1781,25 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       }
       // Continue with full scan - all files will be processed in the loop below
     }
+    files.remove(lru);
+    // AtomicFileWriter tmp orphans (`lru.txt.tmp.<uuid>`) from JVM crashes live at the cache
+    // root. They're in `files` whenever hexBucketLevels == 0 (the bucket IS the root), so we
+    // also remove them from `files` to keep the pool below from re-processing them and the
+    // later async delete from racing with itself (NoSuchFileException SEVERE-log spam).
+    String snapshotTmpPrefix = lru.getFileName().toString() + ".tmp.";
+    Set<Path> tmpOrphans = new HashSet<>();
+    try (Stream<Path> rootStream = Files.list(root)) {
+      rootStream
+          .filter(p -> p.getFileName().toString().startsWith(snapshotTmpPrefix))
+          .forEach(tmpOrphans::add);
+    } catch (NoSuchFileException e) {
+      // Root dir doesn't exist yet — initializeRootDirectory will create it.
+    }
+    if (!tmpOrphans.isEmpty()) {
+      files.removeAll(tmpOrphans);
+      deleteFilesBuilder.addAll(tmpOrphans);
+    }
+
     for (Path file : files) {
       String basename = file.getFileName().toString();
       pool.execute(
@@ -1804,7 +1842,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     } else {
       // if cas is full or entry is oversized or empty, mark file for later deletion.
       long size = entry.size();
-      if (totalBytes.sum() + estimateSizeOnDisk(size, blockSize, /* isHardlink= */ false)
+      if (evictor.currentTotalBytes() + estimateSizeOnDisk(size, blockSize, /* isHardlink= */ false)
               > maxSizeInBytes
           || size > maxEntrySizeInBytes
           || size == 0) {
@@ -1826,13 +1864,19 @@ public abstract class CASFileCache implements ContentAddressableStorage {
           Entry e = Entry.orphan(key, size, Deadline.after(10, SECONDS));
           checkState(storage.put(e.key, e) == null, key);
           onStartPut.accept(fileEntryKey.digest());
-          totalBytes.add(estimateSizeOnDisk(size, blockSize, /* isHardlink= */ false));
-          lruLock.lock();
-          try {
-            linkUnreferenced(e);
-          } finally {
-            lruLock.unlock();
+          // Startup runs before the evictor thread starts, so the LRU is pre-seeded directly.
+          // Reserve the bytes through the evictor so its totalBytes accounting is correctly
+          // seeded before the loop begins. The parallel scan pool calls into here concurrently,
+          // so guard the LRU pointer mutation with a synchronized block on the header sentinel —
+          // pre-start contention on this lock is bounded by scan-pool size.
+          long diskSize = estimateSizeOnDisk(size, blockSize, /* isHardlink= */ false);
+          synchronized (header) {
+            if (!e.isLinked() && e.state() == Entry.State.LIVE && e.refCount() == 0) {
+              e.addBefore(header);
+              evictor.noteUnreferencedAtStartup();
+            }
           }
+          evictor.addBytesAtStartup(diskSize);
         }
       }
     }
@@ -1878,10 +1922,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       throws IOException, InterruptedException;
 
   protected int decrementInputReferences(Iterable<String> inputFiles) {
-    // Collect entries that hit 1 -> 0 so a single lruLock acquisition appends them all
-    // and signals once at the end. An action releasing N inputs would otherwise take N
-    // independent lock acquisitions on the eviction lock.
-    List<Entry> toLink = null;
+    int linked = 0;
     for (String input : inputFiles) {
       checkNotNull(input);
       Entry e = storage.get(input);
@@ -1892,28 +1933,21 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         throw new RuntimeException("ERROR: entry retrieved: " + e.key + " != " + input);
       }
       if (e.release()) {
-        if (toLink == null) {
-          toLink = new ArrayList<>();
+        try {
+          evictor.offerInsertion(e);
+          linked++;
+        } catch (InterruptedException ie) {
+          Thread.currentThread().interrupt();
+          log.log(Level.WARNING, "interrupted during decrementInputReferences of " + e.key, ie);
+        } catch (IOException ioe) {
+          log.log(
+              Level.SEVERE,
+              "evictor backpressure during decrementInputReferences of " + e.key,
+              ioe);
         }
-        toLink.add(e);
       }
     }
-    if (toLink == null) {
-      return 0;
-    }
-    lruLock.lock();
-    try {
-      for (Entry e : toLink) {
-        linkUnreferenced(e);
-      }
-      // signalAll because we may have linked N entries; one signal would wake only
-      // one parked charger and could leave others stuck if linkUnreferenced is the
-      // only signal source until the next batched release.
-      lruCondition.signalAll();
-    } finally {
-      lruLock.unlock();
-    }
-    return toLink.size();
+    return linked;
   }
 
   public Path getPath(String filename) {
@@ -1924,45 +1958,14 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     return entryPathStrategy.getPath(filename + "_removed");
   }
 
-  private void dischargeAndNotify(String key, long size) {
-    lruLock.lock();
-    try {
-      dischargeLocked(key, size);
-    } finally {
-      lruLock.unlock();
-    }
-  }
-
   /**
-   * Discharge variant for callers already holding {@code lruLock}. The signal is required — a bare
-   * {@link #discharge} that drops totalBytes below maxSizeInBytes leaves chargers parked in {@link
-   * #waitForLastUnreferencedEntry}'s {@code await()} with no edge to wake them on. Every
-   * evictor-path discharge routes through this helper or {@link #dischargeAndNotify}.
+   * Discharge a producer reservation that did not progress to a committed entry — e.g. a cancelled
+   * write, a digest mismatch, an open-output error. Routes the byte refund through the evictor's
+   * totalBytes accounting.
    */
-  @GuardedBy("lruLock")
-  private void dischargeLocked(String key, long size) {
-    discharge(key, size);
-    // signalAll because a discharge can drop totalBytes below maxSizeInBytes and unblock
-    // every waiter in waitForLastUnreferencedEntry's totalBytes <= max exit branch.
-    lruCondition.signalAll();
-  }
-
-  protected void discharge(String key, long size) {
+  private void dischargeReservation(long size) {
     long diskSize = estimateSizeOnDisk(size, blockSize, /* isHardlink= */ false);
-    totalBytes.add(-diskSize);
-    removedCount.increment();
-    removedBytes.add(diskSize);
-  }
-
-  @GuardedBy("lruLock")
-  private void unlinkEntry(Entry entry) throws IOException {
-    try {
-      dischargeEntry(entry, expireService);
-    } catch (Exception e) {
-      throw new IOException(e);
-    }
-    // technically we should attempt to remove the file here,
-    // but we're only called in contexts where it doesn't exist...
+    evictor.discharge(diskSize);
   }
 
   protected String getDirectoryKey(Digest digest) {
@@ -1974,173 +1977,20 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     return getPath(getDirectoryKey(digest));
   }
 
-  @VisibleForTesting
-  @GuardedBy("lruLock")
-  @SuppressWarnings("PMD.CompareObjectsWithEquals")
-  Entry waitForLastUnreferencedEntry(long blobSizeInBytes) throws InterruptedException {
-    while (header.after == header) { // Intentional reference comparison
-      if (storage.isEmpty()) {
-        throw new IllegalStateException(
-            "CASFileCache::expireEntry("
-                + blobSizeInBytes
-                + ") there are no keys to wait for expiration on");
-      }
-      // The detailed walk is O(N) over storage and is only used for diagnostics. At
-      // hundreds-of-millions of entries it dominates each wait cycle while the
-      // eviction lock is held. Gate it behind FINE; emit a lightweight INFO summary
-      // on the production path.
-      if (log.isLoggable(Level.FINE)) {
-        logDetailedExpireStats(blobSizeInBytes);
-      } else {
-        log.log(
-            Level.INFO,
-            format(
-                "CASFileCache::expireEntry(%d) waiting: %d bytes, %d keys",
-                blobSizeInBytes, totalBytes.sum(), storage.size()));
-      }
-      lruCondition.await();
-      if (totalBytes.sum() <= maxSizeInBytes) {
-        return null;
-      }
-    }
-    return header.after;
-  }
-
-  @GuardedBy("lruLock")
-  @SuppressWarnings("PMD.CompareObjectsWithEquals")
-  private void logDetailedExpireStats(long blobSizeInBytes) {
-    int references = 0;
-    int keys = 0;
-    int min = -1;
-    int max = 0;
-    String minkey = null;
-    String maxkey = null;
-    log.log(
-        Level.FINE,
-        format(
-            "CASFileCache::expireEntry(%d) header(%s): { after: %s, before: %s }",
-            blobSizeInBytes, header.hashCode(), header.after.hashCode(), header.before.hashCode()));
-    for (Map.Entry<String, Entry> pe : storage.entrySet()) {
-      String key = pe.getKey();
-      Entry e = pe.getValue();
-      int rc = e.refCount();
-      if (rc > max) {
-        max = rc;
-        maxkey = key;
-      }
-      if (min == -1 || rc < min) {
-        min = rc;
-        minkey = key;
-      }
-      if (rc == 0) {
-        log.log(
-            Level.FINE,
-            format(
-                "CASFileCache::expireEntry(%d) unreferenced entry(%s): { after: %s, before: %s }",
-                blobSizeInBytes,
-                e.hashCode(),
-                e.after == null ? null : e.after.hashCode(),
-                e.before == null ? null : e.before.hashCode()));
-      }
-      references += rc;
-      keys++;
-    }
-    log.log(
-        Level.FINE,
-        format(
-            "CASFileCache::expireEntry(%d) unreferenced list is empty, %d bytes, %d keys with %d"
-                + " references, min(%d, %s), max(%d, %s)",
-            blobSizeInBytes, totalBytes.sum(), keys, references, min, minkey, max, maxkey));
-  }
-
-  protected abstract List<ListenableFuture<Void>> unlinkAndExpireDirectories(
-      Entry entry, ExecutorService service);
-
-  @GuardedBy("lruLock")
-  protected ListenableFuture<Entry> dischargeEntryFuture(Entry entry, ExecutorService service) {
-    // Mirror dischargeEntry's discharge-in-finally so callers can hoist `discharged = true`
-    // BEFORE this call: by the time this method returns or throws synchronously, discharge()
-    // has run exactly once. Without the finally, a throw from unlinkAndExpireDirectories
-    // (subclass overrides catch internally today, but the contract doesn't forbid a throw)
-    // or from whenAllComplete().call() construction would leave the caller's outer finally
-    // looking at discharged=false and double-decrement totalBytes.
-    List<ListenableFuture<Void>> directoryExpirationFutures;
-    try {
-      directoryExpirationFutures = unlinkAndExpireDirectories(entry, service);
-    } finally {
-      dischargeLocked(entry.key, entry.size);
-    }
-    return whenAllComplete(directoryExpirationFutures)
-        .call(
-            () -> {
-              Exception expirationException = null;
-              for (ListenableFuture<Void> directoryExpirationFuture : directoryExpirationFutures) {
-                try {
-                  directoryExpirationFuture.get();
-                } catch (ExecutionException e) {
-                  Throwable cause = e.getCause();
-                  if (cause instanceof Exception) {
-                    expirationException = (Exception) cause;
-                  } else {
-                    log.log(
-                        Level.SEVERE,
-                        "undeferrable exception during discharge of " + entry.key,
-                        cause);
-                    // errors and the like, avoid any deferrals
-                    Throwables.throwIfUnchecked(cause);
-                    throw new RuntimeException(cause);
-                  }
-                } catch (InterruptedException e) {
-                  // unlikely, all futures must be complete
-                }
-              }
-              if (expirationException != null) {
-                throw expirationException;
-              }
-              return entry;
-            },
-            service);
-  }
-
-  @GuardedBy("lruLock")
-  private void dischargeEntry(Entry entry, ExecutorService service) throws Exception {
-    Exception expirationException = null;
-    // discharge in a finally so totalBytes accounting is reconciled even when a
-    // directory-expiration future failure rethrows past us — callers rely on the
-    // contract "by the time dischargeEntry returns or throws, discharge() has run".
-    // Without it, the catch path in newLocalInput / referenceIfExists would see
-    // discharged=false and double-decrement totalBytes after dischargeEntry's own
-    // discharge already ran.
-    try {
-      for (ListenableFuture<Void> directoryExpirationFuture :
-          unlinkAndExpireDirectories(entry, service)) {
-        do {
-          try {
-            directoryExpirationFuture.get();
-          } catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof Exception) {
-              expirationException = (Exception) cause;
-            } else {
-              log.log(
-                  Level.SEVERE, "undeferrable exception during discharge of " + entry.key, cause);
-              // errors and the like, avoid any deferrals
-              Throwables.throwIfUnchecked(cause);
-              throw new RuntimeException(cause);
-            }
-          } catch (InterruptedException e) {
-            // FIXME add some suppression
-            expirationException = e;
-          }
-        } while (!directoryExpirationFuture.isDone());
-      }
-    } finally {
-      // only discharge after all the directories are gone, or their removal failed
-      dischargeLocked(entry.key, entry.size);
-    }
-    if (expirationException != null) {
-      throw expirationException;
-    }
+  /**
+   * Hook for subclasses to wire directory-level cleanup into eviction. The contract is now "called
+   * by the evictor on a successfully-evicted Entry"; the historical {@code ListenableFuture<Void>}
+   * return type is preserved so subclass overrides need no signature change. The Evictor's evictOne
+   * calls this synchronously on the evictor thread between safeStorageRemoval and the async {@code
+   * deleteExpiredKey} dispatch; an override that needs off-thread work should return a future that
+   * completes asynchronously.
+   *
+   * <p>Default implementation: no extra cleanup beyond the standard delete; returns one
+   * already-complete future.
+   */
+  protected List<ListenableFuture<Void>> unlinkAndExpireDirectories(
+      Entry entry, ExecutorService service) {
+    return ImmutableList.of(immediateFuture(null));
   }
 
   // clears the interrupted status
@@ -2148,6 +1998,62 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     return Thread.interrupted()
         || e.getCause() instanceof InterruptedException
         || e instanceof ClosedByInterruptException;
+  }
+
+  /**
+   * Race-loss recovery: a {@code safeStorageRemoval} on this {@code key} returned a different
+   * {@link Entry} than the caller expected (a concurrent writer landed an Entry between the
+   * caller's tryEvict and the removal). Restore it under the same per-key lock that {@code
+   * safeStorageInsertion} acquires so this is atomic with concurrent insertion. If yet-another
+   * writer has already published a newer Entry by the time we get the lock, the replacement is
+   * orphaned and we discharge its bytes to avoid a slow totalBytes leak.
+   */
+  private void restoreEntryAfterRaceLoss(String key, Entry replacement) {
+    Lock lock;
+    try {
+      lock = keyLocks.get(key);
+    } catch (ExecutionException e) {
+      throw new RuntimeException(e.getCause());
+    }
+    boolean restored;
+    lock.lock();
+    try {
+      Entry existing = storage.putIfAbsent(key, replacement);
+      restored = existing == null;
+      if (!restored) {
+        log.log(
+            Level.SEVERE,
+            "race-loss restore for "
+                + key
+                + " collided with newer entry; discharging orphan bytes");
+        evictor.discharge(estimateSizeOnDisk(replacement.size, blockSize, /* isHardlink= */ false));
+      }
+    } finally {
+      lock.unlock();
+    }
+    // If the replacement has no holder (refCount==0) and isn't already on the LRU, enqueue it
+    // so the evictor's sweep can find it. Without this, the bytes stay in totalBytes but the
+    // entry isn't reachable from a sweep — only a subsequent referenceIfExists -> release
+    // cycle would re-enqueue it. The drain-side guard in onInsertion rejects already-linked
+    // or non-LIVE entries, so this is safe to call unconditionally for refCount==0.
+    if (restored && replacement.refCount() == 0) {
+      try {
+        evictor.offerInsertion(replacement);
+      } catch (InterruptedException ie) {
+        Thread.currentThread().interrupt();
+        log.log(
+            Level.WARNING,
+            "interrupted re-enqueueing race-loss replacement for "
+                + key
+                + "; entry may delay landing on LRU",
+            ie);
+      } catch (IOException ioe) {
+        log.log(
+            Level.SEVERE,
+            "failed to re-enqueue race-loss replacement for " + key + "; entry may leak from LRU",
+            ioe);
+      }
+    }
   }
 
   protected Entry safeStorageInsertion(String key, Entry entry) {
@@ -2180,22 +2086,31 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       throw new IOException(e);
     }
 
-    Entry entry;
+    Entry entry = null;
+    boolean detached = false;
     lock.lock();
-    // why are we splitting IO between this and dischargeEntryFuture?
     try {
       if (key.endsWith("_dir")) {
         Files.move(path, expiredPath, ATOMIC_MOVE, REPLACE_EXISTING);
       } else {
-        Files.createLink(expiredPath, path);
+        try {
+          Files.createLink(expiredPath, path);
+        } catch (FileAlreadyExistsException e) {
+          Files.delete(expiredPath);
+          Files.createLink(expiredPath, path);
+        }
         deleteExpiredPath = true;
         Files.delete(path);
         deleteExpiredPath = false;
       }
+      detached = true;
     } catch (NoSuchFileException e) {
       // ignore, already removed
+      detached = true;
     } finally {
-      entry = storage.remove(key);
+      if (detached) {
+        entry = storage.remove(key);
+      }
       if (deleteExpiredPath) {
         // only valid for files with 2-step
         try {
@@ -2208,121 +2123,6 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     }
     // the directory remains, guess we should get the service in here??
     return entry;
-  }
-
-  @SuppressWarnings({"PMD.CompareObjectsWithEquals"})
-  @GuardedBy("lruLock")
-  private ListenableFuture<Entry> expireEntry(long blobSizeInBytes, ExecutorService service)
-      throws IOException, InterruptedException {
-    for (Entry e = waitForLastUnreferencedEntry(blobSizeInBytes);
-        e != null;
-        e = waitForLastUnreferencedEntry(blobSizeInBytes)) {
-      if (!e.tryEvict()) {
-        // Resurrected by a concurrent acquirer; drop from the LRU so we don't pick it
-        // again. The acquirer is parked on lruLock (which we hold) and will observe
-        // !isLinked() in unlinkReferenced — meaning we own the decrement here.
-        unlinkReferenced(e);
-        continue;
-      }
-      // expireEntryFallback / safeStorageRemoval / dischargeEntryFuture can throw; without
-      // this finally, a throw between tryEvict and completeEviction would strand the entry
-      // in EVICTING permanently. The !completed path also unlinks and discharges so a
-      // disk-pressure IOException (Files.createLink/delete) does not leak bytes from
-      // totalBytes.
-      boolean discharged = false;
-      boolean completed = false;
-      try {
-        if (!e.key.endsWith("_dir")) {
-          FileEntryKey fileEntryKey = parseFileEntryKey(e.key, e.size);
-          if (fileEntryKey == null) {
-            log.log(Level.SEVERE, format("error parsing expired key %s", e.key));
-          } else {
-            // The fallback copy is best-effort: a synchronous throw from
-            // delegate.getWrite() / performCopy() that escapes expireEntryFallback's
-            // EntryLimitException catch would skip safeStorageRemoval below and strand
-            // e in storage (state=EVICTED, file on disk, unevictable + unacquirable).
-            // The outer !completed finally restores the LRU/accounting/state but cannot
-            // see e in storage. Log-and-continue so storage cleanup runs unconditionally.
-            try {
-              expireEntryFallback(fileEntryKey);
-              invalidateWrite(fileEntryKey.digest());
-            } catch (RuntimeException re) {
-              log.log(
-                  Level.SEVERE,
-                  format("expireEntryFallback failed for %s; continuing with removal", e.key),
-                  re);
-            }
-          }
-        }
-        Entry removedEntry = safeStorageRemoval(e.key);
-        // reference compare on purpose
-        if (removedEntry == e) {
-          // Hoist discharged=true BEFORE dischargeEntryFuture so an early synchronous throw
-          // (unlinkAndExpireDirectories or whenAllComplete construction) does not leave
-          // the outer finally double-discharging — dischargeEntryFuture's try/finally
-          // guarantees discharge() runs on every exit path.
-          discharged = true;
-          ListenableFuture<Entry> result = dischargeEntryFuture(e, service);
-          e.completeEviction();
-          completed = true;
-          return result;
-        }
-        if (removedEntry == null) {
-          // Defensive: per the protocol (only the tryEvict winner can call safeStorageRemoval,
-          // and we are that winner), storage.remove should always find e. If it doesn't, e's
-          // bytes are still charged to totalBytes and e is still on the LRU — without
-          // discharging here, the bytes leak permanently and the resurrection branch would
-          // later unlink without discharging.
-          log.log(Level.SEVERE, format("entry %s was already removed during expiration", e.key));
-          if (e.isLinked()) {
-            log.log(Level.SEVERE, format("removing spuriously non-existent entry %s", e.key));
-            unlinkReferenced(e);
-          } else {
-            log.log(
-                Level.SEVERE,
-                format(
-                    "spuriously non-existent entry %s was somehow unlinked, should not appear"
-                        + " again",
-                    e.key));
-          }
-          dischargeLocked(e.key, e.size);
-          discharged = true;
-          e.completeEviction();
-          completed = true;
-        } else {
-          log.log(
-              Level.SEVERE,
-              "removed entry %s did not match last unreferenced entry, restoring it",
-              e.key);
-          storage.put(e.key, removedEntry);
-          // e was on the LRU (header.after) and its bytes were charged to totalBytes,
-          // but storage now holds a different Entry for this key. Without unlinking +
-          // discharging, e strands on the LRU as EVICTED with its bytes permanently
-          // in totalBytes — the resurrection branch above would later unlink it but
-          // would not discharge.
-          unlinkReferenced(e);
-          dischargeLocked(e.key, e.size);
-          discharged = true;
-          // Mark this Entry instance terminal; the restored Entry is a different
-          // identity with its own state.
-          e.completeEviction();
-          completed = true;
-        }
-      } finally {
-        if (!completed) {
-          unlinkReferenced(e);
-          if (!discharged) {
-            dischargeLocked(e.key, e.size);
-          }
-          e.completeEviction();
-        }
-      }
-      // possibly delegated, but no removal, if we're interrupted, abort loop
-      if (Thread.currentThread().isInterrupted()) {
-        throw new InterruptedException();
-      }
-    }
-    return null;
   }
 
   interface FileContent {
@@ -2751,6 +2551,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     }
   }
 
+  @SuppressWarnings("PMD.CompareObjectsWithEquals")
   protected boolean referenceIfExists(String key) throws IOException {
     Entry e = storage.get(key);
     if (e == null) {
@@ -2758,84 +2559,11 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     }
 
     if (!entryExists(e)) {
-      if (e.tryEvict()) {
-        // unlinkEntry can throw IOException via dischargeEntry; without the finally
-        // a throw between tryEvict and completeEviction would strand the entry in
-        // EVICTING permanently. The catch path also unlinks and discharges so a
-        // disk-pressure IOException does not leak bytes from totalBytes.
-        boolean discharged = false;
-        boolean completed = false;
-        try {
-          // reference compare on purpose — mirror newLocalInput's three-arm structure.
-          Entry removedEntry = storage.remove(key);
-          if (removedEntry == e) {
-            lruLock.lock();
-            try {
-              // Set discharged before unlinkEntry: dischargeEntry's finally guarantees
-              // discharge() always runs, but unlinkEntry can still rethrow a directory-
-              // expiration failure past us. If we only set discharged after the call,
-              // the outer finally would double-decrement totalBytes on that path.
-              discharged = true;
-              unlinkEntry(removedEntry);
-            } finally {
-              lruLock.unlock();
-            }
-          } else if (removedEntry != null) {
-            // Defensive: a different Entry now sits under this key. Per the tryEvict-
-            // owns-removal protocol this should not happen, but if a future code path
-            // breaks the invariant we restore the impostor so its own discipline
-            // continues and discharge e ourselves — without this, e's bytes leak
-            // permanently into totalBytes and the resurrection branch in expireEntry
-            // would later unlink e but never discharge.
-            log.severe(
-                format(
-                    "nonexistent entry %s did not match last unreferenced entry," + " restoring it",
-                    key));
-            storage.put(key, removedEntry);
-            lruLock.lock();
-            try {
-              unlinkReferenced(e);
-              dischargeLocked(e.key, e.size);
-            } finally {
-              lruLock.unlock();
-            }
-            discharged = true;
-          } else {
-            // Defensive: per the protocol the tryEvict winner is the unique remover, so
-            // storage.remove should always find e here. If it doesn't, e's bytes remain in
-            // totalBytes and e is still on the LRU — discharge here so accounting does not
-            // slow-leak under a crash-recovery or corruption scenario.
-            log.severe(
-                format(
-                    "entry %s was already removed from storage before this evictor could"
-                        + " remove it, discharging",
-                    key));
-            lruLock.lock();
-            try {
-              unlinkReferenced(e);
-              dischargeLocked(e.key, e.size);
-            } finally {
-              lruLock.unlock();
-            }
-            discharged = true;
-          }
-          e.completeEviction();
-          completed = true;
-        } finally {
-          if (!completed) {
-            lruLock.lock();
-            try {
-              unlinkReferenced(e);
-              if (!discharged) {
-                dischargeLocked(e.key, e.size);
-              }
-            } finally {
-              lruLock.unlock();
-            }
-            e.completeEviction();
-          }
-        }
-      }
+      // Stale-on-disk recovery runs on the evictor thread so LRU unlink and accounting remain
+      // single-writer. The caller holds no refcount here; if a concurrent acquire wins before the
+      // evictor drains the event, tryEvict's refcount re-check rolls back and a later stale read
+      // will re-enqueue it.
+      evictStaleEntry(e);
       return false;
     }
 
@@ -2843,14 +2571,8 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     if (previous < 0) {
       return false;
     }
-    if (previous == 0) {
-      lruLock.lock();
-      try {
-        unlinkReferenced(e);
-      } finally {
-        lruLock.unlock();
-      }
-    }
+    // Do not unlink from the LRU on 0->1; the evictor's sweep observes the bumped refCount
+    // via tryEvict's recheck and skips the entry. The evictor owns LRU mutation.
     return true;
   }
 
@@ -2881,7 +2603,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       return out;
     } finally {
       if (requiresDischarge.get()) {
-        dischargeAndNotify("put:" + key, blobSizeInBytes);
+        dischargeReservation(blobSizeInBytes);
       }
     }
   }
@@ -2905,75 +2627,12 @@ public abstract class CASFileCache implements ContentAddressableStorage {
   @SuppressWarnings({"ConstantConditions", "ResultOfMethodCallIgnored"})
   protected boolean charge(String key, long blobSizeInBytes, AtomicBoolean requiresDischarge)
       throws IOException, InterruptedException {
-    boolean interrupted = false;
-    Iterable<ListenableFuture<Digest>> expiredDigestsFutures;
     if (referenceIfExists(key)) {
       return false;
     }
-    totalBytes.add(estimateSizeOnDisk(blobSizeInBytes, blockSize, /* isHardlink= */ false));
+    long diskSize = estimateSizeOnDisk(blobSizeInBytes, blockSize, /* isHardlink= */ false);
+    evictor.charge(diskSize);
     requiresDischarge.set(true);
-    lruLock.lock();
-    try {
-      ImmutableList.Builder<ListenableFuture<Digest>> builder = ImmutableList.builder();
-      try {
-        while (!interrupted && totalBytes.sum() > maxSizeInBytes) {
-          ListenableFuture<Entry> expiredFuture = expireEntry(blobSizeInBytes, expireService);
-          interrupted = Thread.interrupted();
-          if (expiredFuture != null) {
-            builder.add(
-                transformAsync(
-                    expiredFuture,
-                    (expiredEntry) -> {
-                      String expiredKey = expiredEntry.key;
-                      try {
-                        deleteExpiredKey(expiredKey);
-                      } catch (NoSuchFileException eNoEnt) {
-                        log.log(
-                            Level.SEVERE,
-                            format(
-                                "CASFileCache::putImpl: expired key %s did not exist to delete",
-                                expiredKey),
-                            eNoEnt);
-                      }
-                      FileEntryKey fileEntryKey = parseFileEntryKey(expiredKey, expiredEntry.size);
-                      if (fileEntryKey != null
-                          && storage.containsKey(
-                              getKey(fileEntryKey.digest(), !fileEntryKey.isExecutable()))) {
-                        return immediateFuture(null);
-                      }
-                      expiredKeyCounter.inc();
-                      return immediateFuture(fileEntryKey != null ? fileEntryKey.digest() : null);
-                    },
-                    expireService));
-          }
-        }
-      } catch (InterruptedException e) {
-        // clear interrupted flag
-        Thread.interrupted();
-        interrupted = true;
-      }
-      expiredDigestsFutures = builder.build();
-    } finally {
-      lruLock.unlock();
-    }
-
-    ImmutableSet.Builder<Digest> builder = ImmutableSet.builder();
-    for (ListenableFuture<Digest> expiredDigestFuture : expiredDigestsFutures) {
-      Digest digest = getOrIOException(expiredDigestFuture);
-      if (Thread.interrupted()) {
-        interrupted = true;
-      }
-      if (digest != null) {
-        builder.add(digest);
-      }
-    }
-    Set<Digest> expiredDigests = builder.build();
-    if (!expiredDigests.isEmpty()) {
-      onExpire.accept(expiredDigests);
-    }
-    if (interrupted || Thread.currentThread().isInterrupted()) {
-      throw new InterruptedException();
-    }
     return true;
   }
 
@@ -3051,7 +2710,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
           out.close();
           Files.delete(writePath);
         } finally {
-          dischargeAndNotify(writeKey, blobSizeInBytes);
+          dischargeReservation(blobSizeInBytes);
         }
       }
 
@@ -3095,7 +2754,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
           try {
             Files.delete(writePath);
           } finally {
-            dischargeAndNotify(writeKey, blobSizeInBytes);
+            dischargeReservation(blobSizeInBytes);
           }
           Digest actual = digestUtil.build(hash, size);
           throw new DigestMismatchException(actual, expectedDigest);
@@ -3113,13 +2772,13 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         String fileName = writePath.getFileName().toString();
         Digest actual = digestUtil.build(hash, countingOut.written());
         if (!fileName.equals(getKey(actual, isExecutable) + "." + writeId)) {
-          dischargeAndNotify(writeKey, blobSizeInBytes);
+          dischargeReservation(blobSizeInBytes);
           throw new DigestMismatchException(actual, expectedDigest);
         }
         try {
           setReadOnlyPerms(writePath, isExecutable, fileStore);
         } catch (IOException e) {
-          dischargeAndNotify(writeKey, blobSizeInBytes);
+          dischargeReservation(blobSizeInBytes);
           throw e;
         }
 
@@ -3128,7 +2787,10 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         Entry existingEntry = null;
         boolean inserted = false;
         try {
-          // acquire the key lock
+          // createLink runs before the per-key lock acquired in safeStorageInsertion: a
+          // concurrent evictor mid-safeStorageRemoval for the same key still holds the canonical
+          // file, so createLink throws FileAlreadyExistsException and we fall through to the
+          // "look up the existing entry" polling branch below.
           Files.createLink(CASFileCache.this.getPath(key), writePath);
           existingEntry = safeStorageInsertion(key, entry);
           inserted = existingEntry == null;
@@ -3137,7 +2799,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         } finally {
           Files.delete(writePath);
           if (!inserted) {
-            dischargeAndNotify(writeKey, blobSizeInBytes);
+            dischargeReservation(blobSizeInBytes);
           }
         }
 
@@ -3237,10 +2899,8 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
     /**
      * Produces an entry in the unreferenced state with {@code before/after = null} so {@link
-     * #isLinked()} returns false until the caller publishes it via {@link
-     * CASFileCache#linkUnreferenced} under {@code lruLock}. Self-linking here would race {@link
-     * CASFileCache#unlinkReferenced}'s {@code isLinked()} check on a concurrent acquirer and
-     * corrupt {@code unreferencedCount}.
+     * #isLinked()} returns false until the caller publishes it via the evictor. Self-linking here
+     * would race the evictor's drain-side guard and corrupt {@code unreferencedCount}.
      */
     public static Entry orphan(String key, long size, Deadline existsDeadline) {
       return new Entry(key, size, existsDeadline, 0);
@@ -3290,8 +2950,9 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     /**
      * Atomically increments refCount when the entry is LIVE.
      *
-     * @return the previous refcount on success (0 indicates the caller drove the 0 -> 1 revival and
-     *     must unlink the entry from the LRU under lruLock); -1 when the entry is no longer LIVE.
+     * @return the previous refcount on success; -1 when the entry is no longer LIVE. The evictor's
+     *     sweep observes refCount via tryEvict and skips entries with refCount > 0, so the acquirer
+     *     does not need to proactively unlink.
      */
     public int tryAcquire() {
       if (((State) STATE.getVolatile(this)) != State.LIVE) {
@@ -3309,7 +2970,8 @@ public abstract class CASFileCache implements ContentAddressableStorage {
      * Atomically decrements refCount; throws IllegalStateException on underflow rather than
      * publishing a transient negative.
      *
-     * @return true on the final 1 -> 0 transition (caller must append to LRU under lruLock).
+     * @return true on the final 1 -> 0 transition (caller must enqueue the entry through {@code
+     *     evictor.offerInsertion} so it lands on the LRU).
      */
     public boolean release() {
       for (; ; ) {
@@ -3345,6 +3007,14 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       return true;
     }
 
+    /** Retryable transition EVICTING -> LIVE after eviction failed before detaching storage. */
+    public void abortEviction() {
+      checkState(
+          STATE.compareAndSet(this, State.EVICTING, State.LIVE),
+          "abortEviction observed unexpected state for %s",
+          key);
+    }
+
     /** Terminal transition EVICTING -> EVICTED after the file delete has succeeded. */
     public void completeEviction() {
       // Mirror tryEvict's rollback CAS: a caller that invokes completeEviction without
@@ -3355,43 +3025,6 @@ public abstract class CASFileCache implements ContentAddressableStorage {
           STATE.compareAndSet(this, State.EVICTING, State.EVICTED),
           "completeEviction observed unexpected state for %s",
           key);
-    }
-
-    /**
-     * Re-position an unreferenced entry at the LRU tail. Returns true when the caller must
-     * compensate {@code unreferencedCount} (the entry was unlinked but not re-linked because an
-     * off-lock {@code tryEvict} flipped state to EVICTING between the precondition check and the
-     * {@code addBefore}); false in all other cases. See the caller in {@link
-     * CASFileCache#recordAccess(Iterable)} for the compensating decrement.
-     */
-    public boolean recordAccess(Entry header) {
-      // Only re-position entries that are currently LIVE, unreferenced, AND linked. An
-      // entry can be unreferenced-but-not-yet-linked transiently (between release's CAS
-      // and the LRU tail-append under lruLock) or unlinked because eviction is in
-      // progress; both are benign — skip the access record. The state==LIVE check keeps
-      // a queued recordAccess from re-positioning an entry the evictor has already
-      // chosen as a victim (state==EVICTING), which would transiently expose an
-      // EVICTING entry at the LRU tail.
-      if (state() == State.LIVE && refCount() == 0 && isLinked()) {
-        unlink();
-        // Re-check state after the unlink: tryEvict is called off-lock from
-        // newLocalInput's IOException recovery and referenceIfExists's stale-deadline
-        // recovery, so a racing tryEvict can flip state to EVICTING between the
-        // precondition above and the addBefore below. Without the recheck we would
-        // re-publish an EVICTING entry on the LRU; the racing evictor's later
-        // unlinkReferenced sees isLinked==true and would still produce correct
-        // accounting in Phase 1, but the Phase 2 async evictor relies on "entries on
-        // the LRU are LIVE". When we skip the addBefore, the caller decrements
-        // unreferencedCount to compensate — the evictor's later unlinkReferenced will
-        // see isLinked==false and skip its decrement, so without compensation the
-        // counter drifts positive.
-        if (state() == State.LIVE) {
-          addBefore(header);
-          return false;
-        }
-        return true;
-      }
-      return false;
     }
   }
 
@@ -3438,11 +3071,6 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       // the STARTING/STOPPED dummy returned by getEntry(); a future change that exposes
       // the header through getEntry() must not have it pass isPlaceholder().
       return false;
-    }
-
-    @Override
-    public boolean recordAccess(Entry header) {
-      throw new UnsupportedOperationException("sentinel cannot be accessed");
     }
   }
 

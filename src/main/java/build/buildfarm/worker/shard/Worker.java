@@ -111,6 +111,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.UserPrincipal;
+import java.time.Clock;
 import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Random;
@@ -118,6 +119,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -443,10 +445,16 @@ public final class Worker extends LoggingMain {
       @Nullable ContentAddressableStorage delegate,
       boolean delegateSkipLoad,
       InputStreamFactory externalInputStreamFactory) {
+    long maxSizeBytes = cas.getMaxSizeBytes();
+    long lowBytes = computeLowBytes(cas, maxSizeBytes);
+    // Convert operator-facing millis to nanos at the boundary; the Evictor API is nanos-based
+    // for precision and to align with System.nanoTime, but YAML operators reason in ms.
+    long wakeBudgetNanos = TimeUnit.MILLISECONDS.toNanos(cas.getEvictorWakeBudgetMillis());
+    long heartbeatNanos = TimeUnit.MILLISECONDS.toNanos(cas.getEvictorIdleHeartbeatMillis());
     if (configs.getWorker().isLegacyDirectoryFileCache()) {
       return new LegacyDirectoryCFC(
           root,
-          cas.getMaxSizeBytes(),
+          maxSizeBytes,
           maxEntrySizeInBytes, // TODO make this a configurable value for each cas
           cas.getHexBucketLevels(),
           cas.isFileDirectoriesIndexInMemory(),
@@ -460,11 +468,15 @@ public final class Worker extends LoggingMain {
           onExpire,
           delegate,
           delegateSkipLoad,
-          externalInputStreamFactory);
+          externalInputStreamFactory,
+          lowBytes,
+          wakeBudgetNanos,
+          heartbeatNanos,
+          Clock.systemUTC());
     }
     return new DirectoryEntryCFC(
         root,
-        cas.getMaxSizeBytes(),
+        maxSizeBytes,
         maxEntrySizeInBytes,
         cas.getHexBucketLevels(),
         expireService,
@@ -475,7 +487,38 @@ public final class Worker extends LoggingMain {
         onExpire,
         delegate,
         delegateSkipLoad,
-        externalInputStreamFactory);
+        externalInputStreamFactory,
+        lowBytes,
+        wakeBudgetNanos,
+        heartbeatNanos,
+        Clock.systemUTC());
+  }
+
+  /**
+   * Translate the operator-facing {@code lowWatermarkPercent} into an absolute byte target the
+   * Evictor sweeps to. When the operator specifies {@code maxSizePercent} the percentages share a
+   * common base (filesystem total), so we can compute lowBytes proportionally from maxSizeBytes
+   * without re-querying the filesystem. When the operator used {@code maxSizeBytes} directly (so
+   * {@code maxSizePercent} is unset), we treat {@code lowWatermarkPercent} as a percent of the cap
+   * itself — the only meaningful interpretation without a filesystem reference point.
+   *
+   * <p>When {@code lowWatermarkPercent} is 0 (unset by the operator), the default is 80% of the cap
+   * in both modes. The fixed 80% is monotonic across {@code maxSizePercent} (lowBytes shrinks
+   * linearly with the cap, matching operator intuition) and avoids the divide-by-derived-percent
+   * collapse the earlier {@code (maxSizePercent - 10) / maxSizePercent} formula produced for {@code
+   * maxSizePercent <= 10}.
+   */
+  static long computeLowBytes(Cas cas, long maxSizeBytes) {
+    int lowWatermarkPercent = cas.getLowWatermarkPercent();
+    int maxSizePercent = cas.getMaxSizePercent();
+    if (lowWatermarkPercent <= 0) {
+      // Auto-default: 80% of the cap, regardless of mode. Avoids the non-monotonic behavior
+      // (and divide-by-derivedPercent=0 collapse) the earlier "10 percent below" formula
+      // produced for small maxSizePercent values.
+      return maxSizeBytes * 80 / 100;
+    }
+    int base = maxSizePercent > 0 ? maxSizePercent : 100;
+    return maxSizeBytes * lowWatermarkPercent / base;
   }
 
   private ExecFileSystem createCFCExecFileSystem(

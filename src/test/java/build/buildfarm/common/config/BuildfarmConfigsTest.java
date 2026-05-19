@@ -3,6 +3,7 @@ package build.buildfarm.common.config;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -25,6 +26,7 @@ public class BuildfarmConfigsTest {
     BuildfarmConfigs configs = BuildfarmConfigs.getInstance();
     configs.setServer(new Server());
     configs.setBackplane(new Backplane());
+    configs.setWorker(new Worker());
   }
 
   @After
@@ -165,5 +167,205 @@ public class BuildfarmConfigsTest {
 
     BuildfarmConfigs configs = BuildfarmConfigs.loadConfigs(configFile);
     assertEquals(75, configs.getWorker().getStorages().get(0).getMaxSizePercent());
+  }
+
+  @Test
+  public void validateCasEvictorConfig_lowWatermarkEqualToMax_throws() {
+    Cas cas = new Cas();
+    cas.setMaxSizePercent(90);
+    cas.setLowWatermarkPercent(90); // equal to max — must be strictly less
+    ConfigurationException ex =
+        assertThrows(
+            ConfigurationException.class, () -> BuildfarmConfigs.validateCasEvictorConfig(cas));
+    assertTrue(
+        "message should reference lowWatermarkPercent: " + ex.getMessage(),
+        ex.getMessage().contains("lowWatermarkPercent"));
+  }
+
+  @Test
+  public void validateCasEvictorConfig_lowWatermarkAboveMax_throws() {
+    Cas cas = new Cas();
+    cas.setMaxSizePercent(90);
+    cas.setLowWatermarkPercent(95);
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validateCasEvictorConfig(cas));
+  }
+
+  @Test
+  public void validateCasEvictorConfig_lowWatermarkOneBelowMax_passes()
+      throws ConfigurationException {
+    Cas cas = new Cas();
+    cas.setMaxSizePercent(90);
+    cas.setLowWatermarkPercent(89);
+    BuildfarmConfigs.validateCasEvictorConfig(cas);
+  }
+
+  @Test
+  public void validateCasEvictorConfig_lowWatermarkNegative_throws() {
+    Cas cas = new Cas();
+    cas.setLowWatermarkPercent(-1);
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validateCasEvictorConfig(cas));
+  }
+
+  @Test
+  public void validateCasEvictorConfig_lowWatermarkZero_passes() throws ConfigurationException {
+    // 0 is the sentinel for auto-derive; allowed.
+    Cas cas = new Cas();
+    cas.setLowWatermarkPercent(0);
+    BuildfarmConfigs.validateCasEvictorConfig(cas);
+  }
+
+  @Test
+  public void validateCasEvictorConfig_lowWatermarkBytesModeHighPercent_passes()
+      throws ConfigurationException {
+    // bytes-mode (maxSizePercent == 0) interprets lowWatermarkPercent as a percent of the cap
+    // itself, so values up to 99 are legal.
+    Cas cas = new Cas();
+    cas.setMaxSizeBytes(1000);
+    cas.setMaxSizePercent(0);
+    cas.setLowWatermarkPercent(95);
+    BuildfarmConfigs.validateCasEvictorConfig(cas);
+  }
+
+  @Test
+  public void validateCasEvictorConfig_lowWatermarkBytesModeAtHundred_throws() {
+    // 100 % of cap is the cap itself — must be strictly less.
+    Cas cas = new Cas();
+    cas.setMaxSizeBytes(1000);
+    cas.setMaxSizePercent(0);
+    cas.setLowWatermarkPercent(100);
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validateCasEvictorConfig(cas));
+  }
+
+  @Test
+  public void validateCasEvictorConfig_lowWatermarkSetButNoCapConfigured_throws() {
+    // Operator set lowWatermarkPercent but did not configure either maxSizeBytes or
+    // maxSizePercent — there is no cap to compute a watermark against.
+    Cas cas = new Cas();
+    cas.setMaxSizeBytes(0);
+    cas.setMaxSizePercent(0);
+    cas.setLowWatermarkPercent(50);
+    ConfigurationException ex =
+        assertThrows(
+            ConfigurationException.class, () -> BuildfarmConfigs.validateCasEvictorConfig(cas));
+    assertTrue(
+        "message should mention the missing cap: " + ex.getMessage(),
+        ex.getMessage().contains("maxSizeBytes") && ex.getMessage().contains("maxSizePercent"));
+  }
+
+  @Test
+  public void validateCasEvictorConfig_wakeBudgetBelowMinimum_throws() {
+    Cas cas = new Cas();
+    cas.setEvictorWakeBudgetMillis(0L); // below 1 ms floor
+    ConfigurationException ex =
+        assertThrows(
+            ConfigurationException.class, () -> BuildfarmConfigs.validateCasEvictorConfig(cas));
+    assertTrue(
+        "message should reference evictorWakeBudgetMillis: " + ex.getMessage(),
+        ex.getMessage().contains("evictorWakeBudgetMillis"));
+  }
+
+  @Test
+  public void validateCasEvictorConfig_wakeBudgetAboveMaximum_throws() {
+    Cas cas = new Cas();
+    cas.setEvictorWakeBudgetMillis(2000L); // above 1 s cap
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validateCasEvictorConfig(cas));
+  }
+
+  @Test
+  public void validateCasEvictorConfig_heartbeatBelowMinimum_throws() {
+    Cas cas = new Cas();
+    cas.setEvictorIdleHeartbeatMillis(50L); // below 100 ms floor
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validateCasEvictorConfig(cas));
+  }
+
+  @Test
+  public void validateCasEvictorConfig_heartbeatAboveMaximum_throws() {
+    Cas cas = new Cas();
+    cas.setEvictorIdleHeartbeatMillis(120_000L); // 2 min — above 1 min cap
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validateCasEvictorConfig(cas));
+  }
+
+  @Test
+  public void validateCasEvictorConfig_wakeBudgetAtOrAboveHeartbeat_throws() {
+    // The heartbeat is the backstop for missed wake signals and must outlast a sweep.
+    Cas cas = new Cas();
+    cas.setEvictorWakeBudgetMillis(500L);
+    cas.setEvictorIdleHeartbeatMillis(500L); // equal, must be strictly greater
+    ConfigurationException ex =
+        assertThrows(
+            ConfigurationException.class, () -> BuildfarmConfigs.validateCasEvictorConfig(cas));
+    assertTrue(
+        "message should reference the cross-field constraint: " + ex.getMessage(),
+        ex.getMessage().contains("evictorWakeBudgetMillis")
+            && ex.getMessage().contains("evictorIdleHeartbeatMillis"));
+  }
+
+  @Test
+  public void validateCasEvictorConfig_validValues_pass() throws ConfigurationException {
+    Cas cas = new Cas();
+    cas.setMaxSizePercent(90);
+    cas.setLowWatermarkPercent(80);
+    cas.setEvictorWakeBudgetMillis(50L);
+    cas.setEvictorIdleHeartbeatMillis(2000L);
+    BuildfarmConfigs.validateCasEvictorConfig(cas);
+  }
+
+  @Test
+  public void validateCasEvictorConfig_allDefaults_passes() throws ConfigurationException {
+    // Default Cas (operator left every field unset) must clear the validator.
+    BuildfarmConfigs.validateCasEvictorConfig(new Cas());
+  }
+
+  @Test
+  public void loadConfigs_withLowWatermarkPercent_parsesCorrectly() throws IOException {
+    Path configFile = tempDir.resolve("low-watermark.yaml");
+    String yamlContent = "worker:\n  storages:\n    - lowWatermarkPercent: 70\n";
+    Files.write(configFile, yamlContent.getBytes());
+
+    BuildfarmConfigs configs = BuildfarmConfigs.loadConfigs(configFile);
+    assertEquals(70, configs.getWorker().getStorages().get(0).getLowWatermarkPercent());
+  }
+
+  @Test
+  public void loadWorkerConfigs_lowWatermarkPercentWithDerivedDefaultCap_passes() throws Exception {
+    Path configFile = tempDir.resolve("worker-low-watermark-derived-cap.yaml");
+    String yamlContent =
+        "worker:\n"
+            + "  root: '"
+            + tempDir.toString().replace("'", "''")
+            + "'\n"
+            + "  storages:\n"
+            + "    - lowWatermarkPercent: 70\n";
+    Files.write(configFile, yamlContent.getBytes());
+
+    BuildfarmConfigs configs =
+        BuildfarmConfigs.loadWorkerConfigs(new String[] {configFile.toString()});
+    Cas storage = configs.getWorker().getStorages().get(0);
+    assertEquals(70, storage.getLowWatermarkPercent());
+    assertEquals(0, storage.getMaxSizePercent());
+    assertTrue(storage.getMaxSizeBytes() > 0);
+  }
+
+  @Test
+  public void loadConfigs_withEvictorMillisFields_parsesCorrectly() throws IOException {
+    // Ensure SnakeYAML resolves long-typed fields through the Lombok setters.
+    Path configFile = tempDir.resolve("evictor-millis.yaml");
+    String yamlContent =
+        "worker:\n"
+            + "  storages:\n"
+            + "    - evictorWakeBudgetMillis: 25\n"
+            + "      evictorIdleHeartbeatMillis: 3000\n";
+    Files.write(configFile, yamlContent.getBytes());
+
+    BuildfarmConfigs configs = BuildfarmConfigs.loadConfigs(configFile);
+    Cas storage = configs.getWorker().getStorages().get(0);
+    assertEquals(25L, storage.getEvictorWakeBudgetMillis());
+    assertEquals(3000L, storage.getEvictorIdleHeartbeatMillis());
   }
 }

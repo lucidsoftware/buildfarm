@@ -25,7 +25,6 @@ import static java.lang.Thread.State.WAITING;
 import static java.util.concurrent.Executors.newSingleThreadExecutor;
 import static java.util.concurrent.TimeUnit.MICROSECONDS;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
-import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.fail;
@@ -91,7 +90,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutionException;
@@ -103,10 +101,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Consumer;
-import java.util.logging.Handler;
-import java.util.logging.Level;
-import java.util.logging.LogRecord;
-import java.util.logging.Logger;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -166,7 +160,11 @@ class CASFileCacheTest {
                 })
         .when(delegate)
         .findMissingBlobs(any(Iterable.class), any(DigestFunction.Value.class));
-    blobs = Maps.newHashMap();
+    // ConcurrentMap (not HashMap): tests like expireEntryWaitsForUnreferencedEntry write
+    // into blobs from a child put-thread while the main thread reads via the
+    // InputStreamFactory lambda. HashMap is not safe under concurrent put + get even when
+    // the map is small.
+    blobs = Maps.newConcurrentMap();
     putService = newSingleThreadExecutor();
     storage = Maps.newConcurrentMap();
     expireService = newSingleThreadExecutor();
@@ -191,16 +189,30 @@ class CASFileCacheTest {
               }
               checkArgument(compressor == Compressor.Value.IDENTITY);
               return content.substring((int) offset).newInput();
-            });
+            },
+            // Test fixture: lowBytes == maxSizeInBytes disables eager-to-low-watermark eviction.
+            // Most tests fill the cache to exactly maxSizeInBytes and assert that no eviction
+            // has fired yet; with the production watermark default they'd see early eviction.
+            /* lowBytes= */ 24576,
+            /* wakeBudgetNanos= */ 50_000_000L,
+            /* idleHeartbeatNanos= */ 2_000_000_000L,
+            java.time.Clock.systemUTC());
     // do this so that we can remove the cache root dir
     fileCache.initializeRootDirectory();
     // Force a known block size so tests are more hermetic and don't depend on the host filesystem
     fileCache.setBlockSizeForTesting(TEST_BLOCK_SIZE);
+    // The evictor runs on its own thread. Most tests exercise eviction without
+    // calling start(), so the fixture starts the evictor up-front. The start() call is
+    // idempotent — tests that call fileCache.start(...) explicitly still work.
+    fileCache.evictorForTesting().start();
   }
 
   @After
   public void tearDown() throws IOException, InterruptedException {
     FileStore fileStore = Files.getFileStore(root);
+    // Stop the evictor thread before draining executors so it doesn't queue more cleanup
+    // tasks onto a shutting-down expireService.
+    fileCache.evictorForTesting().stop();
     // bazel appears to have a problem with us creating directories under
     // windows that are marked as no-delete. clean up after ourselves with
     // our utils
@@ -474,6 +486,8 @@ class CASFileCacheTest {
     }
 
     assertThat(noSuchFileException).isNotNull();
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
     assertThat(storage.containsKey(nonexistentKey)).isFalse();
   }
 
@@ -487,22 +501,34 @@ class CASFileCacheTest {
     blobs.put(bigDigest, bigContent);
     Path bigPath = fileCache.put(bigDigest, /* isExecutable= */ false).path();
 
-    AtomicBoolean started = new AtomicBoolean(false);
+    // Capture the put-thread so we can observe its state deterministically rather than
+    // poll on a wall-clock interval. The plan calls for awaitThreadState + awaitQuiescence
+    // here.
+    java.util.concurrent.atomic.AtomicReference<Thread> putThread =
+        new java.util.concurrent.atomic.AtomicReference<>();
     ExecutorService service = newSingleThreadExecutor();
     Future<Void> putFuture =
         service.submit(
             () -> {
-              started.set(true);
+              putThread.set(Thread.currentThread());
               ByteString content = ByteString.copyFromUtf8("CAS Would Exceed Max Size");
               Digest digest = DIGEST_UTIL.compute(content);
               blobs.put(digest, content);
               fileCache.put(digest, /* isExecutable= */ false);
               return null;
             });
-    while (!started.get()) {
-      MICROSECONDS.sleep(1);
+    // Wait for the put-thread to be parked on the hard-cap condvar (held bigBlob fills the
+    // cache exactly). parkUntilUnderHardCap uses cond.await with a timeout, which puts the
+    // thread into TIMED_WAITING (rather than the unbounded WAITING state).
+    long deadlineNanos = System.nanoTime() + SECONDS.toNanos(5);
+    while (putThread.get() == null) {
+      if (System.nanoTime() > deadlineNanos) {
+        putFuture.cancel(true);
+        fail("put thread did not start within 5s");
+      }
+      Thread.yield();
     }
-    // minimal test to ensure that we're blocked
+    awaitThreadState(putThread.get(), Thread.State.TIMED_WAITING, SECONDS.toNanos(5));
     assertThat(putFuture.isDone()).isFalse();
     decrementReference(bigPath);
     try {
@@ -512,227 +538,6 @@ class CASFileCacheTest {
         throw new RuntimeException("could not shut down service");
       }
     }
-  }
-
-  @Test
-  public void waitForLastUnreferencedEntrySkipsWalkAtInfoLevel()
-      throws ExecutionException, IOException, InterruptedException {
-    try (LogCapture capture = new LogCapture(CASFileCache.class, Level.INFO)) {
-      runOverflowingPutAndAwaitWaitCycle(capture);
-
-      List<LogRecord> records = capture.snapshot();
-      assertThat(records).isNotEmpty();
-      // Production path emits only the new lightweight INFO summary; the detailed walk
-      // (header / per-unreferenced-entry / min/max summary) is now FINE-only and must
-      // not appear at INFO.
-      assertThat(records.stream().anyMatch(r -> formatted(r).contains("waiting:"))).isTrue();
-      assertThat(records.stream().noneMatch(r -> formatted(r).contains("header("))).isTrue();
-      assertThat(records.stream().noneMatch(r -> formatted(r).contains("unreferenced entry(")))
-          .isTrue();
-      assertThat(
-              records.stream().noneMatch(r -> formatted(r).contains("unreferenced list is empty")))
-          .isTrue();
-    }
-  }
-
-  @Test
-  public void waitForLastUnreferencedEntryEmitsDetailAtFineLevel()
-      throws ExecutionException, IOException, InterruptedException {
-    try (LogCapture capture = new LogCapture(CASFileCache.class, Level.FINE)) {
-      runOverflowingPutAndAwaitWaitCycle(capture);
-
-      List<LogRecord> records = capture.snapshot();
-      assertThat(records).isNotEmpty();
-      // FINE level reproduces the original detailed walk: a "header(" line per
-      // iteration plus a "unreferenced list is empty ... min(..) max(..)" summary
-      // per iteration. Production INFO summary line must NOT appear at FINE because
-      // the two paths are mutually exclusive.
-      assertThat(records.stream().anyMatch(r -> formatted(r).contains("header("))).isTrue();
-      assertThat(
-              records.stream().anyMatch(r -> formatted(r).contains("unreferenced list is empty")))
-          .isTrue();
-      assertThat(records.stream().noneMatch(r -> formatted(r).contains("waiting:"))).isTrue();
-    }
-  }
-
-  // Fills the cache with one referenced entry, then submits a second put that will park
-  // inside waitForLastUnreferencedEntry (LRU is empty while the first entry is held).
-  // Awaits at least one captured log record so the assertions see the wait-cycle output,
-  // then releases the held entry and drains the put.
-  private void runOverflowingPutAndAwaitWaitCycle(LogCapture capture)
-      throws ExecutionException, IOException, InterruptedException {
-    byte[] bigData = new byte[22000];
-    ByteString bigBlob = ByteString.copyFrom(bigData);
-    Digest bigDigest = DIGEST_UTIL.compute(bigBlob);
-    blobs.put(bigDigest, bigBlob);
-    Path bigPath = fileCache.put(bigDigest, /* isExecutable= */ false).path();
-
-    ExecutorService service = newSingleThreadExecutor();
-    Future<Void> putFuture =
-        service.submit(
-            () -> {
-              ByteString content = ByteString.copyFromUtf8("CAS Would Exceed Max Size");
-              Digest digest = DIGEST_UTIL.compute(content);
-              blobs.put(digest, content);
-              fileCache.put(digest, /* isExecutable= */ false);
-              return null;
-            });
-    capture.awaitRecord(SECONDS.toNanos(5));
-    decrementReference(bigPath);
-    try {
-      putFuture.get();
-    } finally {
-      if (!shutdownAndAwaitTermination(service, 1, SECONDS)) {
-        throw new RuntimeException("could not shut down service");
-      }
-    }
-  }
-
-  @Test
-  @SuppressWarnings("GuardedBy")
-  public void waitForLastUnreferencedEntryStillThrowsWhenStorageEmpty()
-      throws InterruptedException {
-    // Storage starts empty in the test fixture; the LRU header is unlinked so the
-    // method enters the wait loop and immediately throws on the empty-storage check.
-    IllegalStateException thrown = null;
-    fileCache.lruLockForTesting().lock();
-    try {
-      fileCache.waitForLastUnreferencedEntry(1024L);
-    } catch (IllegalStateException e) {
-      thrown = e;
-    } finally {
-      fileCache.lruLockForTesting().unlock();
-    }
-    assertThat(thrown).isNotNull();
-    assertThat(thrown).hasMessageThat().contains("there are no keys to wait for expiration on");
-  }
-
-  @Test
-  @SuppressWarnings("GuardedBy")
-  public void waitForLastUnreferencedEntryExitsOnSizeDropBelowLimit()
-      throws IOException, InterruptedException {
-    // Populate one referenced entry so storage isn't empty; with the entry referenced,
-    // the LRU is empty (header.after == header) and the method enters the wait loop.
-    byte[] bigData = new byte[22000];
-    ByteString bigBlob = ByteString.copyFrom(bigData);
-    Digest bigDigest = DIGEST_UTIL.compute(bigBlob);
-    blobs.put(bigDigest, bigBlob);
-    fileCache.put(bigDigest, /* isExecutable= */ false);
-
-    AtomicReference<Entry> result = new AtomicReference<>();
-    AtomicReference<Throwable> error = new AtomicReference<>();
-    Thread caller =
-        new Thread(
-            () -> {
-              try {
-                fileCache.lruLockForTesting().lock();
-                try {
-                  // Force totalBytes above the cap so the await-then-check sees the
-                  // over-cap state initially.
-                  fileCache.setSizeInBytesForTesting(fileCache.maxSize() + TEST_BLOCK_SIZE);
-                  result.set(fileCache.waitForLastUnreferencedEntry(1024L));
-                } finally {
-                  fileCache.lruLockForTesting().unlock();
-                }
-              } catch (Throwable t) {
-                error.set(t);
-              }
-            });
-    caller.start();
-    // Detect "caller is parked on lruCondition" via hasWaiters() under the lock.
-    // Thread.State.WAITING is a scheduler hint that GC pauses or vCPU contention
-    // can leave stale; hasWaiters() is atomic w.r.t. the condition. Once true,
-    // drop totalBytes back to the cap and signal in the same critical section so
-    // the await-recheck branch returns null.
-    long deadline = System.nanoTime() + SECONDS.toNanos(5);
-    while (true) {
-      fileCache.lruLockForTesting().lock();
-      try {
-        if (fileCache.lruLockForTesting().hasWaiters(fileCache.lruConditionForTesting())) {
-          fileCache.setSizeInBytesForTesting(fileCache.maxSize());
-          fileCache.lruConditionForTesting().signalAll();
-          break;
-        }
-      } finally {
-        fileCache.lruLockForTesting().unlock();
-      }
-      if (System.nanoTime() > deadline) {
-        caller.interrupt();
-        fail("caller did not enter Condition.await() within budget");
-      }
-      Thread.yield();
-    }
-    caller.join(SECONDS.toMillis(5));
-    if (caller.isAlive()) {
-      // Interrupt before fail so a parked caller doesn't sit on lruCondition through
-      // tearDown and cascade noise into subsequent tests — matching the discipline
-      // applied to the sibling stall-regression tests.
-      caller.interrupt();
-      fail("caller still parked on lruCondition after signalAll");
-    }
-    assertThat(error.get()).isNull();
-    assertThat(result.get()).isNull();
-  }
-
-  /** Captures JUL log records for a target logger at a configured level. */
-  private static final class LogCapture implements AutoCloseable {
-    private final Logger logger;
-    private final Handler handler;
-    private final Level previousLevel;
-    private final boolean previousUseParentHandlers;
-    private final List<LogRecord> records = new CopyOnWriteArrayList<>();
-
-    LogCapture(Class<?> targetClass, Level level) {
-      this.logger = Logger.getLogger(targetClass.getName());
-      this.previousLevel = logger.getLevel();
-      this.previousUseParentHandlers = logger.getUseParentHandlers();
-      this.handler =
-          new Handler() {
-            @Override
-            public void publish(LogRecord record) {
-              records.add(record);
-            }
-
-            @Override
-            public void flush() {}
-
-            @Override
-            public void close() {}
-          };
-      handler.setLevel(Level.ALL);
-      logger.setLevel(level);
-      logger.setUseParentHandlers(false);
-      logger.addHandler(handler);
-    }
-
-    void awaitRecord(long timeoutNanos) throws InterruptedException {
-      long deadline = System.nanoTime() + timeoutNanos;
-      while (records.isEmpty()) {
-        if (System.nanoTime() >= deadline) {
-          throw new AssertionError(
-              "no log record arrived within " + NANOSECONDS.toMillis(timeoutNanos) + "ms");
-        }
-        MICROSECONDS.sleep(100);
-      }
-    }
-
-    List<LogRecord> snapshot() {
-      return new ArrayList<>(records);
-    }
-
-    @Override
-    public void close() {
-      logger.removeHandler(handler);
-      logger.setLevel(previousLevel);
-      logger.setUseParentHandlers(previousUseParentHandlers);
-    }
-  }
-
-  // CASFileCache pre-formats log messages with String.format, so LogRecord.getParameters()
-  // is always null and getMessage() is the final string.
-  private static String formatted(LogRecord r) {
-    String msg = r.getMessage();
-    return msg == null ? "" : msg;
   }
 
   @Test
@@ -759,6 +564,10 @@ class CASFileCacheTest {
         ImmutableList.of(pathOne, pathTwo, pathThree),
         ImmutableList.of(),
         DIGEST_UTIL.getDigestFunction());
+    // LRU mutation runs on the evictor thread after MPSC drain. Wait for the
+    // releases to land before asserting order.
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
     /* sentinel <- three <- two <- one <- sentinel */
     assertThat(storage.get(pathOne).after).isEqualTo(storage.get(pathTwo));
     assertThat(storage.get(pathTwo).after).isEqualTo(storage.get(pathThree));
@@ -768,6 +577,9 @@ class CASFileCacheTest {
             fileCache.findMissingBlobs(
                 ImmutableList.of(DigestUtil.toDigest(digestOne)), digestOne.getDigestFunction()))
         .isEmpty();
+    // The recordAccess MPSC re-position also runs on the evictor thread; wait again.
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
     assertThat(storage.get(pathTwo).after).isEqualTo(storage.get(pathThree));
     assertThat(storage.get(pathThree).after).isEqualTo(storage.get(pathOne));
   }
@@ -823,7 +635,7 @@ class CASFileCacheTest {
   }
 
   @Test
-  public void asyncWriteCompletionDischargesWriteSize() throws IOException {
+  public void asyncWriteCompletionDischargesWriteSize() throws Exception {
     ByteString content = ByteString.copyFromUtf8("Hello, World");
     Digest digest = DIGEST_UTIL.compute(content);
 
@@ -838,10 +650,18 @@ class CASFileCacheTest {
       content.writeTo(out);
     }
     assertThat(notified.get()).isTrue();
-    if (!shutdownAndAwaitTermination(expireService, 1, SECONDS)) {
-      throw new RuntimeException("could not shut down expire service");
+    // The async discharge of the duplicate write runs via expireService and
+    // the writesInProgress RemovalListener. Wait for the evictor to settle (which drains
+    // any insertion event from the cancellation) and then poll briefly for the discharge
+    // to propagate.
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
+    long expectedSize = estimateSizeOnDisk(digest.getSize());
+    long deadlineNanos = System.nanoTime() + SECONDS.toNanos(5);
+    while (fileCache.size() != expectedSize && System.nanoTime() < deadlineNanos) {
+      Thread.sleep(5);
     }
-    assertThat(fileCache.size()).isEqualTo(estimateSizeOnDisk(digest.getSize()));
+    assertThat(fileCache.size()).isEqualTo(expectedSize);
     assertThat(incompleteWrite.getCommittedSize()).isEqualTo(digest.getSize());
     assertThat(incompleteWrite.isComplete()).isTrue();
     incompleteOut.close(); // redundant
@@ -990,7 +810,10 @@ class CASFileCacheTest {
     assertThrows(
         NoSuchFileException.class,
         () -> fileCache.newInput(Compressor.Value.IDENTITY, blob.getDigest(), /* offset= */ 0));
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
     assertThat(storage.containsKey(key)).isFalse();
+    assertThat(fileCache.unreferencedEntryCount()).isEqualTo(0);
   }
 
   @Test
@@ -1035,72 +858,6 @@ class CASFileCacheTest {
   }
 
   @Test
-  public void expireInterruptCausesExpirySequenceHalt() throws IOException, InterruptedException {
-    Blob expiringBlob;
-    try (ByteString.Output out = ByteString.newOutput(22000)) {
-      for (int i = 0; i < 22000; i++) {
-        out.write(0);
-      }
-      expiringBlob = new Blob(out.toByteString(), DIGEST_UTIL);
-      fileCache.put(expiringBlob);
-    }
-    Digest expiringDigest = expiringBlob.getDigest();
-
-    // set the delegate to throw interrupted on write output creation
-    Write interruptingWrite =
-        new UnsupportedWrite() {
-          boolean canReset = false;
-
-          // WritesHelper.streamIntoWriteFuture probes isComplete() before calling getOutput(). We
-          // need isComplete to return false so the helper proceeds to getOutput() where this
-          // mock's InterruptedException triggers for this test.
-          @Override
-          public boolean isComplete() {
-            return false;
-          }
-
-          @Override
-          public FeedbackOutputStream getOutput(
-              long offset, long deadlineAfter, TimeUnit deadlineAfterUnits, Runnable onReadyHandler)
-              throws IOException {
-            canReset = true;
-            throw new IOException(new InterruptedException());
-          }
-
-          @Override
-          public void reset() {
-            if (!canReset) {
-              throw new UnsupportedOperationException();
-            }
-          }
-        };
-    when(delegate.getWrite(
-            eq(Compressor.Value.IDENTITY),
-            eq(expiringDigest),
-            any(UUID.class),
-            any(RequestMetadata.class)))
-        .thenReturn(interruptingWrite);
-
-    // FIXME we should have a guarantee that we did not iterate over another expiration
-    InterruptedException sequenceException = null;
-    try {
-      fileCache.put(new Blob(ByteString.copyFromUtf8("Hello, World"), DIGEST_UTIL));
-      fail("should not get here");
-    } catch (InterruptedException e) {
-      sequenceException = e;
-    }
-    assertThat(sequenceException).isNotNull();
-
-    verify(delegate, times(1))
-        .getWrite(
-            eq(Compressor.Value.IDENTITY),
-            eq(expiringDigest),
-            any(UUID.class),
-            any(RequestMetadata.class));
-    assertThat(storage).isEmpty();
-  }
-
-  @Test
   public void delegateWriteCompleteIsNotAnError() throws IOException, InterruptedException {
     Blob expiringBlob;
     try (ByteString.Output out = ByteString.newOutput(22000)) {
@@ -1139,6 +896,11 @@ class CASFileCacheTest {
 
     Blob blob = new Blob(ByteString.copyFromUtf8("Hello, World"), DIGEST_UTIL);
     fileCache.put(blob);
+    // The eviction that calls delegate.getWrite runs on the evictor thread,
+    // not synchronously inside put(). Wait for the evictor to settle so the verify and
+    // isComplete assertions see the side-effects.
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
 
     verify(delegate, times(1))
         .getWrite(
@@ -1151,7 +913,11 @@ class CASFileCacheTest {
   }
 
   void decrementReference(Path path) throws IOException, InterruptedException {
-    fileCache.decrementReferences(
+    decrementReference(fileCache, path);
+  }
+
+  void decrementReference(CASFileCache cache, Path path) throws IOException, InterruptedException {
+    cache.decrementReferences(
         ImmutableList.of(path.getFileName().toString()),
         ImmutableList.of(),
         DIGEST_UTIL.getDigestFunction());
@@ -1238,6 +1004,8 @@ class CASFileCacheTest {
   @Test
   public void duplicateExpiredEntrySuppressesDigestExpiration()
       throws IOException, InterruptedException {
+    // Hold a refcount on the executable=true variant so its presence in storage suppresses
+    // the digest-level onExpire callback when the executable=false variant gets evicted.
     Blob expiringBlob;
     try (ByteString.Output out = ByteString.newOutput(10000)) {
       for (int i = 0; i < 10000; i++) {
@@ -1246,127 +1014,101 @@ class CASFileCacheTest {
       expiringBlob = new Blob(out.toByteString(), DIGEST_UTIL);
     }
     blobs.put(expiringBlob.getDigest(), expiringBlob.getData());
-    decrementReference(
-        fileCache
-            .put(expiringBlob.getDigest(), /* isExecutable= */ false)
-            .path()); // expected eviction
-    blobs.clear();
-    decrementReference(
-        fileCache
-            .put(expiringBlob.getDigest(), /* isExecutable= */ true)
-            .path()); // should be fed from storage directly, not through delegate
+    Path nonExecPath = fileCache.put(expiringBlob.getDigest(), /* isExecutable= */ false).path();
+    Path execPath = fileCache.put(expiringBlob.getDigest(), /* isExecutable= */ true).path();
+    // Release the executable=false reference so it becomes evictable; keep the executable=true
+    // reference held so it remains pinned in storage.
+    decrementReference(nonExecPath);
+    // Wait for the release to land on the LRU.
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
 
     fileCache.put(new Blob(ByteString.copyFromUtf8("Hello, World"), DIGEST_UTIL));
+    // The eviction runs on the evictor thread. Wait for the async cleanup
+    // (including Files.delete via expireService) to complete before checking files exist.
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
+    shutdownAndAwaitTermination(expireService, 5, SECONDS);
 
+    // executable=true variant still in storage → onExpire was NOT called for this digest.
     verifyNoInteractions(onExpire);
-    // assert expiration of non-executable digest
     String expiringKey = fileCache.getKey(expiringBlob.getDigest(), /* isExecutable= */ false);
     assertThat(storage.containsKey(expiringKey)).isFalse();
     assertThat(Files.exists(fileCache.getPath(expiringKey))).isFalse();
+
+    // Clean up so tearDown doesn't trip a refcount-held storage assertion.
+    decrementReference(execPath);
   }
 
-  @SuppressWarnings("unchecked")
   @Test
-  public void interruptDeferredDuringExpirations() throws IOException, InterruptedException {
-    Blob expiringBlob;
+  public void chargeShouldReleaseReservationOnInterrupt() throws Exception {
+    // The observable behavior we care about: a charger parked at the hard cap that is
+    // interrupted out propagates InterruptedException and rolls back its byte reservation.
+    // Hold a refcount on the filling blob so it CANNOT be evicted; the second-thread
+    // charger then has no evictable LRU entries and parks indefinitely until interrupted.
+    Blob fillingBlob;
     try (ByteString.Output out = ByteString.newOutput(22000)) {
       for (int i = 0; i < 22000; i++) {
         out.write(0);
       }
-      expiringBlob = new Blob(out.toByteString(), DIGEST_UTIL);
+      fillingBlob = new Blob(out.toByteString(), DIGEST_UTIL);
     }
-    fileCache.put(expiringBlob);
-    // state of CAS
-    //   22000-byte key (24576 bytes on disk, fills the cache)
+    blobs.put(fillingBlob.getDigest(), fillingBlob.getData());
+    Path fillingPath = fileCache.put(fillingBlob.getDigest(), false).path();
+    // Do NOT decrementReference — refCount stays 1; entry is not on the LRU; not evictable.
+    assertThat(fileCache.size()).isEqualTo(estimateSizeOnDisk(22000));
 
-    AtomicReference<Throwable> exRef = new AtomicReference<>(null);
-    // 0 = not blocking
-    // 1 = blocking
-    // 2 = delegate write
-    AtomicInteger writeState = new AtomicInteger(0);
-    // this will ensure that the discharge task is blocked until we release it
-    Future<Void> blockingExpiration =
-        expireService.submit(
-            () -> {
-              writeState.getAndIncrement();
-              while (writeState.get() != 0) {
-                try {
-                  MICROSECONDS.sleep(1);
-                } catch (InterruptedException e) {
-                  // ignore
-                }
-              }
-              return null;
-            });
-    when(delegate.getWrite(
-            eq(Compressor.Value.IDENTITY),
-            eq(expiringBlob.getDigest()),
-            any(UUID.class),
-            any(RequestMetadata.class)))
-        .thenReturn(
-            new NullWrite() {
-              @Override
-              public FeedbackOutputStream getOutput(
-                  long offset,
-                  long deadlineAfter,
-                  TimeUnit deadlineAfterUnits,
-                  Runnable onReadyHandler)
-                  throws IOException {
-                try {
-                  while (writeState.get() != 1) {
-                    MICROSECONDS.sleep(1);
-                  }
-                  writeState.getAndIncrement(); // move into output stream state
-                  SECONDS.sleep(1); // inspire a long enough delay to be interrupted
-                } catch (InterruptedException e) {
-                  throw new IOException(e);
-                }
-                return super.getOutput(offset, deadlineAfter, deadlineAfterUnits, onReadyHandler);
-              }
-            });
-    Thread expiringThread =
+    AtomicReference<Throwable> exRef = new AtomicReference<>();
+    Thread chargeThread =
         new Thread(
             () -> {
               try {
-                fileCache.put(new Blob(ByteString.copyFromUtf8("Hello, World"), DIGEST_UTIL));
-              } catch (InterruptedException e) {
-                throw new RuntimeException(e);
+                ByteString content = ByteString.copyFromUtf8("Hello, World");
+                Digest d = DIGEST_UTIL.compute(content);
+                blobs.put(d, content);
+                fileCache.put(d, /* isExecutable= */ false);
+              } catch (InterruptedException ie) {
+                exRef.compareAndSet(null, ie);
+                Thread.currentThread().interrupt();
+              } catch (Throwable t) {
+                // The hard-cap-backpressure IOException is a real failure here — we expected
+                // the interrupt to land first and propagate InterruptedException. Capture it
+                // so the assertion below produces a useful diagnostic instead of NPE.
+                exRef.compareAndSet(null, t);
               }
-              fail("should not get here");
             });
-    expiringThread.setUncaughtExceptionHandler((t, e) -> exRef.set(e));
-    // wait for blocking state
-    while (writeState.get() != 1) {
-      MICROSECONDS.sleep(1);
+    chargeThread.setDaemon(true);
+    chargeThread.start();
+    // Wait until the charger has reserved its bytes AND is actually parked on the hard-cap
+    // condvar. The size check confirms the reservation landed (totalBytes.add ran); the
+    // thread-state check confirms we're past Evictor.charge's totalBytes.add and inside
+    // cond.await(remainingNanos, NANOSECONDS), so the interrupt below tests the
+    // interrupt-while-parked invariant rather than interrupt-during-charge-prologue.
+    long deadlineNanos = System.nanoTime() + SECONDS.toNanos(5);
+    long expectedReservedSize = estimateSizeOnDisk(22000) + estimateSizeOnDisk(12);
+    while (fileCache.size() != expectedReservedSize) {
+      if (System.nanoTime() > deadlineNanos) {
+        chargeThread.interrupt();
+        fail(
+            "charger did not enter hard-cap park within 5s; cache size="
+                + fileCache.size()
+                + " expected="
+                + expectedReservedSize);
+      }
+      Thread.sleep(1);
     }
-    expiringThread.start();
-    while (writeState.get() != 2) {
-      MICROSECONDS.sleep(1);
-    }
-    // expiry has been initiated, thread should be waiting
-    MICROSECONDS.sleep(10); // just trying to ensure that we've reached the future wait point
-    // hopefully this will be scheduled *after* the discharge task
-    Future<Void> completedExpiration = expireService.submit(() -> null);
-    // interrupt it
-    expiringThread.interrupt();
-
-    assertThat(expiringThread.isAlive()).isTrue();
-    assertThat(completedExpiration.isDone()).isFalse();
-    writeState.set(0);
-    while (!blockingExpiration.isDone()) {
-      MICROSECONDS.sleep(1);
-    }
-    expiringThread.join();
-    // CAS should now be empty due to expiration and failed put
-    while (!completedExpiration.isDone()) {
-      MICROSECONDS.sleep(1);
-    }
-    assertThat(fileCache.size()).isEqualTo(0);
+    awaitThreadState(chargeThread, Thread.State.TIMED_WAITING, SECONDS.toNanos(5));
+    chargeThread.interrupt();
+    chargeThread.join(SECONDS.toMillis(5));
+    assertThat(chargeThread.isAlive()).isFalse();
+    // The reserved bytes (4096 on-disk for a 12-byte blob) must have been rolled back when
+    // the interrupt propagated. The cache size returns to the cap (the held first blob).
+    assertThat(fileCache.size()).isEqualTo(estimateSizeOnDisk(22000));
     Throwable t = exRef.get();
     assertThat(t).isNotNull();
-    t = t.getCause();
-    assertThat(t).isNotNull();
     assertThat(t).isInstanceOf(InterruptedException.class);
+    // Clean up the held refcount so tearDown can drain.
+    decrementReference(fillingPath);
   }
 
   @Test
@@ -1837,7 +1579,6 @@ class CASFileCacheTest {
     assertThrows(UnsupportedOperationException.class, sentinel::tryEvict);
     assertThrows(UnsupportedOperationException.class, sentinel::completeEviction);
     assertThrows(UnsupportedOperationException.class, sentinel::unlink);
-    assertThrows(UnsupportedOperationException.class, () -> sentinel.recordAccess(sentinel));
     // isEvictable returns false unconditionally; not an exception, but pin the contract.
     assertThat(sentinel.isEvictable()).isFalse();
   }
@@ -1938,179 +1679,6 @@ class CASFileCacheTest {
   }
 
   @Test
-  @SuppressWarnings("GuardedBy")
-  public void evictionShouldDischargeExactlyOnceWhenDirectoryExpirationFails() throws Exception {
-    // Cluster F/G regression pin: dischargeEntry calls discharge() and then rethrows
-    // a directory-expiration failure. Without setting discharged=true BEFORE unlinkEntry,
-    // the caller's !completed finally would observe discharged=false and decrement
-    // totalBytes a second time — recreating the useless-eviction-loop dynamic Phase 1
-    // was written to eliminate.
-    //
-    // Build a custom CFC whose unlinkAndExpireDirectories returns a failed future,
-    // then trigger the failure path via referenceIfExists on an entry whose file no
-    // longer exists. Assert that totalBytes returns to its pre-eviction value (single
-    // discharge), not a negative drift (double discharge).
-    ConcurrentMap<String, Entry> failingStorage = Maps.newConcurrentMap();
-    Path failingRoot = root.resolveSibling("failing-cache");
-    DirectoryEntryCFC failingCache =
-        new DirectoryEntryCFC(
-            failingRoot,
-            /* maxSizeInBytes= */ 24576,
-            /* maxEntrySizeInBytes= */ 24576,
-            /* hexBucketLevels= */ 1,
-            expireService,
-            /* accessRecorder= */ directExecutor(),
-            failingStorage,
-            /* zstdBufferPool= */ null,
-            onPut,
-            onExpire,
-            delegate,
-            /* delegateSkipLoad= */ false,
-            (compressor, digest, offset) -> {
-              throw new NoSuchFileException("not used");
-            }) {
-          @Override
-          protected List<ListenableFuture<Void>> unlinkAndExpireDirectories(
-              Entry entry, ExecutorService service) {
-            return ImmutableList.of(
-                Futures.immediateFailedFuture(new IOException("injected expiration failure")));
-          }
-        };
-    failingCache.initializeRootDirectory();
-    failingCache.setBlockSizeForTesting(TEST_BLOCK_SIZE);
-
-    // Synthesize one unreferenced entry: orphan + linkUnreferenced under lruLock, plus
-    // totalBytes += entry.size. existsDeadline starts in the past so entryExists() goes
-    // straight to Files.exists (which returns false: the file was never created).
-    // Use a digest-shaped key so HexBucketEntryPathStrategy's hex-prefix regex passes.
-    ByteString syntheticContent = ByteString.copyFromUtf8("synthetic-blob-content");
-    Digest syntheticDigest = DIGEST_UTIL.compute(syntheticContent);
-    String key = CASFileCache.getKey(syntheticDigest, /* isExecutable= */ false);
-    long size = 4096L;
-    Entry e = Entry.orphan(key, size, Deadline.after(-1, SECONDS));
-    failingStorage.put(key, e);
-    failingCache.setSizeInBytesForTesting(size);
-    failingCache.lruLockForTesting().lock();
-    try {
-      failingCache.linkUnreferenced(e);
-    } finally {
-      failingCache.lruLockForTesting().unlock();
-    }
-    assertThat(e.isLinked()).isTrue();
-    assertThat(failingCache.size()).isEqualTo(size);
-    long unreferencedBefore = failingCache.unreferencedEntryCount();
-
-    IOException thrown = null;
-    try {
-      failingCache.referenceIfExists(key);
-    } catch (IOException ex) {
-      thrown = ex;
-    }
-
-    assertThat(thrown).isNotNull();
-    // The expirationException is wrapped as IOException via unlinkEntry's catch.
-    assertThat(thrown).hasCauseThat().hasMessageThat().contains("injected expiration failure");
-    // Single discharge: totalBytes back to zero, not negative. Without the fix, this
-    // would be -size because dischargeEntry's internal discharge AND the finally's
-    // discharge would both run.
-    assertThat(failingCache.size()).isEqualTo(0L);
-    assertThat(failingStorage.containsKey(key)).isFalse();
-    assertThat(e.state()).isEqualTo(Entry.State.EVICTED);
-    assertThat(e.isLinked()).isFalse();
-    assertThat(failingCache.unreferencedEntryCount()).isEqualTo(unreferencedBefore - 1);
-  }
-
-  @Test
-  @SuppressWarnings("GuardedBy")
-  public void linkUnreferencedShouldRefuseReferencedEntry() throws Exception {
-    // Race-safety pin: linkUnreferenced must observe refCount() == 0 under lruLock
-    // before linking, so a release-then-acquire race (e.release() commits 1->0 outside
-    // lruLock, then a concurrent tryAcquire bumps to 1 before the batched
-    // linkUnreferenced runs) does not publish a referenced entry onto the LRU tail.
-    Entry e = Entry.orphan("k", 7L, Deadline.after(10, SECONDS));
-    e.tryAcquire(); // simulate the racing acquirer winning the 0 -> 1 transition.
-    assertThat(e.refCount()).isEqualTo(1);
-
-    long unreferencedBefore = fileCache.unreferencedEntryCount();
-    fileCache.lruLockForTesting().lock();
-    try {
-      fileCache.linkUnreferenced(e);
-    } finally {
-      fileCache.lruLockForTesting().unlock();
-    }
-    // Must not have linked the referenced entry into the LRU. The unreferencedCount
-    // assertion catches a regression that incremented the counter unconditionally
-    // while still skipping the addBefore call — isLinked() alone would false-pass.
-    assertThat(e.isLinked()).isFalse();
-    assertThat(fileCache.unreferencedEntryCount()).isEqualTo(unreferencedBefore);
-  }
-
-  @Test
-  @SuppressWarnings("GuardedBy")
-  public void linkUnreferencedShouldRefuseNonLiveEntry() throws Exception {
-    // Pin the state-guard arm: an EVICTING entry has already been chosen as a victim;
-    // re-linking it would let waitForLastUnreferencedEntry pick the same Entry twice.
-    Entry e = Entry.orphan("k", 7L, Deadline.after(10, SECONDS));
-    assertThat(e.tryEvict()).isTrue();
-    assertThat(e.state()).isEqualTo(Entry.State.EVICTING);
-    assertThat(e.refCount()).isEqualTo(0);
-
-    fileCache.lruLockForTesting().lock();
-    try {
-      fileCache.linkUnreferenced(e);
-    } finally {
-      fileCache.lruLockForTesting().unlock();
-    }
-    assertThat(e.isLinked()).isFalse();
-  }
-
-  @Test
-  @SuppressWarnings("GuardedBy")
-  public void linkUnreferencedShouldRefuseAlreadyLinkedEntry() throws Exception {
-    // Pin the linkage-guard arm: a double-link corrupts the doubly-linked list and
-    // double-counts unreferencedCount. The first call publishes; the second must be
-    // a no-op even with state==LIVE && refCount==0.
-    Entry e = Entry.orphan("k", 7L, Deadline.after(10, SECONDS));
-    long before = fileCache.unreferencedEntryCount();
-    fileCache.lruLockForTesting().lock();
-    try {
-      fileCache.linkUnreferenced(e);
-      assertThat(e.isLinked()).isTrue();
-      assertThat(fileCache.unreferencedEntryCount()).isEqualTo(before + 1);
-
-      fileCache.linkUnreferenced(e);
-      assertThat(e.isLinked()).isTrue();
-      assertThat(fileCache.unreferencedEntryCount()).isEqualTo(before + 1);
-    } finally {
-      fileCache.lruLockForTesting().unlock();
-    }
-  }
-
-  @Test
-  @SuppressWarnings("GuardedBy")
-  public void unlinkReferencedShouldBeNoOpOnUnlinkedEntry() throws Exception {
-    // Pin the Cluster E NPE fix: a release-then-acquire race can leave an entry with
-    // refCount==0 && !isLinked() (linkUnreferenced's recheck skipped publication
-    // because a concurrent tryAcquire bumped refCount back to 1, then released).
-    // tryEvict succeeds on such an entry; the subclass unlinkAndExpireDirectories
-    // override routes through unlinkReferenced, which MUST gate on isLinked() so
-    // entry.unlink() does not NPE on null before/after links.
-    Entry e = Entry.orphan("k", 7L, Deadline.after(10, SECONDS));
-    assertThat(e.isLinked()).isFalse();
-    long unreferencedBefore = fileCache.unreferencedEntryCount();
-
-    fileCache.lruLockForTesting().lock();
-    try {
-      fileCache.unlinkReferenced(e); // must not throw, must not decrement.
-    } finally {
-      fileCache.lruLockForTesting().unlock();
-    }
-
-    assertThat(e.isLinked()).isFalse();
-    assertThat(fileCache.unreferencedEntryCount()).isEqualTo(unreferencedBefore);
-  }
-
-  @Test
   public void concurrentAcquireReleaseShouldConvergeToInitialRefCount() throws Exception {
     Entry e = new Entry("k", 7L, Deadline.after(10, SECONDS));
     int threadCount = 16;
@@ -2185,18 +1753,20 @@ class CASFileCacheTest {
     blobs.put(digest, content);
     Path path = fileCache.put(digest, false).path();
     decrementReference(path); // drop to refCount 0 so the entry is on the LRU.
+    // The 1->0 transition's LRU link runs on the evictor; wait for it.
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
     String key = path.getFileName().toString();
     Entry e = storage.get(key);
     assertThat(e.refCount()).isEqualTo(0);
     assertThat(e.isLinked()).isTrue();
 
-    // Call the protected referenceIfExists directly (same-package access). This pins
-    // the atomic 0 -> 1 revive: tryAcquire success + unlinkReferenced under lruLock.
+    // Call the protected referenceIfExists directly (same-package access).
     boolean acquired = fileCache.referenceIfExists(key);
     assertThat(acquired).isTrue();
     assertThat(e.refCount()).isEqualTo(1);
-    // After a 0 -> 1 revival the entry must be unlinked from the LRU.
-    assertThat(e.isLinked()).isFalse();
+    // 0->1 transitions do NOT proactively unlink — the evictor observes the
+    // bumped refcount via tryEvict's rollback. isLinked() may remain true.
     decrementReference(path);
   }
 
@@ -2213,6 +1783,9 @@ class CASFileCacheTest {
     blobs.put(digest, content);
     Path path = fileCache.put(digest, false).path();
     decrementReference(path);
+    // Wait for the evictor to drain the release event so the entry is on LRU.
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
     String key = path.getFileName().toString();
     Entry e = storage.get(key);
     assertThat(e.refCount()).isEqualTo(0);
@@ -2256,101 +1829,15 @@ class CASFileCacheTest {
     assertThat(error.get()).isNull();
     assertThat(successCount.get()).isEqualTo(threadCount);
     assertThat(e.refCount()).isEqualTo(threadCount);
-    // The 0 -> 1 winner drove the unlink; all subsequent acquirers found
-    // !isLinked. unreferencedCount drops by exactly one — the signature of a single
-    // unlink, not multiple competing unlinks.
-    assertThat(e.isLinked()).isFalse();
-    assertThat(fileCache.unreferencedEntryCount()).isEqualTo(unreferencedBefore - 1);
+    // 0->1 acquirers do NOT proactively unlink — that's the evictor's
+    // responsibility (tryEvict's rollback). isLinked() may stay true until the evictor
+    // sweep observes the bumped refcount. The observable invariant we care about
+    // — the entry was not evictable while held — is enforced by the refcount alone.
 
     // Drain references so the entry is evictable for tearDown.
     for (int i = 0; i < threadCount; i++) {
       decrementReference(path);
     }
-  }
-
-  @Test
-  public void lockFreeReadersShouldNotBlockEvictionLock() throws Exception {
-    // Populate one entry. While a thread holds lruLock for an extended period, the public
-    // metric readers (size(), getEvictedCount(), getEvictedSize(), entryCount()) must
-    // not enqueue on the lock. A regression that re-introduced synchronized() on a
-    // reader would show up as the reader thread queueing on lruLock while the holder
-    // sits on it — `lock.getQueueLength() > 0` is the binary check, not wall-clock.
-    //
-    // The readers run on a separate thread so a regression manifests as a bounded
-    // join timeout with a queue-length-observed-non-zero diagnostic rather than the
-    // test thread blocking inside size() until bazel's outer timeout (no diagnostic).
-    ByteString content = ByteString.copyFromUtf8("metric-read");
-    Digest digest = DIGEST_UTIL.compute(content);
-    blobs.put(digest, content);
-    fileCache.put(digest, false);
-
-    java.util.concurrent.locks.ReentrantLock lock = fileCache.lruLockForTesting();
-    CountDownLatch lockHeld = new CountDownLatch(1);
-    CountDownLatch release = new CountDownLatch(1);
-    CountDownLatch readsDone = new CountDownLatch(1);
-    AtomicReference<Throwable> readerError = new AtomicReference<>();
-    Thread holder =
-        new Thread(
-            () -> {
-              lock.lock();
-              try {
-                lockHeld.countDown();
-                release.await();
-              } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-              } finally {
-                lock.unlock();
-              }
-            },
-            "lru-lock-holder");
-    Thread reader =
-        new Thread(
-            () -> {
-              try {
-                for (int i = 0; i < 200; i++) {
-                  fileCache.size();
-                  fileCache.entryCount();
-                  fileCache.getEvictedCount();
-                  fileCache.getEvictedSize();
-                }
-              } catch (Throwable th) {
-                readerError.compareAndSet(null, th);
-              } finally {
-                readsDone.countDown();
-              }
-            },
-            "lock-free-reader");
-    reader.setDaemon(true);
-    holder.setDaemon(true);
-    holder.start();
-    try {
-      assertThat(lockHeld.await(5, SECONDS)).isTrue();
-      reader.start();
-      // Poll the lock's queue length while the reader runs. A regression that made
-      // any reader acquire lruLock would park the reader thread on this lock, and
-      // getQueueLength would observe it before the await(1ms) returns true.
-      int maxQueueLengthObserved = 0;
-      long deadlineNanos = System.nanoTime() + SECONDS.toNanos(5);
-      while (!readsDone.await(1, MILLISECONDS)) {
-        int q = lock.getQueueLength();
-        if (q > maxQueueLengthObserved) {
-          maxQueueLengthObserved = q;
-        }
-        if (System.nanoTime() > deadlineNanos) {
-          break;
-        }
-      }
-      assertThat(readerError.get()).isNull();
-      assertWithMessage("reader did not complete within 5s — likely queued on lruLock")
-          .that(readsDone.getCount())
-          .isEqualTo(0);
-      assertThat(maxQueueLengthObserved).isEqualTo(0);
-    } finally {
-      release.countDown();
-      holder.join(SECONDS.toMillis(5));
-      reader.join(SECONDS.toMillis(5));
-    }
-    assertThat(lock.getQueueLength()).isEqualTo(0);
   }
 
   @Test
@@ -2360,25 +1847,34 @@ class CASFileCacheTest {
     blobs.put(digest, content);
     Path path = fileCache.put(digest, false).path();
     decrementReference(path); // drop initial put refcount so the entry is evictable.
+    // Wait for the evictor to drain the 1->0 release insertion event so the
+    // entry actually lands on the LRU before we open the stream.
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
 
     String key = path.getFileName().toString();
     Entry e = storage.get(key);
     assertThat(e.refCount()).isEqualTo(0);
+    assertThat(e.isLinked()).isTrue();
 
     InputStream in = fileCache.newInput(Compressor.Value.IDENTITY, digest, 0);
     try {
-      // While the stream is open the entry must be held by exactly one reference and
-      // therefore unlinked from the LRU.
+      // While the stream is open the entry must be held by exactly one reference. In
+      // The LRU stays linked (the evictor's tryEvict observes the bumped
+      // refcount and rolls back rather than the acquirer unlinking eagerly), so we do
+      // not assert on isLinked() here.
       assertThat(e.refCount()).isEqualTo(1);
-      assertThat(e.isLinked()).isFalse();
       // Read all bytes — the open fd survives even if eviction unlinks the file.
       ByteString actual = ByteString.readFrom(in);
       assertThat(actual).isEqualTo(content);
     } finally {
       in.close();
     }
-    // After close the refcount returns to zero and the entry is back on the LRU.
+    // After close the refcount returns to zero and (eventually) the entry is back on
+    // the LRU via the evictor's MPSC drain.
     assertThat(e.refCount()).isEqualTo(0);
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
     assertThat(e.isLinked()).isTrue();
   }
 
@@ -2430,6 +1926,9 @@ class CASFileCacheTest {
     // A leak here would manifest as refCount == 1, pinning the entry LIVE forever.
     assertThat(e.refCount()).isEqualTo(0);
     assertThat(e.state()).isEqualTo(Entry.State.LIVE);
+    // The entry lands on the LRU through the evictor's drain; wait.
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
     assertThat(e.isLinked()).isTrue();
   }
 
@@ -2673,21 +2172,22 @@ class CASFileCacheTest {
     assertThat(error.get()).isNull();
 
     // All decrementReference calls have completed → no held refcounts → every entry
-    // in storage must be on the LRU and unreferencedCount must agree.
-    fileCache.lruLockForTesting().lock();
-    try {
-      long onLru = 0;
-      Entry header = fileCache.headerForTesting();
-      for (Entry e = header.after; e != header; e = e.after) {
-        onLru++;
-        // Defense in depth: every LRU entry must be unreferenced and LIVE.
-        assertThat(e.refCount()).isEqualTo(0);
-        assertThat(e.state()).isEqualTo(Entry.State.LIVE);
-      }
-      assertThat(fileCache.unreferencedEntryCount()).isEqualTo(onLru);
-    } finally {
-      fileCache.lruLockForTesting().unlock();
+    // in storage must be on the LRU and unreferencedCount must agree. The evictor puts the
+    // evictor on its own thread, so we wait for the MPSC drain to settle via
+    // awaitQuiescence before walking the LRU — by then the evictor is parked and the
+    // LRU is safe to read without a lock.
+    assertWithMessage("evictor did not quiesce after workload completed")
+        .that(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
+    long onLru = 0;
+    Entry header = fileCache.headerForTesting();
+    for (Entry e = header.after; e != header; e = e.after) {
+      onLru++;
+      // Defense in depth: every LRU entry must be unreferenced and LIVE.
+      assertThat(e.refCount()).isEqualTo(0);
+      assertThat(e.state()).isEqualTo(Entry.State.LIVE);
     }
+    assertThat(fileCache.unreferencedEntryCount()).isEqualTo(onLru);
   }
 
   static class ConcurrentWriteStreamObserver {
@@ -2735,6 +2235,544 @@ class CASFileCacheTest {
     void close() throws IOException {
       out.close();
     }
+  }
+
+  // === Evictor-specific tests ===
+
+  @Test
+  public void evictorShouldQuiesceAfterIdle() throws Exception {
+    // After a put + release with no further activity the evictor must reach quiescence,
+    // not busy-spin. awaitQuiescence times out (false) if the evictor's loop keeps making
+    // forward progress without going to await — the heartbeat check inside the helper
+    // distinguishes "parked between cond.await calls" from "running through the loop body."
+    ByteString content = ByteString.copyFromUtf8("idle-quiescence");
+    Digest digest = DIGEST_UTIL.compute(content);
+    blobs.put(digest, content);
+    Path path = fileCache.put(digest, false).path();
+    decrementReference(path);
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
+  }
+
+  @Test
+  public void offerInsertionShouldSignalEvictorEvenAtLowDepth() throws Exception {
+    // Single-entry insertion (queue depth 1) must wake the evictor so the entry lands on
+    // the LRU. A regression that only signaled on threshold-cross would leave entries
+    // stranded in the MPSC queue until heartbeat fires. Use a dedicated cache with a long
+    // heartbeat so the heartbeat cannot mask a missing signal-on-low-depth path.
+    ConcurrentMap<String, Entry> signalStorage = Maps.newConcurrentMap();
+    CASFileCache signalCache =
+        new DirectoryEntryCFC(
+            root.resolve("low-depth-signal"),
+            /* maxSizeInBytes= */ 24576,
+            /* maxEntrySizeInBytes= */ 24576,
+            /* hexBucketLevels= */ 1,
+            expireService,
+            /* accessRecorder= */ directExecutor(),
+            signalStorage,
+            /* zstdBufferPool= */ null,
+            /* onPut= */ digest -> {},
+            /* onExpire= */ digests -> {},
+            /* delegate= */ null,
+            /* delegateSkipLoad= */ false,
+            (compressor, digest, offset) -> {
+              ByteString content = blobs.get(digest);
+              assertThat(content).isNotNull();
+              checkArgument(compressor == Compressor.Value.IDENTITY);
+              return content.substring((int) offset).newInput();
+            },
+            /* lowBytes= */ 24576,
+            /* wakeBudgetNanos= */ 50_000_000L,
+            /* idleHeartbeatNanos= */ 60_000_000_000L,
+            java.time.Clock.systemUTC());
+    signalCache.initializeRootDirectory();
+    signalCache.setBlockSizeForTesting(TEST_BLOCK_SIZE);
+    signalCache.evictorForTesting().start();
+    ByteString content = ByteString.copyFromUtf8("low-depth-signal");
+    Digest digest = DIGEST_UTIL.compute(content);
+    blobs.put(digest, content);
+    try {
+      Path path = signalCache.put(digest, false).path();
+      decrementReference(signalCache, path);
+      assertThat(signalCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+          .isTrue();
+      Entry e = signalStorage.get(path.getFileName().toString());
+      assertThat(e.isLinked()).isTrue();
+    } finally {
+      signalCache.evictorForTesting().stop();
+    }
+  }
+
+  @Test
+  public void evictorShouldSweepDownToLowWatermark() throws Exception {
+    // Production behavior the default fixture (lowBytes == cap, eager eviction disabled) can't
+    // exercise: with lowBytes < cap the evictor sweeps unreferenced entries until totalBytes
+    // drops to lowBytes, not merely to the cap. Use a dedicated cache rooted in a subdir so its
+    // evictor + snapshot file don't collide with the fixture's.
+    Path wmRoot = root.resolve("wm");
+    CASFileCache wm =
+        new DirectoryEntryCFC(
+            wmRoot,
+            /* maxSizeInBytes= */ 24576, // cap = 6 blocks
+            /* maxEntrySizeInBytes= */ 24576,
+            /* hexBucketLevels= */ 1,
+            expireService,
+            /* accessRecorder= */ directExecutor(),
+            Maps.newConcurrentMap(),
+            /* zstdBufferPool= */ null,
+            /* onPut= */ digest -> {},
+            /* onExpire= */ digests -> {},
+            /* delegate= */ null,
+            /* delegateSkipLoad= */ false,
+            (compressor, digest, offset) -> blobs.get(digest).substring((int) offset).newInput(),
+            /* lowBytes= */ 8192, // sweep target = 2 blocks
+            /* wakeBudgetNanos= */ 50_000_000L,
+            /* idleHeartbeatNanos= */ 2_000_000_000L,
+            java.time.Clock.systemUTC());
+    wm.initializeRootDirectory();
+    wm.setBlockSizeForTesting(TEST_BLOCK_SIZE);
+    wm.evictorForTesting().start();
+    try {
+      // Four unreferenced 1-block entries: 4 * 4096 = 16384, above lowBytes (8192) and below the
+      // cap (24576), so admission never rejects and the watermark — not the cap — drives eviction.
+      List<Path> paths = new ArrayList<>();
+      for (int i = 0; i < 4; i++) {
+        byte[] data = new byte[100];
+        data[0] = (byte) i; // distinct content per entry
+        ByteString blob = ByteString.copyFrom(data);
+        Digest digest = DIGEST_UTIL.compute(blob);
+        blobs.put(digest, blob);
+        Path p = wm.put(digest, false).path();
+        decrementReference(wm, p);
+        paths.add(p);
+      }
+      assertWithMessage("watermark evictor did not quiesce")
+          .that(wm.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+          .isTrue();
+      // Quiescence requires totalBytes <= lowBytes, so the sweep ran down to the watermark (8192),
+      // not merely to the cap (24576). The two oldest (coldest) entries are the ones reclaimed.
+      assertThat(wm.size()).isAtMost(8192L);
+      assertThat(Files.exists(paths.get(0))).isFalse();
+      assertThat(Files.exists(paths.get(1))).isFalse();
+      assertThat(Files.exists(paths.get(2))).isTrue();
+      assertThat(Files.exists(paths.get(3))).isTrue();
+    } finally {
+      wm.evictorForTesting().stop();
+    }
+  }
+
+  @Test
+  public void sweepShouldLeaveLiveRollbackVictimLinked() throws Exception {
+    // If tryEvict rolls LIVE -> EVICTING -> LIVE because refCount became non-zero, the
+    // entry must remain linked. A failed acquirer can still undo a transient refcount bump,
+    // and unlinking the LIVE rollback victim can strand a refCount==0 entry off the LRU
+    // with no later release event to re-offer it.
+    fileCache.evictorForTesting().stop();
+    Entry header = fileCache.headerForTesting();
+    Entry victim = Entry.orphan("live-rollback-victim", 100, Deadline.after(10, SECONDS));
+    victim.addBefore(header);
+    assertThat(victim.tryAcquire()).isEqualTo(0);
+    long diskSize = estimateSizeOnDisk(victim.size);
+    AtomicInteger nowCalls = new AtomicInteger();
+    CasEvictorBacking backing =
+        new CasEvictorBacking() {
+          @Override
+          public Entry lookupEntry(String key) {
+            return key.equals(victim.key) ? victim : null;
+          }
+
+          @Override
+          public Entry safeStorageRemoval(String key) throws IOException {
+            fail("referenced rollback victim must not reach storage removal");
+            return null;
+          }
+
+          @Override
+          public void deleteExpiredKey(String key) {}
+
+          @Override
+          public void expireEntryFallback(String key, long size) {}
+
+          @Override
+          public void invalidateWriteForKey(String key, long size) {}
+
+          @Override
+          public void restoreEntryAfterRaceLoss(String key, Entry replacement) {}
+
+          @Override
+          public long onDiskSize(Entry entry) {
+            return diskSize;
+          }
+
+          @Override
+          public void onDigestFullyExpired(String key, long size) {}
+
+          @Override
+          public void onEntryEvicted(Entry entry) {}
+        };
+    Evictor evictor =
+        new Evictor(
+            backing,
+            expireService,
+            java.time.Clock.systemUTC(),
+            header,
+            /* parkBytes= */ 24576,
+            /* lowBytes= */ 0,
+            /* wakeBudgetNanos= */ 1,
+            /* idleHeartbeatNanos= */ SECONDS.toNanos(30),
+            new TextLRUDB(),
+            root.resolve("live-rollback-lru.txt"));
+    // Allow startup + one sweep iteration, then expire the sweep budget before a second tryEvict.
+    evictor.setNanosSupplier(() -> nowCalls.incrementAndGet() <= 4 ? 0 : 1);
+    evictor.noteUnreferencedAtStartup();
+    evictor.addBytesAtStartup(diskSize);
+    long rollbacksBefore = evictor.currentStateRollbackCount();
+    evictor.start();
+    try {
+      long deadline = System.nanoTime() + SECONDS.toNanos(5);
+      while (evictor.currentStateRollbackCount() == rollbacksBefore) {
+        if (System.nanoTime() > deadline) {
+          fail("evictor did not observe the referenced rollback victim within 5s");
+        }
+        Thread.sleep(2);
+      }
+      assertThat(victim.state()).isEqualTo(Entry.State.LIVE);
+      assertThat(victim.refCount()).isEqualTo(1);
+      assertThat(victim.isLinked()).isTrue();
+      assertThat(evictor.currentUnreferencedCount()).isEqualTo(1);
+    } finally {
+      evictor.stop();
+    }
+  }
+
+  @Test
+  public void evictionShouldReplaceStaleRemovedSibling() throws Exception {
+    ByteString content = ByteString.copyFromUtf8("stale-removed-sibling");
+    Digest digest = DIGEST_UTIL.compute(content);
+    blobs.put(digest, content);
+    Path path = fileCache.put(digest, false).path();
+    decrementReference(path);
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
+
+    String key = path.getFileName().toString();
+    Path removingPath = fileCache.getRemovingPath(key);
+    Files.createDirectories(removingPath.getParent());
+    Files.write(removingPath, ByteString.copyFromUtf8("stale-expired-path").toByteArray());
+    assertThat(Files.exists(removingPath)).isTrue();
+
+    fileCache
+        .evictorForTesting()
+        .setTotalBytesForTesting(fileCache.evictorForTesting().lowBytes() + 1);
+    fileCache.evictorForTesting().requestDrain("test");
+
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
+    assertThat(storage.containsKey(key)).isFalse();
+    assertThat(Files.exists(path)).isFalse();
+    long deadline = System.nanoTime() + SECONDS.toNanos(5);
+    while (Files.exists(removingPath) && System.nanoTime() < deadline) {
+      Thread.sleep(5);
+    }
+    assertThat(Files.exists(removingPath)).isFalse();
+  }
+
+  @Test
+  public void evictionInvalidatesCompletedWriteBeforeAsyncListenerCleanup() throws Exception {
+    CountDownLatch expireServiceBlocked = new CountDownLatch(1);
+    CountDownLatch releaseExpireService = new CountDownLatch(1);
+    expireService.submit(
+        () -> {
+          expireServiceBlocked.countDown();
+          try {
+            releaseExpireService.await();
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+          }
+        });
+    assertThat(expireServiceBlocked.await(5, SECONDS)).isTrue();
+
+    try {
+      ByteString content = ByteString.copyFromUtf8("completed-write-evicted");
+      Digest digest = DIGEST_UTIL.compute(content);
+      Write completedWrite = getWrite(digest);
+      try (OutputStream out = completedWrite.getOutput(1, SECONDS, () -> {})) {
+        content.writeTo(out);
+      }
+      assertThat(completedWrite.isComplete()).isTrue();
+      String key = fileCache.getKey(digest, false);
+      assertThat(storage.containsKey(key)).isTrue();
+
+      fileCache
+          .evictorForTesting()
+          .setTotalBytesForTesting(fileCache.evictorForTesting().lowBytes() + 1);
+      fileCache.evictorForTesting().requestDrain("test");
+
+      long deadline = System.nanoTime() + SECONDS.toNanos(5);
+      while (storage.containsKey(key)) {
+        if (System.nanoTime() > deadline) {
+          fail("evictor did not remove completed write entry within 5s");
+        }
+        Thread.sleep(5);
+      }
+
+      Write replacementWrite = getWrite(digest);
+      assertThat(replacementWrite.getFuture().isDone()).isFalse();
+      assertThat(replacementWrite.isComplete()).isFalse();
+    } finally {
+      releaseExpireService.countDown();
+    }
+  }
+
+  @Test
+  public void evictionDischargesBytesEvenWhenDigestExpiryHookThrows() throws Exception {
+    // bytesFreedThisWake invariant: a RuntimeException escaping evictOne AFTER the discharge
+    // (here from the onExpire digest-fully-expired hook, which runs after safeStorageRemoval and
+    // dischargeNoSignal) must NOT strand the freed bytes — the victim's storage/file removal and
+    // byte discharge already happened, so a producer parked at the hard cap is still woken by the
+    // end-of-sweep signal. Inject the throw via onExpire and confirm a cap-crossing put completes
+    // (proving the parker woke) and the victim is gone despite the hook failure.
+    byte[] fillData = new byte[22000]; // on-disk 24576 = cap
+    Arrays.fill(fillData, (byte) 1);
+    ByteString fillBlob = ByteString.copyFrom(fillData);
+    Digest fillDigest = DIGEST_UTIL.compute(fillBlob);
+    blobs.put(fillDigest, fillBlob);
+    Path fillPath = fileCache.put(fillDigest, false).path();
+    decrementReference(fillPath);
+    String fillKey = fillPath.getFileName().toString();
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+        .isTrue();
+
+    // The digest-fully-expired hook throws on every eviction from now on.
+    doThrow(new RuntimeException("injected onExpire failure")).when(onExpire).accept(any());
+
+    // A cap-crossing put parks at the hard cap until the evictor frees the filler. The eviction's
+    // onExpire throw fires only AFTER the filler's bytes are discharged, so this put MUST complete
+    // rather than time out at the 5-minute hard cap — that is the bytesFreedThisWake wake firing
+    // despite the post-discharge throw.
+    byte[] data2 = new byte[100];
+    Arrays.fill(data2, (byte) 2);
+    ByteString blob2 = ByteString.copyFrom(data2);
+    Digest digest2 = DIGEST_UTIL.compute(blob2);
+    blobs.put(digest2, blob2);
+    Path path2 = fileCache.put(digest2, false).path(); // returns only if the parker woke
+    decrementReference(path2);
+
+    // The filler was evicted — storage entry and canonical file gone — even though the hook threw.
+    assertThat(storage.containsKey(fillKey)).isFalse();
+    assertThat(Files.exists(fillPath)).isFalse();
+    // The new entry made it in.
+    assertThat(storage.containsKey(path2.getFileName().toString())).isTrue();
+  }
+
+  @Test
+  public void evictorShouldRollbackEntryWhenStorageRemovalFailsBeforeDetach() throws Exception {
+    fileCache.evictorForTesting().stop();
+    Entry header = fileCache.headerForTesting();
+    Entry victim = Entry.orphan("rollback-victim", 100, Deadline.after(10, SECONDS));
+    victim.addBefore(header);
+    long diskSize = estimateSizeOnDisk(victim.size);
+    AtomicInteger removalAttempts = new AtomicInteger();
+    CasEvictorBacking backing =
+        new CasEvictorBacking() {
+          @Override
+          public Entry lookupEntry(String key) {
+            return key.equals(victim.key) ? victim : null;
+          }
+
+          @Override
+          public Entry safeStorageRemoval(String key) throws IOException {
+            removalAttempts.incrementAndGet();
+            throw new IOException("injected detach failure");
+          }
+
+          @Override
+          public void deleteExpiredKey(String key) {}
+
+          @Override
+          public void expireEntryFallback(String key, long size) {}
+
+          @Override
+          public void invalidateWriteForKey(String key, long size) {}
+
+          @Override
+          public void restoreEntryAfterRaceLoss(String key, Entry replacement) {}
+
+          @Override
+          public long onDiskSize(Entry entry) {
+            return diskSize;
+          }
+
+          @Override
+          public void onDigestFullyExpired(String key, long size) {}
+
+          @Override
+          public void onEntryEvicted(Entry entry) {}
+        };
+    Evictor evictor =
+        new Evictor(
+            backing,
+            expireService,
+            java.time.Clock.systemUTC(),
+            header,
+            /* parkBytes= */ 24576,
+            /* lowBytes= */ 0,
+            /* wakeBudgetNanos= */ 50_000_000L,
+            /* idleHeartbeatNanos= */ 2_000_000_000L,
+            new TextLRUDB(),
+            root.resolve("rollback-lru.txt"));
+    evictor.noteUnreferencedAtStartup();
+    evictor.addBytesAtStartup(diskSize);
+    evictor.start();
+    try {
+      evictor.requestDrain("test");
+      long deadline = System.nanoTime() + SECONDS.toNanos(5);
+      while (removalAttempts.get() == 0) {
+        if (System.nanoTime() > deadline) {
+          fail("evictor did not attempt removal within 5s");
+        }
+        Thread.sleep(2);
+      }
+      while (victim.state() == Entry.State.EVICTING) {
+        if (System.nanoTime() > deadline) {
+          fail("evictor did not roll back failed removal within 5s");
+        }
+        Thread.sleep(2);
+      }
+
+      assertThat(victim.state()).isEqualTo(Entry.State.LIVE);
+      assertThat(victim.refCount()).isEqualTo(0);
+      assertThat(victim.isLinked()).isTrue();
+      assertThat(evictor.currentTotalBytes()).isEqualTo(diskSize);
+      assertThat(evictor.currentUnreferencedCount()).isEqualTo(1);
+    } finally {
+      evictor.stop();
+    }
+  }
+
+  // chargeShouldRollBackReservationOnHardCapTimeoutTrace was deleted because it asserted
+  // nothing about the timeout path it claimed to cover. The interrupt-path rollback is
+  // exercised by chargeShouldReleaseReservationOnInterrupt above; the timeout-path rollback
+  // is structurally identical (parkUntilUnderHardCap's catch clauses share the same
+  // totalBytes.add(-bytesReserved) recovery) and lacks a deterministic harness without a
+  // FakeClock — which the Evictor's nanos source supports via setNanosSupplier but the
+  // current test fixture does not wire through. Add timeout coverage when that wiring lands.
+
+  @Test
+  public void newLocalInputShouldReadCorrectBytesAcrossPutAndAccess() throws Exception {
+    // Round-trip: write a non-trivial payload, read it back, verify byte-equality. Phase
+    // 2.1's lazy LRU mutation shouldn't disturb the read path.
+    ByteString content = ByteString.copyFromUtf8("read-roundtrip-payload-with-some-length");
+    Digest digest = DIGEST_UTIL.compute(content);
+    blobs.put(digest, content);
+    Path path = fileCache.put(digest, false).path();
+    decrementReference(path);
+    try (InputStream in = fileCache.newInput(Compressor.Value.IDENTITY, digest, 0)) {
+      ByteString actual = ByteString.readFrom(in);
+      assertThat(actual).isEqualTo(content);
+    }
+  }
+
+  @Test
+  public void evictorStartShouldBeIdempotent() throws Exception {
+    // The test fixture starts the evictor in setUp. A redundant start (e.g., from a test
+    // that explicitly invokes start() or from the cache's start() lifecycle) must be a
+    // no-op rather than throwing or doubling threads.
+    long evictorThreadsBefore = countEvictorThreads();
+    long schedulerThreadsBefore = countSnapshotSchedulerThreads();
+    // Sanity: the fixture's evictor thread must actually be running, otherwise the
+    // idempotence assertion below could pass against an empty baseline if someone later
+    // renamed the evictor thread.
+    assertThat(evictorThreadsBefore).isAtLeast(1);
+    assertThat(schedulerThreadsBefore).isAtLeast(1);
+    fileCache.evictorForTesting().start();
+    fileCache.evictorForTesting().start();
+    // Count both the evictor thread and the snapshot scheduler thread: a buggy
+    // non-idempotent start() would spawn an extra of either.
+    assertThat(countEvictorThreads()).isEqualTo(evictorThreadsBefore);
+    assertThat(countSnapshotSchedulerThreads()).isEqualTo(schedulerThreadsBefore);
+    // The evictor thread is still running; quiescence still returns true.
+    assertThat(fileCache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(2)))
+        .isTrue();
+  }
+
+  private static long countEvictorThreads() {
+    return Thread.getAllStackTraces().keySet().stream()
+        .filter(t -> t.getName().startsWith("buildfarm-cas-evictor"))
+        .count();
+  }
+
+  private static long countSnapshotSchedulerThreads() {
+    return Thread.getAllStackTraces().keySet().stream()
+        .filter(t -> t.getName().startsWith("buildfarm-cas-snapshot-scheduler"))
+        .count();
+  }
+
+  @Test
+  public void startupShouldReclaimRemovedSuffixOrphans() throws Exception {
+    // Synthesize an orphan _removed file in the bucket tree, then start the cache. The
+    // orphan must be deleted by scanRoot before any real storage admission.
+    Path bucket =
+        fileCache.getPath(
+            fileCache.getKey(DIGEST_UTIL.compute(ByteString.copyFromUtf8("x")), false));
+    Files.createDirectories(bucket.getParent());
+    Path orphan = bucket.getParent().resolve("orphan_removed");
+    Files.write(orphan, new byte[16]);
+    assertThat(Files.exists(orphan)).isTrue();
+
+    fileCache.start(/* skipLoad= */ false).get();
+
+    assertThat(Files.exists(orphan)).isFalse();
+  }
+
+  @Test
+  public void startupShouldReclaimSnapshotTmpOrphans() throws Exception {
+    // Synthesize a stale AtomicFileWriter tmp at the snapshot location (root), then start
+    // the cache. Stale tmps are left behind when the JVM crashes between writing the tmp
+    // and the atomic rename — they must be cleaned up so the snapshot directory doesn't
+    // accumulate dead state.
+    Path tmpOrphan = root.resolve("lru.txt.tmp.deadbeef-1234-5678-abcd-ef0123456789");
+    Files.write(tmpOrphan, new byte[32]);
+    assertThat(Files.exists(tmpOrphan)).isTrue();
+
+    fileCache.start(/* skipLoad= */ false).get();
+
+    assertThat(Files.exists(tmpOrphan)).isFalse();
+  }
+
+  @Test
+  public void snapshotWriterShouldEmitOnShutdown() throws Exception {
+    // After putting multiple entries and stopping the evictor, the shutdown snapshot file
+    // must exist and contain a (key,size) line for every entry on the LRU. Spot-checking a
+    // single matching line would silently pass if the writer truncated the output or wrote
+    // the wrong size.
+    ByteString content1 = ByteString.copyFromUtf8("snapshot-shutdown-1");
+    ByteString content2 = ByteString.copyFromUtf8("snapshot-shutdown-second-entry");
+    Digest digest1 = DIGEST_UTIL.compute(content1);
+    Digest digest2 = DIGEST_UTIL.compute(content2);
+    blobs.put(digest1, content1);
+    blobs.put(digest2, content2);
+    Path path1 = fileCache.put(digest1, false).path();
+    Path path2 = fileCache.put(digest2, false).path();
+    decrementReference(path1);
+    decrementReference(path2);
+    fileCache.evictorForTesting().stop();
+
+    Path snapshotPath = root.resolve("lru.txt");
+    assertThat(Files.exists(snapshotPath)).isTrue();
+    List<String> lines = Files.readAllLines(snapshotPath);
+    java.util.Map<String, Long> parsed = new java.util.HashMap<>();
+    for (String line : lines) {
+      int sep = line.indexOf(',');
+      assertWithMessage("snapshot line missing comma: " + line).that(sep).isGreaterThan(-1);
+      parsed.put(line.substring(0, sep), Long.parseLong(line.substring(sep + 1)));
+    }
+    String key1 = path1.getFileName().toString();
+    String key2 = path2.getFileName().toString();
+    assertThat(parsed).containsKey(key1);
+    assertThat(parsed).containsKey(key2);
+    assertThat(parsed.get(key1)).isEqualTo(content1.size());
+    assertThat(parsed.get(key2)).isEqualTo(content2.size());
   }
 
   @RunWith(JUnit4.class)

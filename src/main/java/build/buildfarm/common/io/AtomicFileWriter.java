@@ -37,6 +37,14 @@ import java.util.logging.Logger;
  * does not support atomic rename, falls back to a non-atomic delete + createLink with a WARNING log
  * so operators see the reduced durability.
  *
+ * <p>Note: ATOMIC_MOVE is <i>metadata-atomic</i>, not durable. The rename commits atomically in the
+ * directory's inode but the temp file's data may still be in the page cache when the rename lands.
+ * A JVM crash is safe (the data flushes asynchronously); a host crash (power loss / kernel panic)
+ * between the rename and the page-cache flush can leave the target pointing at truncated data.
+ * Callers that need host-crash durability must {@code fsync} the temp file and the parent directory
+ * before close — this class does neither, since its current consumers (LRU snapshots) are
+ * rebuildable from a filesystem scan.
+ *
  * <p>Usage:
  *
  * <pre>{@code

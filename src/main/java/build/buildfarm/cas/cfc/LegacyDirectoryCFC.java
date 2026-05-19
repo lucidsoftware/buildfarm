@@ -51,6 +51,7 @@ import java.nio.channels.ClosedByInterruptException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Clock;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
@@ -107,6 +108,50 @@ public class LegacyDirectoryCFC extends CASFileCache {
       @Nullable ContentAddressableStorage delegate,
       boolean delegateSkipLoad,
       InputStreamFactory externalInputStreamFactory) {
+    this(
+        root,
+        maxSizeInBytes,
+        maxEntrySizeInBytes,
+        hexBucketLevels,
+        storeFileDirsIndexInMemory,
+        execRootFallback,
+        expireService,
+        accessRecorder,
+        storage,
+        directoriesIndexDbName,
+        zstdBufferPool,
+        onPut,
+        onExpire,
+        delegate,
+        delegateSkipLoad,
+        externalInputStreamFactory,
+        /* lowBytes= */ 0, // sentinel; CASFileCache fills in the default
+        Evictor.DEFAULT_WAKE_BUDGET_NANOS,
+        Evictor.DEFAULT_IDLE_HEARTBEAT_NANOS,
+        Clock.systemUTC());
+  }
+
+  public LegacyDirectoryCFC(
+      Path root,
+      long maxSizeInBytes,
+      long maxEntrySizeInBytes,
+      int hexBucketLevels,
+      boolean storeFileDirsIndexInMemory,
+      boolean execRootFallback,
+      ExecutorService expireService,
+      Executor accessRecorder,
+      ConcurrentMap<String, Entry> storage,
+      String directoriesIndexDbName,
+      FixedBufferPool zstdBufferPool,
+      Consumer<Digest> onPut,
+      Consumer<Iterable<Digest>> onExpire,
+      @Nullable ContentAddressableStorage delegate,
+      boolean delegateSkipLoad,
+      InputStreamFactory externalInputStreamFactory,
+      long lowBytes,
+      long wakeBudgetNanos,
+      long idleHeartbeatNanos,
+      Clock clock) {
     super(
         root,
         maxSizeInBytes,
@@ -120,7 +165,11 @@ public class LegacyDirectoryCFC extends CASFileCache {
         onExpire,
         delegate,
         delegateSkipLoad,
-        externalInputStreamFactory);
+        externalInputStreamFactory,
+        lowBytes,
+        wakeBudgetNanos,
+        idleHeartbeatNanos,
+        clock);
     this.execRootFallback = execRootFallback;
     this.directoriesIndexDbName = directoriesIndexDbName;
 
@@ -408,10 +457,11 @@ public class LegacyDirectoryCFC extends CASFileCache {
     }
   }
 
-  // Do not add `synchronized` here — caller holds lruLock, and `this` is the parent
-  // CASFileCache instance (extends-relationship), so `synchronized` would invert lock
-  // order against putDirectorySynchronized (`this` -> lruLock).
-  @GuardedBy("lruLock")
+  /**
+   * Called by the evictor on a successfully-evicted Entry from its own thread; the evictor has
+   * already detached the entry from the LRU. Drains the directoriesIndex referencing this entry and
+   * queues cleanup futures for any containing directories.
+   */
   @Override
   protected List<ListenableFuture<Void>> unlinkAndExpireDirectories(
       Entry entry, ExecutorService service) {
@@ -426,11 +476,6 @@ public class LegacyDirectoryCFC extends CASFileCache {
     for (Digest containingDirectory : containingDirectories) {
       builder.add(expireDirectory(containingDirectory, service));
     }
-
-    // Route through unlinkReferenced so the isLinked() gate applies: an entry whose
-    // linkUnreferenced was skipped (release-then-acquire race) can still be selected
-    // by tryEvict, and unlink() against !isLinked() would NPE.
-    unlinkReferenced(entry);
     if (entry.refCount() != 0) {
       log.severe("removed referenced entry " + entry.key);
     }
