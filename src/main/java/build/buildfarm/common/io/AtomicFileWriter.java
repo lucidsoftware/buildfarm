@@ -15,19 +15,27 @@
 package build.buildfarm.common.io;
 
 import static com.google.common.base.Preconditions.checkState;
+import static java.nio.file.StandardCopyOption.ATOMIC_MOVE;
+import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.UUID;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * A writer that atomically presents a target file only on successful close.
  *
  * <p>Writes are performed to a temporary file with a unique UUID suffix. On successful close(), the
- * target file is atomically replaced via hard link, and the temporary file is deleted.
+ * temp file is atomically renamed onto the target via {@code Files.move(ATOMIC_MOVE,
+ * REPLACE_EXISTING)} — a single syscall ({@code renameat2}) on POSIX filesystems. If the filesystem
+ * does not support atomic rename, falls back to a non-atomic delete + createLink with a WARNING log
+ * so operators see the reduced durability.
  *
  * <p>Usage:
  *
@@ -46,6 +54,8 @@ import java.util.UUID;
  * <p>No thread safety of onSuccess() and close() is guaranteed.
  */
 public class AtomicFileWriter extends BufferedWriter {
+  private static final Logger log = Logger.getLogger(AtomicFileWriter.class.getName());
+
   private final Path target;
   private final Path temp;
   private boolean closed = false;
@@ -81,16 +91,11 @@ public class AtomicFileWriter extends BufferedWriter {
   /**
    * Closes the writer and atomically replaces the target file.
    *
-   * <p>This method:
-   *
-   * <ol>
-   *   <li>Closes the BufferedWriter
-   *   <li>Deletes the target file if it exists
-   *   <li>Creates a hard link from temp file to target (atomic replacement)
-   *   <li>Deletes the temporary file
-   * </ol>
-   *
-   * The temporary file is always deleted, even if an error occurs during the atomic swap.
+   * <p>On success, the temp file is renamed onto the target via {@link
+   * java.nio.file.StandardCopyOption#ATOMIC_MOVE}; on filesystems that do not support atomic
+   * rename, falls back to a non-atomic delete + createLink. Either way the temp file no longer
+   * exists at the end of a successful close. On failure (close threw, onSuccess was never called,
+   * or the move/createLink threw), the temp file is removed.
    *
    * @throws IOException if an error occurs during the atomic swap
    */
@@ -109,19 +114,30 @@ public class AtomicFileWriter extends BufferedWriter {
         replace();
       }
     } finally {
-      Files.delete(temp);
+      // After a successful atomic move the temp no longer exists; deleteIfExists handles both
+      // that case and the failure paths where the temp survived.
+      Files.deleteIfExists(temp);
     }
   }
 
   private void replace() throws IOException {
-    // Delete target file (ignore if doesn't exist)
     try {
-      Files.delete(target);
-    } catch (NoSuchFileException e) {
-      // Ignore - file may not exist
+      Files.move(temp, target, ATOMIC_MOVE, REPLACE_EXISTING);
+    } catch (AtomicMoveNotSupportedException e) {
+      // Filesystem doesn't support atomic rename (rare on POSIX; possible on some networked or
+      // cross-volume Windows setups). Fall back to the non-atomic delete + createLink sequence.
+      // A JVM crash between the delete and createLink leaves the target gone — log loudly so
+      // operators see the reduced durability rather than discovering it after a crash.
+      log.log(
+          Level.WARNING,
+          "atomic move not supported for " + target + "; falling back to non-atomic replace",
+          e);
+      try {
+        Files.delete(target);
+      } catch (NoSuchFileException nsfe) {
+        // Ignore - file may not exist
+      }
+      Files.createLink(target, temp);
     }
-
-    // Create hard link to atomically replace
-    Files.createLink(target, temp);
   }
 }
