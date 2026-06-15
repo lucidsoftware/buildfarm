@@ -22,6 +22,7 @@ import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static com.google.common.util.concurrent.MoreExecutors.shutdownAndAwaitTermination;
 import static java.lang.Thread.State.TERMINATED;
 import static java.lang.Thread.State.WAITING;
+import static java.util.concurrent.Executors.newFixedThreadPool;
 import static java.util.concurrent.Executors.newSingleThreadExecutor;
 import static java.util.concurrent.TimeUnit.MICROSECONDS;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
@@ -2410,9 +2411,11 @@ class CASFileCacheTest {
           @Override
           public void onEntryEvicted(Entry entry) {}
         };
-    Evictor evictor =
-        new Evictor(
+    EvictorShard evictor =
+        new EvictorShard(
             backing,
+            /* index= */ 0,
+            /* shardCount= */ 1,
             expireService,
             java.time.Clock.systemUTC(),
             header,
@@ -2609,9 +2612,11 @@ class CASFileCacheTest {
           @Override
           public void onEntryEvicted(Entry entry) {}
         };
-    Evictor evictor =
-        new Evictor(
+    EvictorShard evictor =
+        new EvictorShard(
             backing,
+            /* index= */ 0,
+            /* shardCount= */ 1,
             expireService,
             java.time.Clock.systemUTC(),
             header,
@@ -2643,7 +2648,7 @@ class CASFileCacheTest {
       assertThat(victim.state()).isEqualTo(Entry.State.LIVE);
       assertThat(victim.refCount()).isEqualTo(0);
       assertThat(victim.isLinked()).isTrue();
-      assertThat(evictor.currentTotalBytes()).isEqualTo(diskSize);
+      assertThat(evictor.currentShardBytes()).isEqualTo(diskSize);
       assertThat(evictor.currentUnreferencedCount()).isEqualTo(1);
     } finally {
       evictor.stop();
@@ -2758,7 +2763,8 @@ class CASFileCacheTest {
     decrementReference(path2);
     fileCache.evictorForTesting().stop();
 
-    Path snapshotPath = root.resolve("lru.txt");
+    // Phase 2.2: snapshots are per-shard; at N=1 the single shard writes shard 0's file.
+    Path snapshotPath = root.resolve("lru_num_shards_1_shard_0.txt");
     assertThat(Files.exists(snapshotPath)).isTrue();
     List<String> lines = Files.readAllLines(snapshotPath);
     java.util.Map<String, Long> parsed = new java.util.HashMap<>();
@@ -2773,6 +2779,832 @@ class CASFileCacheTest {
     assertThat(parsed).containsKey(key2);
     assertThat(parsed.get(key1)).isEqualTo(content1.size());
     assertThat(parsed.get(key2)).isEqualTo(content2.size());
+  }
+
+  // === Phase 2.2 sharding tests ===
+
+  /**
+   * Build a DirectoryEntryCFC partitioned into {@code shardCount} evictor shards rooted at {@code
+   * cacheRoot}, with its own storage map and a blobs-backed input factory. Not started or
+   * initialized — callers do so as the test needs.
+   */
+  private DirectoryEntryCFC buildShardedCache(Path cacheRoot, int shardCount) {
+    // lowBytes == maxSize disables eager eviction; tests fill well under the cap.
+    return buildShardedCache(
+        cacheRoot, shardCount, /* maxSizeInBytes= */ 1 << 20, /* lowBytes= */ 1 << 20);
+  }
+
+  /**
+   * {@link #buildShardedCache(Path, int)} with an explicit cap and low-watermark, for tests that
+   * need eager eviction (small {@code lowBytes}) or a deliberately tiny cap.
+   */
+  private DirectoryEntryCFC buildShardedCache(
+      Path cacheRoot, int shardCount, long maxSizeInBytes, long lowBytes) {
+    CASFileCache[] holder = new CASFileCache[1];
+    DirectoryEntryCFC cache =
+        new DirectoryEntryCFC(
+            cacheRoot,
+            maxSizeInBytes,
+            /* maxEntrySizeInBytes= */ Math.max(TEST_BLOCK_SIZE, maxSizeInBytes / shardCount),
+            /* hexBucketLevels= */ 1,
+            expireService,
+            /* accessRecorder= */ directExecutor(),
+            Maps.newConcurrentMap(),
+            /* zstdBufferPool= */ null,
+            onPut,
+            onExpire,
+            delegate,
+            /* delegateSkipLoad= */ false,
+            (compressor, digest, offset) -> {
+              ByteString content = blobs.get(digest);
+              if (content == null) {
+                return holder[0].newTransparentInput(compressor, digest, offset);
+              }
+              checkArgument(compressor == Compressor.Value.IDENTITY);
+              return content.substring((int) offset).newInput();
+            },
+            lowBytes,
+            /* wakeBudgetNanos= */ 50_000_000L,
+            /* idleHeartbeatNanos= */ 2_000_000_000L,
+            java.time.Clock.systemUTC(),
+            shardCount);
+    holder[0] = cache;
+    return cache;
+  }
+
+  /** Build, initialize, fix the block size, and start every shard's evictor. */
+  private DirectoryEntryCFC startedShardedCache(Path cacheRoot, int shardCount) throws IOException {
+    DirectoryEntryCFC cache = buildShardedCache(cacheRoot, shardCount);
+    cache.initializeRootDirectory();
+    cache.setBlockSizeForTesting(TEST_BLOCK_SIZE);
+    cache.casShardsForTesting().start();
+    return cache;
+  }
+
+  @Test
+  public void deriveEvictorShardCountShouldMatchRoleFormula() {
+    // CAS-only workers: nextPowerOfTwo(max(1, vCPU/4)); exec/combined:
+    // nextPowerOfTwo(max(1,vCPU/8)).
+    assertThat(CASFileCache.deriveEvictorShardCount(96, /* executionRole= */ false)).isEqualTo(32);
+    assertThat(CASFileCache.deriveEvictorShardCount(96, /* executionRole= */ true)).isEqualTo(16);
+    assertThat(CASFileCache.deriveEvictorShardCount(128, false)).isEqualTo(32);
+    assertThat(CASFileCache.deriveEvictorShardCount(128, true)).isEqualTo(16);
+    assertThat(CASFileCache.deriveEvictorShardCount(16, false)).isEqualTo(4);
+    assertThat(CASFileCache.deriveEvictorShardCount(16, true)).isEqualTo(2);
+    assertThat(CASFileCache.deriveEvictorShardCount(8, false)).isEqualTo(2);
+    assertThat(CASFileCache.deriveEvictorShardCount(4, false)).isEqualTo(1);
+    assertThat(CASFileCache.deriveEvictorShardCount(1, true)).isEqualTo(1);
+  }
+
+  @Test
+  public void shardForShouldRouteByStringHashCodeMasked() {
+    // Golden master: routing is EXACTLY String.hashCode() & (N-1). A future change to a different
+    // hash (Murmur, Objects.hash, randomized) trips this test rather than silently invalidating
+    // every on-disk snapshot. DO NOT "fix" the expectations to new behavior — add a migration path.
+    DirectoryEntryCFC cache = buildShardedCache(root.resolveSibling("route"), 32);
+    CasShards shards = cache.casShardsForTesting();
+    // Hand-computed String.hashCode() values, masked to 32 shards.
+    assertThat(shards.shardFor("").index).isEqualTo(0); // hashCode 0
+    assertThat(shards.shardFor("a").index).isEqualTo(1); // 97 & 31
+    assertThat(shards.shardFor("abc").index).isEqualTo(2); // 96354 & 31
+    // Equivalence to the formula across an arbitrary key set.
+    for (String key :
+        new String[] {"deadbeef", "gcc_exec", "0123abcd_dir", "tool", "z".repeat(64)}) {
+      assertWithMessage("routing for %s", key)
+          .that(shards.shardFor(key).index)
+          .isEqualTo(key.hashCode() & 31);
+    }
+  }
+
+  @Test
+  public void shardForShouldKeepCoVUnderBoundOnSyntheticDigests() {
+    int shardCount = 32;
+    DirectoryEntryCFC cache = buildShardedCache(root.resolveSibling("cov"), shardCount);
+    CasShards shards = cache.casShardsForTesting();
+    long[] counts = new long[shardCount];
+    int total = 100_000;
+    java.util.Random random = new java.util.Random(1234567);
+    for (int i = 0; i < total; i++) {
+      // Synthetic Buildfarm keys: 40% bare hex, 30% _exec, 30% _dir, like production digests.
+      StringBuilder sb = new StringBuilder(64);
+      for (int c = 0; c < 64; c++) {
+        sb.append("0123456789abcdef".charAt(random.nextInt(16)));
+      }
+      int kind = i % 10;
+      String key = kind < 4 ? sb.toString() : (kind < 7 ? sb + "_exec" : sb + "_dir");
+      counts[shards.shardFor(key).index]++;
+    }
+    double mean = (double) total / shardCount;
+    double variance = 0;
+    for (long c : counts) {
+      variance += (c - mean) * (c - mean);
+    }
+    double cov = Math.sqrt(variance / shardCount) / mean;
+    // Compare to the coefficient of variation a perfectly uniform (random multinomial) hash would
+    // itself exhibit from finite-sample noise: CoV_random = sqrt((1 - 1/N) * N / total). A good
+    // hash
+    // lands at or below ~1× this; a broken/low-entropy routing (e.g. ignoring high bits) blows past
+    // it. 1.5× tolerates sampling noise while still catching gross non-uniformity.
+    double randomCov = Math.sqrt((1.0 - 1.0 / shardCount) * shardCount / total);
+    assertWithMessage("CoV %s vs random expectation %s", cov, randomCov)
+        .that(cov)
+        .isLessThan(1.5 * randomCov);
+  }
+
+  @Test
+  public void hotKeyDistributionShouldSpreadAcrossShards() {
+    int shardCount = 8;
+    DirectoryEntryCFC cache = buildShardedCache(root.resolveSibling("hotkeys"), shardCount);
+    CasShards shards = cache.casShardsForTesting();
+    // Distinct "tool" digests (gcc, ld, headers, ...) must not all collapse onto one shard.
+    java.util.Set<Integer> hit = new java.util.HashSet<>();
+    for (String tool :
+        new String[] {
+          "gcc", "ld", "clang", "javac", "rustc", "go", "python3", "node", "bash", "make"
+        }) {
+      hit.add(shards.shardFor(DIGEST_UTIL.compute(ByteString.copyFromUtf8(tool)).getHash()).index);
+    }
+    // These 10 tool digests deterministically (SHA-256 + String.hashCode are spec-stable) land on 7
+    // of the 8 shards. Assert with margin rather than at the exact observed value so a tool-list
+    // edit doesn't trip the test, while still catching a routing collapse onto a few shards.
+    assertWithMessage("distinct shards hit by 10 tool digests (observed 7)")
+        .that(hit.size())
+        .isAtLeast(5);
+  }
+
+  @Test
+  public void globalTotalBytesShouldEqualSumOfShardBytesAndSpread() throws Exception {
+    int shardCount = 4;
+    DirectoryEntryCFC cache = startedShardedCache(root.resolveSibling("globalbytes"), shardCount);
+    try {
+      // Put distinct blobs and track the expected on-disk total independently of the shards, so the
+      // assertion catches a charge/accounting bug rather than being x == x (cache.size() IS the sum
+      // of shardBytes, so comparing it to a re-sum of the same shardBytes would be tautological).
+      long expectedTotal = 0;
+      for (int i = 0; i < 24; i++) {
+        ByteString content = ByteString.copyFromUtf8("global-bytes-blob-" + i);
+        Digest digest = DIGEST_UTIL.compute(content);
+        blobs.put(digest, content);
+        cache.put(digest, false);
+        expectedTotal += estimateSizeOnDisk(content.size());
+      }
+      CasShards shards = cache.casShardsForTesting();
+      int nonEmptyShards = 0;
+      for (int i = 0; i < shardCount; i++) {
+        if (shards.shard(i).currentShardBytes() > 0) {
+          nonEmptyShards++;
+        }
+      }
+      assertThat(cache.size()).isEqualTo(expectedTotal);
+      assertWithMessage("blobs should spread across multiple shards")
+          .that(nonEmptyShards)
+          .isAtLeast(2);
+    } finally {
+      cache.casShardsForTesting().stop();
+    }
+  }
+
+  @Test
+  public void oneShardStallShouldNotBlockOtherShards() throws Exception {
+    int shardCount = 4;
+    DirectoryEntryCFC cache = startedShardedCache(root.resolveSibling("stall"), shardCount);
+    try {
+      CasShards shards = cache.casShardsForTesting();
+      // Stall shard 0 by stopping its evictor thread; the other shards keep running.
+      shards.shard(0).stop();
+      int written = 0;
+      for (int i = 0; i < 100 && written < 5; i++) {
+        ByteString content = ByteString.copyFromUtf8("stall-blob-" + i);
+        Digest digest = DIGEST_UTIL.compute(content);
+        // Only exercise keys routed to a live shard; a key on the stalled shard isn't the point.
+        if (shards.shardFor(digest.getHash()).index == 0) {
+          continue;
+        }
+        blobs.put(digest, content);
+        Path path = cache.put(digest, false).path();
+        assertThat(Files.exists(path)).isTrue();
+        written++;
+      }
+      assertWithMessage("puts to live shards should succeed while shard 0 is stalled")
+          .that(written)
+          .isEqualTo(5);
+    } finally {
+      cache.casShardsForTesting().stop();
+    }
+  }
+
+  @Test
+  public void plainBlobEvictionShouldNotRouteThroughFileMover() throws Exception {
+    // The FileMover seam wraps only the _dir eviction rename (Files.move); a plain blob is evicted
+    // via createLink+delete and must NOT touch the mover. This exercises setFileMoverForTesting and
+    // pins that contract. (Exercising the _dir path positively needs putDirectory scaffolding; the
+    // seam is used in production for _dir renames.)
+    DirectoryEntryCFC cache = startedShardedCache(root.resolveSibling("mover"), 1);
+    java.util.concurrent.atomic.AtomicInteger moves =
+        new java.util.concurrent.atomic.AtomicInteger();
+    cache.setFileMoverForTesting(
+        (source, target, options) -> {
+          moves.incrementAndGet();
+          Files.move(source, target, options);
+        });
+    try {
+      // safeStorageRemoval routes only the _dir branch through fileMover.move; a plain blob is
+      // evicted via createLink+delete. Evict a plain blob and confirm the injected mover is wired
+      // (the setter is exercised) but not invoked on this path — pinning that contract.
+      ByteString content = ByteString.copyFromUtf8("mover-blob");
+      Digest digest = DIGEST_UTIL.compute(content);
+      blobs.put(digest, content);
+      Path path = cache.put(digest, false).path();
+      decrementReference(cache, path);
+      cache.casShardsForTesting().shard(0).setTotalBytesForTesting(cache.maxSize() + 1);
+      cache.casShardsForTesting().shard(0).requestDrain("test");
+      assertThat(cache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(5)))
+          .isTrue();
+      assertThat(Files.exists(path)).isFalse();
+      assertThat(moves.get()).isEqualTo(0);
+    } finally {
+      cache.casShardsForTesting().stop();
+    }
+  }
+
+  @Test
+  public void loadShouldRecomputeShardMapOnShardCountIncrease() throws Exception {
+    assertShardCountMigration(/* oldN= */ 2, /* newN= */ 4);
+  }
+
+  @Test
+  public void loadShouldRecomputeShardMapOnShardCountDecrease() throws Exception {
+    // Downsize by 4x. Guards the migration-bound fix: a stale N more than 2x the current count must
+    // still migrate (an earlier "N > 2 * currentN" bound silently stranded these snapshots).
+    assertShardCountMigration(/* oldN= */ 8, /* newN= */ 2);
+  }
+
+  /**
+   * Populate a cache at {@code oldN} shards, stop it (writing per-shard snapshots), restart at
+   * {@code newN} against the same root, and assert the migration: every blob survives, every stale
+   * {@code oldN} snapshot file is deleted, and every {@code newN} snapshot file lists exactly the
+   * keys that route to its shard with no key duplicated across files.
+   */
+  private void assertShardCountMigration(int oldN, int newN) throws Exception {
+    Path cacheRoot = root.resolveSibling("migration-" + oldN + "-to-" + newN);
+    int blobCount = 12;
+    List<Digest> digests = new ArrayList<>();
+    java.util.Set<String> expectedKeys = new java.util.HashSet<>();
+
+    // Phase A: populate at oldN, then stop so each shard writes its snapshot.
+    DirectoryEntryCFC cOld = buildShardedCache(cacheRoot, oldN);
+    try {
+      cOld.start(/* skipLoad= */ false).get();
+      for (int i = 0; i < blobCount; i++) {
+        ByteString content = ByteString.copyFromUtf8("migrate-" + oldN + "-" + i);
+        Digest digest = DIGEST_UTIL.compute(content);
+        blobs.put(digest, content);
+        Path path = cOld.put(digest, false).path();
+        digests.add(digest);
+        expectedKeys.add(path.getFileName().toString());
+        decrementReference(cOld, path);
+      }
+    } finally {
+      cOld.stop(); // drains all shards' MPSC queues and writes each shard's shutdown snapshot
+    }
+    for (int i = 0; i < oldN; i++) {
+      assertThat(Files.exists(cacheRoot.resolve("lru_num_shards_" + oldN + "_shard_" + i + ".txt")))
+          .isTrue();
+    }
+
+    // Phase B: restart at newN against the same root; the oldN snapshots migrate to newN.
+    DirectoryEntryCFC cNew = buildShardedCache(cacheRoot, newN);
+    try {
+      cNew.start(/* skipLoad= */ false).get();
+
+      // Every blob survived (admitted from disk and routed to its newN shard).
+      for (Digest digest : digests) {
+        assertWithMessage("blob %s present after migration", digest.getHash())
+            .that(cNew.containsLocal(digest, /* result= */ null, key -> {}))
+            .isTrue();
+      }
+
+      // Every stale oldN snapshot file was deleted.
+      for (int i = 0; i < oldN; i++) {
+        assertWithMessage("stale oldN snapshot shard %s should be deleted", i)
+            .that(
+                Files.exists(cacheRoot.resolve("lru_num_shards_" + oldN + "_shard_" + i + ".txt")))
+            .isFalse();
+      }
+
+      // Every newN snapshot file exists, lists only keys that route to its shard, and the union
+      // across files is exactly the populated key set with no key duplicated.
+      java.util.Set<String> seen = new java.util.HashSet<>();
+      for (int i = 0; i < newN; i++) {
+        Path file = cacheRoot.resolve("lru_num_shards_" + newN + "_shard_" + i + ".txt");
+        assertWithMessage("newN snapshot shard %s should exist", i)
+            .that(Files.exists(file))
+            .isTrue();
+        for (String line : Files.readAllLines(file)) {
+          String key = line.substring(0, line.indexOf(','));
+          assertWithMessage("key %s in shard-%s file must route to shard %s", key, i, i)
+              .that(key.hashCode() & (newN - 1))
+              .isEqualTo(i);
+          assertWithMessage("key %s appears in more than one shard file", key)
+              .that(seen.add(key))
+              .isTrue();
+        }
+      }
+      assertThat(seen).isEqualTo(expectedKeys);
+    } finally {
+      cNew.stop();
+    }
+  }
+
+  @Test
+  public void loadShouldAbsorbLegacyLruFile() throws Exception {
+    // The pre-2.2 single-file snapshot (lru.txt) must be absorbed on the first sharded startup: its
+    // entries re-hash across the current shards, every blob survives, and lru.txt is deleted. This
+    // is the exact path every pre-sharding worker hits on its first 2.2 startup, so it is covered
+    // distinctly from the sharded-to-sharded assertShardCountMigration cases.
+    Path cacheRoot = root.resolveSibling("legacy-migration");
+    int newN = 4;
+    int blobCount = 12;
+    List<Digest> digests = new ArrayList<>();
+    java.util.Set<String> expectedKeys = new java.util.HashSet<>();
+
+    // Phase A: populate at N=1 and stop. The single shard writes lru_num_shards_1_shard_0.txt,
+    // whose content is byte-identical to a pre-2.2 lru.txt; rename it to the legacy name to stand
+    // in for an upgraded-from-pre-2.2 cache root.
+    DirectoryEntryCFC cOld = buildShardedCache(cacheRoot, 1);
+    try {
+      cOld.start(/* skipLoad= */ false).get();
+      for (int i = 0; i < blobCount; i++) {
+        ByteString content = ByteString.copyFromUtf8("legacy-" + i);
+        Digest digest = DIGEST_UTIL.compute(content);
+        blobs.put(digest, content);
+        Path path = cOld.put(digest, false).path();
+        digests.add(digest);
+        expectedKeys.add(path.getFileName().toString());
+        decrementReference(cOld, path);
+      }
+    } finally {
+      cOld.stop();
+    }
+    Path legacy = cacheRoot.resolve(LruSnapshotFiles.LEGACY_NAME);
+    Files.move(cacheRoot.resolve("lru_num_shards_1_shard_0.txt"), legacy);
+    assertThat(Files.exists(legacy)).isTrue();
+
+    // Phase B: restart at newN against the same root; the legacy lru.txt is absorbed and deleted.
+    DirectoryEntryCFC cNew = buildShardedCache(cacheRoot, newN);
+    try {
+      cNew.start(/* skipLoad= */ false).get();
+
+      // Every blob survived (re-hashed onto its newN shard).
+      for (Digest digest : digests) {
+        assertWithMessage("blob %s present after legacy migration", digest.getHash())
+            .that(cNew.containsLocal(digest, /* result= */ null, key -> {}))
+            .isTrue();
+      }
+
+      // The legacy file was deleted by the successful migration.
+      assertWithMessage("legacy lru.txt must be deleted after a successful migration")
+          .that(Files.exists(legacy))
+          .isFalse();
+
+      // Every newN snapshot file exists, lists only keys that route to its shard, and the union
+      // across files is exactly the populated key set with no key duplicated.
+      java.util.Set<String> seen = new java.util.HashSet<>();
+      for (int i = 0; i < newN; i++) {
+        Path file = cacheRoot.resolve("lru_num_shards_" + newN + "_shard_" + i + ".txt");
+        assertWithMessage("newN snapshot shard %s should exist", i)
+            .that(Files.exists(file))
+            .isTrue();
+        for (String line : Files.readAllLines(file)) {
+          String key = line.substring(0, line.indexOf(','));
+          assertWithMessage("key %s in shard-%s file must route to shard %s", key, i, i)
+              .that(key.hashCode() & (newN - 1))
+              .isEqualTo(i);
+          assertWithMessage("key %s appears in more than one shard file", key)
+              .that(seen.add(key))
+              .isTrue();
+        }
+      }
+      assertThat(seen).isEqualTo(expectedKeys);
+    } finally {
+      cNew.stop();
+    }
+  }
+
+  @Test
+  public void loadShouldTreatCurrentSnapshotWithOutOfRangeShardIndexAsStale() throws Exception {
+    Path cacheRoot = root.resolveSibling("stray-index-current-n");
+    int shardCount = 4;
+    int blobCount = 16;
+    List<Digest> digests = new ArrayList<>();
+    java.util.Set<String> expectedKeys = new java.util.HashSet<>();
+
+    // Populate at N=4 and stop so every shard writes a current-N snapshot.
+    DirectoryEntryCFC cOld = buildShardedCache(cacheRoot, shardCount);
+    try {
+      cOld.start(/* skipLoad= */ false).get();
+      for (int i = 0; i < blobCount; i++) {
+        ByteString content = ByteString.copyFromUtf8("stray-index-" + i);
+        Digest digest = DIGEST_UTIL.compute(content);
+        blobs.put(digest, content);
+        Path path = cOld.put(digest, false).path();
+        digests.add(digest);
+        expectedKeys.add(path.getFileName().toString());
+        decrementReference(cOld, path);
+      }
+    } finally {
+      cOld.stop();
+    }
+
+    // Rename one non-empty current-N snapshot to a filename whose N matches the live shard count
+    // but
+    // whose index is out of range. Startup must treat it as stale, re-hash its entries, and delete
+    // the bogus file only after writing the replacement current-N snapshots.
+    Path source = null;
+    for (int i = 0; i < shardCount; i++) {
+      Path candidate = cacheRoot.resolve(LruSnapshotFiles.name(shardCount, i));
+      assertWithMessage("current-N snapshot shard %s should exist", i)
+          .that(Files.exists(candidate))
+          .isTrue();
+      if (!Files.readAllLines(candidate).isEmpty()) {
+        source = candidate;
+        break;
+      }
+    }
+    assertThat(source).isNotNull();
+    Path bogus = cacheRoot.resolve(LruSnapshotFiles.name(shardCount, 99));
+    Files.move(source, bogus);
+    assertThat(Files.exists(bogus)).isTrue();
+
+    DirectoryEntryCFC cNew = buildShardedCache(cacheRoot, shardCount);
+    try {
+      cNew.start(/* skipLoad= */ false).get();
+
+      for (Digest digest : digests) {
+        assertWithMessage("blob %s present after stray-index migration", digest.getHash())
+            .that(cNew.containsLocal(digest, /* result= */ null, key -> {}))
+            .isTrue();
+      }
+
+      assertWithMessage("out-of-range current-N snapshot must be deleted after migration")
+          .that(Files.exists(bogus))
+          .isFalse();
+
+      java.util.Set<String> seen = new java.util.HashSet<>();
+      for (int i = 0; i < shardCount; i++) {
+        Path file = cacheRoot.resolve(LruSnapshotFiles.name(shardCount, i));
+        assertWithMessage("rewritten current-N snapshot shard %s should exist", i)
+            .that(Files.exists(file))
+            .isTrue();
+        for (String line : Files.readAllLines(file)) {
+          String key = line.substring(0, line.indexOf(','));
+          assertWithMessage("key %s in shard-%s file must route to shard %s", key, i, i)
+              .that(key.hashCode() & (shardCount - 1))
+              .isEqualTo(i);
+          assertWithMessage("key %s appears in more than one shard file", key)
+              .that(seen.add(key))
+              .isTrue();
+        }
+      }
+      assertThat(seen).isEqualTo(expectedKeys);
+    } finally {
+      cNew.stop();
+    }
+  }
+
+  @Test
+  public void buildingShardedCacheWithCapBelowShardCountThrows() {
+    // Reject before allocating shard queues/threads when the shard count cannot hold even the
+    // maximum globally admissible entry size.
+    IllegalArgumentException ex =
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                buildShardedCache(
+                    root.resolveSibling("tinycap"),
+                    /* shardCount= */ 4,
+                    /* maxSizeInBytes= */ 2,
+                    /* lowBytes= */ 1));
+    assertThat(ex).hasMessageThat().contains("shardCount");
+  }
+
+  @Test
+  public void loadShouldIsolateCorruptShardSnapshotAtNGreaterThanOne() throws Exception {
+    Path cacheRoot = root.resolveSibling("corrupt-shard");
+    int shardCount = 4;
+    List<Digest> digests = new ArrayList<>();
+
+    // Populate at N=4 and stop so every shard writes its snapshot.
+    DirectoryEntryCFC cOld = buildShardedCache(cacheRoot, shardCount);
+    try {
+      cOld.start(/* skipLoad= */ false).get();
+      for (int i = 0; i < 16; i++) {
+        ByteString content = ByteString.copyFromUtf8("corrupt-shard-blob-" + i);
+        Digest digest = DIGEST_UTIL.compute(content);
+        blobs.put(digest, content);
+        Path path = cOld.put(digest, false).path();
+        digests.add(digest);
+        decrementReference(cOld, path);
+      }
+    } finally {
+      cOld.stop();
+    }
+
+    // Corrupt one shard's snapshot: a line with no comma trips TextLRUDB's parse checkState, which
+    // loadSnapshotFile catches per-file.
+    Path corrupt = cacheRoot.resolve("lru_num_shards_4_shard_2.txt");
+    assertThat(Files.exists(corrupt)).isTrue();
+    Files.write(
+        corrupt,
+        "this-is-not-a-valid-snapshot-line".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+    // Restart at N=4: the corrupt shard's entries fall back to the filesystem scan (the admission
+    // source of truth), the other three shards load their hints, and no blob is lost.
+    DirectoryEntryCFC cNew = buildShardedCache(cacheRoot, shardCount);
+    try {
+      cNew.start(/* skipLoad= */ false).get();
+      for (Digest digest : digests) {
+        assertWithMessage("blob %s present after corrupt-shard load", digest.getHash())
+            .that(cNew.containsLocal(digest, /* result= */ null, key -> {}))
+            .isTrue();
+      }
+    } finally {
+      cNew.stop();
+    }
+  }
+
+  @Test
+  public void currentShardSnapshotWithZeroSizeFallsBackToScan() throws Exception {
+    Path cacheRoot = root.resolveSibling("snapshot-zero-size");
+    int shardCount = 4;
+    ByteString content = ByteString.copyFromUtf8("snapshot-zero-size-blob");
+    Digest digest = DIGEST_UTIL.compute(content);
+    blobs.put(digest, content);
+    String key;
+
+    DirectoryEntryCFC cOld = buildShardedCache(cacheRoot, shardCount);
+    try {
+      cOld.start(/* skipLoad= */ false).get();
+      Path path = cOld.put(digest, false).path();
+      key = path.getFileName().toString();
+      decrementReference(cOld, path);
+    } finally {
+      cOld.stop();
+    }
+
+    Path snapshot = cacheRoot.resolve(LruSnapshotFiles.name(shardCount, key.hashCode() & 3));
+    Files.write(snapshot, (key + ",0\n").getBytes(StandardCharsets.UTF_8));
+
+    DirectoryEntryCFC cNew = buildShardedCache(cacheRoot, shardCount);
+    try {
+      cNew.start(/* skipLoad= */ false).get();
+      assertThat(cNew.containsLocal(digest, /* result= */ null, unused -> {})).isTrue();
+      assertThat(cNew.size()).isEqualTo(estimateSizeOnDisk(content.size()));
+    } finally {
+      cNew.stop();
+    }
+  }
+
+  @Test
+  public void staleShardSnapshotWithOversizeEntryFallsBackToScanAndMigrates() throws Exception {
+    Path cacheRoot = root.resolveSibling("snapshot-oversize-stale");
+    int oldN = 2;
+    int newN = 4;
+    ByteString content = ByteString.copyFromUtf8("snapshot-oversize-stale-blob");
+    Digest digest = DIGEST_UTIL.compute(content);
+    blobs.put(digest, content);
+    String key;
+
+    DirectoryEntryCFC cOld = buildShardedCache(cacheRoot, oldN);
+    try {
+      cOld.start(/* skipLoad= */ false).get();
+      Path path = cOld.put(digest, false).path();
+      key = path.getFileName().toString();
+      decrementReference(cOld, path);
+    } finally {
+      cOld.stop();
+    }
+
+    Path stale = cacheRoot.resolve(LruSnapshotFiles.name(oldN, key.hashCode() & (oldN - 1)));
+    Files.write(stale, (key + "," + Long.MAX_VALUE + "\n").getBytes(StandardCharsets.UTF_8));
+
+    DirectoryEntryCFC cNew = buildShardedCache(cacheRoot, newN);
+    try {
+      cNew.start(/* skipLoad= */ false).get();
+      assertThat(cNew.containsLocal(digest, /* result= */ null, unused -> {})).isTrue();
+      assertThat(Files.exists(stale)).isFalse();
+    } finally {
+      cNew.stop();
+    }
+  }
+
+  @Test
+  public void migrationSnapshotWriteFailureRetainsStaleFiles() throws Exception {
+    Path cacheRoot = root.resolveSibling("migration-fail");
+    int oldN = 2;
+    int newN = 4;
+    List<Digest> digests = new ArrayList<>();
+
+    // Phase A: populate at oldN, stop so each shard writes its snapshot.
+    DirectoryEntryCFC cOld = buildShardedCache(cacheRoot, oldN);
+    try {
+      cOld.start(/* skipLoad= */ false).get();
+      for (int i = 0; i < 12; i++) {
+        ByteString content = ByteString.copyFromUtf8("migrate-fail-" + i);
+        Digest digest = DIGEST_UTIL.compute(content);
+        blobs.put(digest, content);
+        Path path = cOld.put(digest, false).path();
+        digests.add(digest);
+        decrementReference(cOld, path);
+      }
+    } finally {
+      cOld.stop();
+    }
+    for (int i = 0; i < oldN; i++) {
+      assertThat(Files.exists(cacheRoot.resolve("lru_num_shards_" + oldN + "_shard_" + i + ".txt")))
+          .isTrue();
+    }
+
+    // Phase B: restart at newN but force one shard's migration snapshot write to fail. The
+    // all-or-nothing contract must RETAIN every stale oldN file (for retry on the next startup) and
+    // lose no blob, since the filesystem scan re-admits everything regardless.
+    DirectoryEntryCFC cNew = buildShardedCache(cacheRoot, newN);
+    cNew.casShardsForTesting().shard(1).failSnapshotWriteForTesting = true;
+    try {
+      cNew.start(/* skipLoad= */ false).get();
+
+      for (Digest digest : digests) {
+        assertWithMessage("blob %s present after failed migration", digest.getHash())
+            .that(cNew.containsLocal(digest, /* result= */ null, key -> {}))
+            .isTrue();
+      }
+      for (int i = 0; i < oldN; i++) {
+        assertWithMessage("stale oldN snapshot shard %s must be retained after failed migration", i)
+            .that(
+                Files.exists(cacheRoot.resolve("lru_num_shards_" + oldN + "_shard_" + i + ".txt")))
+            .isTrue();
+      }
+    } finally {
+      // performSnapshot (shutdown) does not consult the test flag, so stop() writes cleanly.
+      cNew.stop();
+    }
+  }
+
+  @Test
+  public void dirEvictionShouldRouteThroughFileMover() throws Exception {
+    // Positive counterpart to plainBlobEvictionShouldNotRouteThroughFileMover: evicting a _dir
+    // entry
+    // MUST route its rename through fileMover.move (the production fault-injection seam), unlike a
+    // plain blob (createLink + delete). A tiny lowBytes makes the evictor reclaim the unreferenced
+    // _dir as soon as it lands on the LRU.
+    DirectoryEntryCFC cache =
+        buildShardedCache(
+            root.resolveSibling("dirmover"),
+            /* shardCount= */ 1,
+            /* maxSizeInBytes= */ 1 << 20,
+            /* lowBytes= */ 4);
+    cache.initializeRootDirectory();
+    cache.setBlockSizeForTesting(TEST_BLOCK_SIZE);
+    cache.casShardsForTesting().start();
+    java.util.concurrent.atomic.AtomicInteger moves =
+        new java.util.concurrent.atomic.AtomicInteger();
+    cache.setFileMoverForTesting(
+        (source, target, options) -> {
+          moves.incrementAndGet();
+          Files.move(source, target, options);
+        });
+    try {
+      ByteString file = ByteString.copyFromUtf8("dir-mover-file");
+      Digest fileDigest = DIGEST_UTIL.compute(file);
+      blobs.put(fileDigest, file);
+      Directory directory =
+          Directory.newBuilder()
+              .addFiles(
+                  FileNode.newBuilder()
+                      .setName("file")
+                      .setDigest(DigestUtil.toDigest(fileDigest))
+                      .build())
+              .build();
+      Digest dirDigest = DIGEST_UTIL.compute(directory);
+      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex =
+          ImmutableMap.of(DigestUtil.toDigest(dirDigest), directory);
+      Path dirPath =
+          getInterruptiblyOrIOException(cache.putDirectory(dirDigest, directoriesIndex, putService))
+              .path();
+      assertThat(Files.isDirectory(dirPath)).isTrue();
+
+      // Release the directory reference so the _dir entry becomes unreferenced and evictable.
+      cache.decrementReferences(
+          ImmutableList.of(),
+          ImmutableList.of(DigestUtil.toDigest(dirDigest)),
+          DIGEST_UTIL.getDigestFunction());
+
+      assertThat(cache.evictorForTesting().awaitQuiescence(java.time.Duration.ofSeconds(10)))
+          .isTrue();
+
+      assertWithMessage("the _dir eviction must route through the injected fileMover.move")
+          .that(moves.get())
+          .isAtLeast(1);
+      assertThat(Files.exists(dirPath)).isFalse();
+    } finally {
+      cache.casShardsForTesting().stop();
+    }
+  }
+
+  @Test
+  public void concurrentChargesAcrossShardsShouldKeepByteAccountingConsistent() throws Exception {
+    int shardCount = 4;
+    // A small cap with eager eviction (lowBytes well below cap) so concurrent puts actually drive
+    // per-shard eviction across all four shards under backpressure, not merely fill an empty cache.
+    // Hold the storage map so the end-state assertion can compare each shard's byte counter to the
+    // actual on-disk footprint of the entries still resident in it.
+    ConcurrentMap<String, Entry> shardedStorage = Maps.newConcurrentMap();
+    CASFileCache[] holder = new CASFileCache[1];
+    DirectoryEntryCFC cache =
+        new DirectoryEntryCFC(
+            root.resolveSibling("concurrent"),
+            /* maxSizeInBytes= */ 1 << 20,
+            /* maxEntrySizeInBytes= */ 64 * 1024,
+            /* hexBucketLevels= */ 1,
+            expireService,
+            /* accessRecorder= */ directExecutor(),
+            shardedStorage,
+            /* zstdBufferPool= */ null,
+            onPut,
+            onExpire,
+            delegate,
+            /* delegateSkipLoad= */ false,
+            (compressor, digest, offset) -> {
+              ByteString content = blobs.get(digest);
+              if (content == null) {
+                return holder[0].newTransparentInput(compressor, digest, offset);
+              }
+              checkArgument(compressor == Compressor.Value.IDENTITY);
+              return content.substring((int) offset).newInput();
+            },
+            /* lowBytes= */ 64 * 1024,
+            /* wakeBudgetNanos= */ 50_000_000L,
+            /* idleHeartbeatNanos= */ 2_000_000_000L,
+            java.time.Clock.systemUTC(),
+            shardCount);
+    holder[0] = cache;
+    cache.initializeRootDirectory();
+    cache.setBlockSizeForTesting(TEST_BLOCK_SIZE);
+    cache.casShardsForTesting().start();
+    try {
+      int threads = 6;
+      int perThread = 100;
+      ExecutorService pool = newFixedThreadPool(threads);
+      CyclicBarrier barrier = new CyclicBarrier(threads);
+      List<Future<?>> futures = new ArrayList<>();
+      for (int t = 0; t < threads; t++) {
+        int threadId = t;
+        futures.add(
+            pool.submit(
+                () -> {
+                  barrier.await();
+                  for (int i = 0; i < perThread; i++) {
+                    ByteString content =
+                        ByteString.copyFromUtf8("concurrent-" + threadId + "-" + i);
+                    Digest digest = DIGEST_UTIL.compute(content);
+                    blobs.put(digest, content);
+                    Path path = cache.put(digest, false).path();
+                    // Drop to refCount 0 so the entry is evictable and its shard can reclaim it.
+                    decrementReference(cache, path);
+                  }
+                  return null;
+                }));
+      }
+      for (Future<?> f : futures) {
+        f.get();
+      }
+      shutdownAndAwaitTermination(pool, 10, SECONDS);
+
+      CasShards shards = cache.casShardsForTesting();
+      for (int i = 0; i < shardCount; i++) {
+        assertWithMessage("shard %s should quiesce", i)
+            .that(shards.shard(i).awaitQuiescence(java.time.Duration.ofSeconds(15)))
+            .isTrue();
+      }
+
+      // Ground-truth accounting (NOT the tautological global == sum-of-shards): each shard's byte
+      // counter must equal the on-disk footprint of the LIVE entries currently routed to it. A
+      // charge/discharge routing bug, a double-discharge, or cross-shard drift would break this.
+      long[] expectedPerShard = new long[shardCount];
+      for (Entry e : shardedStorage.values()) {
+        if (e.state() == Entry.State.LIVE) {
+          expectedPerShard[e.key.hashCode() & (shardCount - 1)] += estimateSizeOnDisk(e.size);
+        }
+      }
+      for (int i = 0; i < shardCount; i++) {
+        assertWithMessage("shard %s byte counter must match its resident LIVE entries", i)
+            .that(shards.shard(i).currentShardBytes())
+            .isEqualTo(expectedPerShard[i]);
+      }
+      assertThat(cache.size()).isAtMost(cache.maxSize());
+    } finally {
+      cache.casShardsForTesting().stop();
+    }
   }
 
   @RunWith(JUnit4.class)

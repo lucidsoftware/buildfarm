@@ -85,4 +85,24 @@ public class Size {
   public static long bytesToGb(long bytes) {
     return bytes / 1024 / 1024 / 1024;
   }
+
+  /**
+   * @brief Largest evictor shard count whose per-shard cap can still hold one max-size entry.
+   * @details The CAS divides its global cap evenly across N shards (cap / N), so for an entry of
+   *     {@code maxEntrySizeInBytes} to be admissible on a shard, the per-shard cap must be at least
+   *     the entry size, bounding N by {@code maxSizeInBytes / maxEntrySizeInBytes}. Returns 1 when
+   *     the cap is unset/non-positive (the single-shard floor). The result is clamped to int range.
+   * @param maxSizeInBytes The global cache cap in bytes.
+   * @param maxEntrySizeInBytes The largest admissible entry size in bytes.
+   * @return The maximum shard count, at least 1.
+   * @note Suggested return identifier: maxShardCount.
+   */
+  public static int maxShardCountForEntrySize(long maxSizeInBytes, long maxEntrySizeInBytes) {
+    if (maxSizeInBytes <= 0) {
+      return 1;
+    }
+    long effectiveMaxEntrySize = Math.max(1L, Math.min(maxEntrySizeInBytes, maxSizeInBytes));
+    long maxShardCount = Math.max(1L, maxSizeInBytes / effectiveMaxEntrySize);
+    return (int) Math.min(maxShardCount, Integer.MAX_VALUE);
+  }
 }

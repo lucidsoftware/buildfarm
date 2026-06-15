@@ -26,6 +26,7 @@ java_test(
         "@buildfarm_maven//:io_grpc_grpc_stub",
         "@buildfarm_maven//:io_grpc_grpc_util",
         "@buildfarm_maven//:org_mockito_mockito_core",
+        "@buildfarm_maven//:org_openjdk_jol_jol_core",
         "@googleapis//google/bytestream:bytestream_java_grpc",
         "@googleapis//google/bytestream:bytestream_java_proto",
         "@remoteapis//build/bazel/remote/execution/v2:remote_execution_java_proto",

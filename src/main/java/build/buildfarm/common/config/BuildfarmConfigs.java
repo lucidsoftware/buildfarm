@@ -3,6 +3,7 @@ package build.buildfarm.common.config;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.ExecutionProperties;
 import build.buildfarm.common.ExecutionWrapperProperties;
+import build.buildfarm.common.Size;
 import build.buildfarm.common.SystemProcessors;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
@@ -375,6 +376,31 @@ public final class BuildfarmConfigs {
               + heartbeatMillis
               + "); the heartbeat is the backstop for missed wake signals and must outlast a"
               + " sweep");
+    }
+    // 0 is the auto-derive sentinel; an explicit shard count must be a power of two so the
+    // hash(key) & (N - 1) routing is uniform and the snapshot filenames remain stable.
+    int evictorShards = storage.getEvictorShards();
+    if (evictorShards < 0) {
+      throw new ConfigurationException(
+          "evictorShards must be >= 0 (0 = auto-derive); got: " + evictorShards);
+    }
+    if (evictorShards > 0 && Integer.bitCount(evictorShards) != 1) {
+      throw new ConfigurationException(
+          "evictorShards must be a power of two (or 0 to auto-derive); got: " + evictorShards);
+    }
+    if (evictorShards > 0 && maxSizeBytes > 0) {
+      int maxShardCount =
+          Size.maxShardCountForEntrySize(maxSizeBytes, getInstance().getMaxEntrySizeBytes());
+      if (evictorShards > maxShardCount) {
+        throw new ConfigurationException(
+            "evictorShards must be <= "
+                + maxShardCount
+                + " for maxSizeBytes="
+                + maxSizeBytes
+                + " and maxEntrySizeBytes="
+                + getInstance().getMaxEntrySizeBytes()
+                + "; use fewer shards or lower maxEntrySizeBytes");
+      }
     }
   }
 

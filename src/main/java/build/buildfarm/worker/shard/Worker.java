@@ -43,6 +43,7 @@ import build.buildfarm.common.EmptyInputStreamFactory;
 import build.buildfarm.common.FailoverInputStreamFactory;
 import build.buildfarm.common.InputStreamFactory;
 import build.buildfarm.common.LoggingMain;
+import build.buildfarm.common.Size;
 import build.buildfarm.common.ZstdDecompressingOutputStream.FixedBufferPool;
 import build.buildfarm.common.config.BuildfarmConfigs;
 import build.buildfarm.common.config.Cas;
@@ -447,10 +448,11 @@ public final class Worker extends LoggingMain {
       InputStreamFactory externalInputStreamFactory) {
     long maxSizeBytes = cas.getMaxSizeBytes();
     long lowBytes = computeLowBytes(cas, maxSizeBytes);
-    // Convert operator-facing millis to nanos at the boundary; the Evictor API is nanos-based
+    // Convert operator-facing millis to nanos at the boundary; the EvictorShard API is nanos-based
     // for precision and to align with System.nanoTime, but YAML operators reason in ms.
     long wakeBudgetNanos = TimeUnit.MILLISECONDS.toNanos(cas.getEvictorWakeBudgetMillis());
     long heartbeatNanos = TimeUnit.MILLISECONDS.toNanos(cas.getEvictorIdleHeartbeatMillis());
+    int shardCount = computeEvictorShards(cas, maxEntrySizeInBytes, maxSizeBytes);
     if (configs.getWorker().isLegacyDirectoryFileCache()) {
       return new LegacyDirectoryCFC(
           root,
@@ -472,7 +474,8 @@ public final class Worker extends LoggingMain {
           lowBytes,
           wakeBudgetNanos,
           heartbeatNanos,
-          Clock.systemUTC());
+          Clock.systemUTC(),
+          shardCount);
     }
     return new DirectoryEntryCFC(
         root,
@@ -491,7 +494,42 @@ public final class Worker extends LoggingMain {
         lowBytes,
         wakeBudgetNanos,
         heartbeatNanos,
-        Clock.systemUTC());
+        Clock.systemUTC(),
+        shardCount);
+  }
+
+  /**
+   * Resolve the evictor shard count: the operator-set {@code cas.evictorShards}, or — when that is
+   * the 0 sentinel — the role-aware auto-derive from vCPU. A combined-role worker (execution + cas)
+   * uses the exec formula because threads are the more brittle resource when doing both jobs. An
+   * explicit value above the vCPU count is honored but logged WARN, since more shards than cores
+   * yields diminishing eviction parallelism for the extra thread footprint. Auto-derived values are
+   * clamped so each shard can hold the configured maximum entry size within the global cache cap.
+   */
+  static int computeEvictorShards(Cas cas, long maxEntrySizeInBytes, long maxSizeBytes) {
+    int vCpu = Runtime.getRuntime().availableProcessors();
+    int explicit = cas.getEvictorShards();
+    if (explicit > 0) {
+      if (explicit > vCpu) {
+        log.warning(
+            String.format(
+                "cas.evictorShards=%d exceeds available processors (%d); using it anyway",
+                explicit, vCpu));
+      }
+      return explicit;
+    }
+    boolean executionRole = configs.getWorker().getCapabilities().isExecution();
+    int derived = CASFileCache.deriveEvictorShardCount(vCpu, executionRole);
+    int maxByEntry = Size.maxShardCountForEntrySize(maxSizeBytes, maxEntrySizeInBytes);
+    int clamped = Math.min(derived, Integer.highestOneBit(maxByEntry));
+    if (clamped < derived) {
+      log.info(
+          String.format(
+              "auto-derived cas.evictorShards=%d clamped to %d so each shard can hold"
+                  + " maxEntrySizeBytes=%d within maxSizeBytes=%d",
+              derived, clamped, maxEntrySizeInBytes, maxSizeBytes));
+    }
+    return Math.max(1, clamped);
   }
 
   /**

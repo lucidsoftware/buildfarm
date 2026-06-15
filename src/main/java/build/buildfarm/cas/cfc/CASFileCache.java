@@ -56,6 +56,7 @@ import build.buildfarm.common.EmptyInputStreamFactory;
 import build.buildfarm.common.EntryLimitException;
 import build.buildfarm.common.FailoverInputStreamFactory;
 import build.buildfarm.common.InputStreamFactory;
+import build.buildfarm.common.Size;
 import build.buildfarm.common.Time;
 import build.buildfarm.common.Write;
 import build.buildfarm.common.Write.CompleteWrite;
@@ -106,6 +107,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.ClosedChannelException;
+import java.nio.file.CopyOption;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileStore;
 import java.nio.file.Files;
@@ -115,6 +117,8 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.AbstractMap;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
@@ -129,6 +133,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
@@ -176,9 +181,14 @@ public abstract class CASFileCache implements ContentAddressableStorage {
   private final Consumer<Iterable<Digest>> onExpire;
   private final ExecutorService expireService;
   private final LRUDB db = new TextLRUDB();
-  // LRU snapshot file. Read on startup to seed the in-memory LRU; rewritten by the evictor on a
-  // periodic schedule and at shutdown.
-  private final Path lru;
+
+  // Snapshot files from a previous run at a different shard count (or the legacy lru.txt) that the
+  // startup scan loaded as recency hints and must rewrite-then-delete once the LRU is fully
+  // populated. Set during scanRoot, consumed by migrateSnapshotsIfPending after computeDirectories
+  // (so the rewrite captures _dir entries). Empty when no migration is pending. Single-threaded
+  // startup access; no synchronization needed.
+  private List<Path> pendingMigrationStaleFiles = List.of();
+  private Set<String> pendingMigrationOldNLabels = Set.of();
 
   private final FixedBufferPool zstdBufferPool;
   @Nullable private final ContentAddressableStorage delegate;
@@ -224,17 +234,35 @@ public abstract class CASFileCache implements ContentAddressableStorage {
   protected FileStore fileStore; // bound to root
   protected long blockSize = DEFAULT_BLOCK_SIZE;
 
-  // The LRU sentinel header is constructed once and handed to the Evictor; the evictor thread
-  // becomes its sole writer after start(). Startup scan populates the LRU before start() runs.
-  protected final transient Entry header = new SentinelEntry();
-  protected final Evictor evictor;
+  /**
+   * Indirection over {@link Files#move} so tests can inject {@code Files.move} failure modes (e.g.
+   * {@code ENOSPC} / {@code EIO}) at the eviction-rename step. Default wraps the real call.
+   */
+  @FunctionalInterface
+  interface FileMover {
+    void move(Path source, Path target, CopyOption... options) throws IOException;
+  }
+
+  private volatile FileMover fileMover = Files::move;
+
+  @VisibleForTesting
+  void setFileMoverForTesting(FileMover fileMover) {
+    this.fileMover = fileMover;
+  }
+
+  // One LRU sentinel header per shard, constructed once and handed to CasShards; each shard's
+  // evictor thread becomes the sole writer of its own list after start(). The startup scan
+  // populates the lists (routed by shard) before start() runs. headers[i] anchors shard i's list.
+  private final Entry[] headers;
+  protected final CasShards casShards;
 
   private State state = new State();
 
   private Thread prometheusMetricsThread;
+  private final AtomicLong startupAdmissionBytes = new AtomicLong();
 
   public long size() {
-    return evictor.currentTotalBytes();
+    return casShards.globalTotalBytes();
   }
 
   public long maxSize() {
@@ -252,7 +280,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
    * not consulted for any admission or capacity decision.
    */
   public long unreferencedEntryCount() {
-    return evictor.currentUnreferencedCount();
+    return casShards.globalUnreferencedCount();
   }
 
   public long directoryStorageCount() {
@@ -260,21 +288,29 @@ public abstract class CASFileCache implements ContentAddressableStorage {
   }
 
   public int getEvictedCount() {
-    return evictor.getEvictedCount();
+    return casShards.getEvictedCount();
   }
 
   public long getEvictedSize() {
-    return evictor.getEvictedSize();
+    return casShards.getEvictedSize();
   }
 
   @VisibleForTesting
-  Evictor evictorForTesting() {
-    return evictor;
+  EvictorShard evictorForTesting() {
+    // Shard 0. Tests run at N=1 (the existing-test-preservation rule), so shard 0 is the only
+    // shard and is equivalent to the pre-2.2 single evictor. Multi-shard tests use
+    // casShardsForTesting.
+    return casShards.shard(0);
+  }
+
+  @VisibleForTesting
+  CasShards casShardsForTesting() {
+    return casShards;
   }
 
   @VisibleForTesting
   Entry headerForTesting() {
-    return header;
+    return headers[0];
   }
 
   public record CacheScanResults(
@@ -322,8 +358,8 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         delegateSkipLoad,
         externalInputStreamFactory,
         /* lowBytes= */ 0, // sentinel; full-arg constructor fills in defaultLowBytes
-        Evictor.DEFAULT_WAKE_BUDGET_NANOS,
-        Evictor.DEFAULT_IDLE_HEARTBEAT_NANOS,
+        EvictorShard.DEFAULT_WAKE_BUDGET_NANOS,
+        EvictorShard.DEFAULT_IDLE_HEARTBEAT_NANOS,
         Clock.systemUTC());
   }
 
@@ -338,11 +374,33 @@ public abstract class CASFileCache implements ContentAddressableStorage {
   }
 
   /**
+   * Role-aware auto-derive of the evictor shard count from vCPU, exposed for {@code Worker} (which
+   * is in another package and cannot reach the package-private {@link CasShards}). See {@link
+   * CasShards#deriveShardCount}.
+   */
+  public static int deriveEvictorShardCount(int vCpu, boolean executionRole) {
+    return CasShards.deriveShardCount(vCpu, executionRole);
+  }
+
+  private static void checkShardCountCanHoldAdmissibleEntry(
+      long maxSizeInBytes, long maxEntrySizeInBytes, int shardCount) {
+    int maxShardCount = Size.maxShardCountForEntrySize(maxSizeInBytes, maxEntrySizeInBytes);
+    checkArgument(
+        shardCount <= maxShardCount,
+        "shardCount (%s) cannot exceed %s for maxSizeInBytes=%s and maxEntrySizeInBytes=%s",
+        shardCount,
+        maxShardCount,
+        maxSizeInBytes,
+        maxEntrySizeInBytes);
+  }
+
+  /**
    * Full-arg constructor accepting evictor tunables explicitly. Used by tests that need to exercise
    * specific watermarks / sweep budgets / heartbeats, and by the public constructor which fills in
    * the defaults. {@code lowBytes <= 0} is the sentinel for "use {@link #defaultLowBytes(long)}";
    * callers that have a Cas config with an unset {@code lowWatermarkPercent} pass 0 through to opt
-   * into the default.
+   * into the default. Defaults to a single evictor shard (the pre-2.2 behavior); production callers
+   * use the {@code shardCount} overload below.
    */
   public CASFileCache(
       Path root,
@@ -362,6 +420,54 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       long wakeBudgetNanos,
       long idleHeartbeatNanos,
       Clock clock) {
+    this(
+        root,
+        maxSizeInBytes,
+        maxEntrySizeInBytes,
+        hexBucketLevels,
+        expireService,
+        accessRecorder,
+        storage,
+        zstdBufferPool,
+        onPut,
+        onExpire,
+        delegate,
+        delegateSkipLoad,
+        externalInputStreamFactory,
+        lowBytes,
+        wakeBudgetNanos,
+        idleHeartbeatNanos,
+        clock,
+        /* shardCount= */ 1);
+  }
+
+  /**
+   * Full-arg constructor with an explicit evictor shard count (Phase 2.2). The CAS is partitioned
+   * into {@code shardCount} {@link EvictorShard}s, each with its own LRU list, byte accounting,
+   * evictor thread, and snapshot file; keys route by {@code hash(key) & (shardCount - 1)}. Must be
+   * a power of two. Production callers pass {@code Worker}'s role-aware {@code
+   * CasShards.deriveShardCount} result (or the operator's {@code cas.evictorShards}); tests pass 1
+   * via the overload above.
+   */
+  public CASFileCache(
+      Path root,
+      long maxSizeInBytes,
+      long maxEntrySizeInBytes,
+      int hexBucketLevels,
+      ExecutorService expireService,
+      Executor accessRecorder,
+      ConcurrentMap<String, Entry> storage,
+      FixedBufferPool zstdBufferPool,
+      Consumer<Digest> onPut,
+      Consumer<Iterable<Digest>> onExpire,
+      @Nullable ContentAddressableStorage delegate,
+      boolean delegateSkipLoad,
+      InputStreamFactory externalInputStreamFactory,
+      long lowBytes,
+      long wakeBudgetNanos,
+      long idleHeartbeatNanos,
+      Clock clock,
+      int shardCount) {
     this.root = root;
     this.maxSizeInBytes = maxSizeInBytes;
     this.maxEntrySizeInBytes = maxEntrySizeInBytes;
@@ -376,8 +482,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
             new FailoverInputStreamFactory(this::newTransparentInput, externalInputStreamFactory));
     this.zstdBufferPool = zstdBufferPool;
     long effectiveLowBytes = lowBytes > 0 ? lowBytes : defaultLowBytes(maxSizeInBytes);
-
-    lru = root.resolve("lru.txt");
+    checkShardCountCanHoldAdmissibleEntry(maxSizeInBytes, maxEntrySizeInBytes, shardCount);
 
     writes =
         CacheBuilder.newBuilder()
@@ -396,20 +501,26 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
     entryPathStrategy = new HexBucketEntryPathStrategy(root, hexBucketLevels);
 
-    header.before = header.after = header;
+    this.headers = new Entry[shardCount];
+    for (int i = 0; i < shardCount; i++) {
+      Entry shardHeader = new SentinelEntry();
+      shardHeader.before = shardHeader.after = shardHeader;
+      headers[i] = shardHeader;
+    }
 
-    this.evictor =
-        new Evictor(
+    this.casShards =
+        new CasShards(
             new EvictorBackingImpl(),
+            shardCount,
             expireService,
             clock,
-            header,
+            headers,
             maxSizeInBytes,
             effectiveLowBytes,
             wakeBudgetNanos,
             idleHeartbeatNanos,
             db,
-            lru);
+            root);
   }
 
   /**
@@ -614,7 +725,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     if (snapshot.isEmpty()) {
       return;
     }
-    evictor.recordAccess(snapshot);
+    casShards.recordAccess(snapshot);
   }
 
   private boolean entryExists(Entry e) {
@@ -837,7 +948,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
    */
   private void evictStaleEntry(Entry e) {
     try {
-      evictor.offerStaleEntry(e);
+      casShards.offerStaleEntry(e);
     } catch (InterruptedException ie) {
       Thread.currentThread().interrupt();
       log.log(Level.WARNING, "interrupted enqueueing stale entry " + e.key, ie);
@@ -858,7 +969,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
   protected void releaseEntry(Entry e) {
     if (e.release()) {
       try {
-        evictor.offerInsertion(e);
+        casShards.offerInsertion(e);
       } catch (InterruptedException ie) {
         Thread.currentThread().interrupt();
         log.log(
@@ -1556,7 +1667,8 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
   @VisibleForTesting
   void setSizeInBytesForTesting(long sizeInBytes) {
-    evictor.setTotalBytesForTesting(sizeInBytes);
+    // Tests run at N=1, so shard 0 holds the whole cache; route the test seed there.
+    casShards.shard(0).setTotalBytesForTesting(sizeInBytes);
   }
 
   public void stop() throws IOException, InterruptedException {
@@ -1564,8 +1676,9 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       prometheusMetricsThread.interrupt();
       prometheusMetricsThread.join();
     }
-    // Final snapshot + evictor thread drain happens inside Evictor.stop.
-    evictor.stop();
+    // Final per-shard snapshot + evictor thread drain happens inside each EvictorShard.stop,
+    // fanned out by CasShards.stop.
+    casShards.stop();
     state.stop();
   }
 
@@ -1596,7 +1709,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
               // restart after the scan. In production start() runs exactly once with the
               // evictor not yet started, and this stop() is a no-op.
               try {
-                evictor.stop();
+                casShards.stop();
               } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 throw ie;
@@ -1605,7 +1718,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
               synchronized (this) {
                 checkState(state.setReadOnly(!writable));
               }
-              evictor.start();
+              casShards.start();
               return null;
             });
   }
@@ -1673,6 +1786,11 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     logComputeDirectoriesResults(invalidDirectories);
     deleteInvalidFileContent(invalidDirectories, removeDirectoryService);
 
+    // Phase 3: Migrate snapshots if the on-disk shard count changed. Runs here (after computeDirs)
+    // so the rewritten current-N snapshots capture _dir entries too, and before the evictor threads
+    // start so the LRU walk has no concurrent writer.
+    migrateSnapshotsIfPending();
+
     return new CacheLoadResults(false, scan, invalidDirectories);
   }
 
@@ -1706,13 +1824,294 @@ public abstract class CASFileCache implements ContentAddressableStorage {
   }
 
   protected boolean shouldDeleteBranchFile(Path branchDir, String name) {
+    // LRU snapshot files (and their AtomicFileWriter tmp orphans) legitimately live at the root
+    // branch directory. Their lifecycle is owned by loadSnapshots / migrateSnapshots — read as
+    // recency hints, current-N retained across restarts, stale-N deleted only on a SUCCESSFUL
+    // shard-count migration. This generic branch cleanup runs before loadSnapshots, so deleting
+    // them here would (a) defeat the migration's retain-stale-on-failure contract and (b)
+    // needlessly churn the current-N snapshot (read, delete, rewrite) on every restart when
+    // hexBucketLevels > 0.
+    if (branchDir.equals(root)
+        && (LruSnapshotFiles.isSnapshot(name) || LruSnapshotFiles.isSnapshotTmpOrphan(name))) {
+      return false;
+    }
     return !name.matches("[0-9a-f]{2}");
+  }
+
+  /**
+   * Load LRU snapshot files at the cache root as recency hints, routing each listed entry onto its
+   * owning shard's list. Snapshots are recency hints plus cached size metadata. A sane cached size
+   * keeps the warm-start fast path stat-free; a suspicious size is left in {@code files} so the
+   * normal scan can stat and process the path with filesystem-derived size.
+   *
+   * <p>Files are discovered by name: current-N files ({@code lru_num_shards_<N>_shard_<I>.txt} with
+   * {@code N == shardCount}), stale-N files from a prior run at a different count, the legacy
+   * {@code lru.txt}, and AtomicFileWriter tmp orphans. Current-N files load first (with a strict
+   * shard-ownership check), then stale-N (sorted by {@code (N, I)} for repeatable crash recovery),
+   * then legacy; the {@code files} set dedupes a key listed by more than one source. Any stale-N or
+   * legacy presence schedules a migration (rewrite current-N + delete stale) that runs after
+   * computeDirectories via {@link #migrateSnapshotsIfPending}. All snapshot and tmp-orphan paths
+   * are removed from {@code files} so the filesystem scan does not mis-parse them as CAS entries.
+   */
+  private void loadSnapshots(
+      Consumer<Digest> onStartPut,
+      Set<Path> files,
+      ImmutableList.Builder<Path> computeDirs,
+      ImmutableList.Builder<Path> deleteFiles) {
+    int shardCount = casShards.shardCount();
+    List<SnapshotFile> currentNFiles = new ArrayList<>();
+    List<SnapshotFile> staleFiles = new ArrayList<>();
+    Path legacyFile = null;
+    List<Path> tmpOrphans = new ArrayList<>();
+    Set<Path> snapshotFiles = new HashSet<>();
+
+    try (Stream<Path> rootStream = Files.list(root)) {
+      for (Path p : (Iterable<Path>) rootStream::iterator) {
+        String basename = p.getFileName().toString();
+        if (LruSnapshotFiles.isSnapshotTmpOrphan(basename)) {
+          tmpOrphans.add(p);
+          continue;
+        }
+        if (basename.equals(LruSnapshotFiles.LEGACY_NAME)) {
+          legacyFile = p;
+          snapshotFiles.add(p);
+          continue;
+        }
+        LruSnapshotFiles.Parsed parsed = LruSnapshotFiles.parse(basename);
+        if (parsed == null) {
+          continue; // not a snapshot file
+        }
+        snapshotFiles.add(p);
+        int n = parsed.shardCount();
+        // Reject only num_shards_0 (a nonsensical filename). Any other N migrates: migration
+        // re-hashes entries by key onto the current shards, so it handles an arbitrary stale N in
+        // either direction (a shard-count increase OR decrease). The stale N is never used to size
+        // or divide anything — only to classify the file and label the migration metric — and
+        // parse() already bounds it to int range, so no upper cap is needed. A bound like
+        // "N <= 2 * shardCount" would silently strand the snapshots of a worker that shrank its
+        // shard count by more than 2x (e.g. 32 -> 4 on a smaller box), leaving the LRU cold and the
+        // stale files orphaned on disk forever.
+        if (n <= 0) {
+          log.log(
+              Level.WARNING,
+              format("ignoring snapshot file with nonsensical shard count: %s", basename));
+          continue;
+        }
+        // Classify as current-N only when both N AND the shard index are in range. A file whose
+        // name claims the current N but carries an out-of-range index (corruption or a manual file
+        // move) is treated as stale: its entries are re-hashed across the live shards (preserving
+        // warmth) and the bogus file is cleaned up by the migration, rather than driving every key
+        // through a doomed shard-ownership check that drops the hint and logs one WARNING per key.
+        if (n == shardCount && parsed.index() >= 0 && parsed.index() < shardCount) {
+          currentNFiles.add(new SnapshotFile(p, parsed));
+        } else {
+          staleFiles.add(new SnapshotFile(p, parsed));
+        }
+      }
+    } catch (NoSuchFileException e) {
+      // root not created yet — initializeRootDirectory will create it.
+    } catch (IOException e) {
+      log.log(Level.WARNING, "failed listing cache root for snapshot files; full scan", e);
+    }
+
+    // Keep snapshot files and tmp orphans out of the filesystem scan; queue tmp orphans for delete.
+    files.removeAll(snapshotFiles);
+    files.removeAll(tmpOrphans);
+    deleteFiles.addAll(tmpOrphans);
+
+    // 1. current-N files (strict shard-ownership assertion), in index order.
+    currentNFiles.sort(Comparator.comparingInt(f -> f.parsed().index()));
+    for (SnapshotFile file : currentNFiles) {
+      loadSnapshotFile(
+          onStartPut, file.path(), file.parsed().index(), files, computeDirs, deleteFiles);
+    }
+    // 2. stale-N files, sorted by (N, I) so overlapping keys resolve the same way on every replay.
+    staleFiles.sort(
+        Comparator.<SnapshotFile>comparingInt(f -> f.parsed().shardCount())
+            .thenComparingInt(f -> f.parsed().index()));
+    for (SnapshotFile file : staleFiles) {
+      loadSnapshotFile(
+          onStartPut, file.path(), /* expectedIndex= */ -1, files, computeDirs, deleteFiles);
+    }
+    // 3. legacy single-file snapshot.
+    if (legacyFile != null) {
+      loadSnapshotFile(onStartPut, legacyFile, -1, files, computeDirs, deleteFiles);
+    }
+
+    // Schedule the migration rewrite when any non-current-N snapshot was present.
+    if (!staleFiles.isEmpty() || legacyFile != null) {
+      List<Path> toDelete = new ArrayList<>();
+      Set<String> oldNLabels = new HashSet<>();
+      for (SnapshotFile stale : staleFiles) {
+        toDelete.add(stale.path());
+        oldNLabels.add(Integer.toString(stale.parsed().shardCount()));
+      }
+      if (legacyFile != null) {
+        toDelete.add(legacyFile);
+        oldNLabels.add("legacy");
+      }
+      pendingMigrationStaleFiles = toDelete;
+      pendingMigrationOldNLabels = oldNLabels;
+    }
+  }
+
+  /** A discovered snapshot file paired with its already-parsed {@code (shardCount, index)}. */
+  private record SnapshotFile(Path path, LruSnapshotFiles.Parsed parsed) {}
+
+  /**
+   * Read one snapshot file, routing each listed (and shard-owned) entry through processRootFile.
+   */
+  private void loadSnapshotFile(
+      Consumer<Digest> onStartPut,
+      Path file,
+      int expectedIndex,
+      Set<Path> files,
+      ImmutableList.Builder<Path> computeDirs,
+      ImmutableList.Builder<Path> deleteFiles) {
+    try (BufferedReader br = Files.newBufferedReader(file)) {
+      for (SizeEntry entry : db.entries(br)) {
+        String key = entry.key();
+        // Shard-ownership assertion for current-N files: a key whose hash doesn't route to this
+        // file's index is misplaced (manual file move). Skip the recency hint only — the entry's
+        // file, if present, is still admitted by the filesystem scan at the LRU tail.
+        if (expectedIndex >= 0 && casShards.shardFor(key).index != expectedIndex) {
+          log.log(
+              Level.WARNING,
+              format(
+                  "snapshot %s lists key %s owned by another shard; skipping recency hint",
+                  file.getFileName(), key));
+          continue;
+        }
+        Path path = entryPathStrategy.getPath(key);
+        if (key.endsWith("_dir")) {
+          if (files.remove(path)) {
+            processRootFile(onStartPut, path, entry, computeDirs, deleteFiles);
+          }
+          continue;
+        }
+        SnapshotFastPath fastPath = snapshotFastPath(entry);
+        if (fastPath == null) {
+          continue;
+        }
+        long diskSize = fastPath.diskSize();
+        if (!tryReserveStartupBytes(diskSize)) {
+          continue;
+        }
+        if (!files.remove(path)) {
+          releaseStartupBytes(diskSize);
+          continue;
+        }
+        boolean admitted = false;
+        try {
+          admitFileAtStartup(onStartPut, fastPath.fileEntryKey(), diskSize);
+          admitted = true;
+        } finally {
+          if (!admitted) {
+            releaseStartupBytes(diskSize);
+          }
+        }
+      }
+    } catch (NoSuchFileException e) {
+      // Raced away between listing and read — nothing to load.
+    } catch (Exception e) {
+      // Corrupt/truncated snapshot: its unread entries fall through to the filesystem scan (the
+      // admission source of truth). Warn and continue rather than aborting the whole load.
+      log.log(
+          Level.WARNING,
+          "ignoring corrupt LRU snapshot " + file + "; its entries fall back to the scan",
+          e);
+    }
+  }
+
+  /**
+   * A snapshot entry that qualifies for the stat-free warm-start path: its parsed key plus the
+   * block-aligned on-disk size, both computed once and reused by the caller.
+   */
+  private record SnapshotFastPath(FileEntryKey fileEntryKey, long diskSize) {}
+
+  /**
+   * Return the parsed key and on-disk size for a snapshot entry eligible for the stat-free fast
+   * path, or null when the entry is empty, oversized, unparseable, or yields an invalid disk size
+   * (such entries fall through to the filesystem scan). Computing the key and size here lets the
+   * caller admit the entry without re-parsing.
+   */
+  private @Nullable SnapshotFastPath snapshotFastPath(SizeEntry entry) {
+    long size = entry.size();
+    if (size <= 0 || size > maxEntrySizeInBytes) {
+      return null;
+    }
+    FileEntryKey fileEntryKey = parseFileEntryKey(entry.key(), size);
+    if (fileEntryKey == null) {
+      return null;
+    }
+    long diskSize;
+    try {
+      diskSize = estimateSizeOnDisk(size, blockSize, /* isHardlink= */ false);
+    } catch (IllegalArgumentException e) {
+      return null;
+    }
+    return new SnapshotFastPath(fileEntryKey, diskSize);
+  }
+
+  /**
+   * Rewrite every shard's current-N snapshot from the now-fully-populated LRU and delete the
+   * stale-N / legacy files those entries were migrated from. Runs after computeDirectories (so
+   * {@code _dir} entries are captured) and before the evictor threads start (so the single-writer
+   * invariant is not yet in force). No-op when no migration was scheduled in {@link
+   * #loadSnapshots}.
+   */
+  private void migrateSnapshotsIfPending() {
+    if (pendingMigrationStaleFiles.isEmpty()) {
+      return;
+    }
+    log.log(
+        Level.INFO,
+        format(
+            "migrating %d stale LRU snapshot file(s) to num_shards=%d",
+            pendingMigrationStaleFiles.size(), casShards.shardCount()));
+    casShards.migrateSnapshots(pendingMigrationStaleFiles, pendingMigrationOldNLabels);
+    pendingMigrationStaleFiles = List.of();
+    pendingMigrationOldNLabels = Set.of();
+  }
+
+  protected boolean tryReserveStartupBytes(long diskSize) {
+    checkArgument(diskSize >= 0, "diskSize (%s) must be non-negative", diskSize);
+    while (true) {
+      long current = startupAdmissionBytes.get();
+      long next = current + diskSize;
+      if (next < current || next > maxSizeInBytes) {
+        return false;
+      }
+      if (startupAdmissionBytes.compareAndSet(current, next)) {
+        return true;
+      }
+    }
+  }
+
+  protected void releaseStartupBytes(long diskSize) {
+    if (diskSize != 0) {
+      startupAdmissionBytes.addAndGet(-diskSize);
+    }
+  }
+
+  private void admitFileAtStartup(
+      Consumer<Digest> onStartPut, FileEntryKey fileEntryKey, long diskSize) {
+    String key = fileEntryKey.key();
+    Entry e = Entry.orphan(key, fileEntryKey.size(), Deadline.after(10, SECONDS));
+    checkState(storage.put(e.key, e) == null, key);
+    onStartPut.accept(fileEntryKey.digest());
+    // Startup runs before the evictor threads start, so the per-shard LRU lists are not yet
+    // under their single-writer contract. linkAtStartup routes the entry to its owning shard,
+    // links it onto that shard's header under the shard's own lock (the parallel scan pool
+    // calls in concurrently), and reserves the bytes against that shard's accounting.
+    casShards.linkAtStartup(e, diskSize);
   }
 
   private CacheScanResults scanRoot(Consumer<Digest> onStartPut)
       throws IOException, InterruptedException {
     // create thread pool
     ExecutorService pool = BuildfarmExecutors.getScanCachePool();
+    startupAdmissionBytes.set(0);
 
     // collect keys from cache root.
     ImmutableList.Builder<Path> computeDirsBuilder = new ImmutableList.Builder<>();
@@ -1756,49 +2155,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
               orphansToDelete.size()));
     }
 
-    try (BufferedReader br = Files.newBufferedReader(lru)) {
-      for (SizeEntry entry : db.entries(br)) {
-        // ignore files in the lru that are not present in the directories
-        Path path = entryPathStrategy.getPath(entry.key());
-        if (files.remove(path)) {
-          processRootFile(onStartPut, path, entry, computeDirsBuilder, deleteFilesBuilder);
-        }
-      }
-    } catch (NoSuchFileException e) {
-      // ignore - LRU file doesn't exist, will scan all files
-    } catch (Exception e) {
-      // Handle corrupted LRU file - delete it and fall back to full scan
-      log.log(
-          Level.WARNING,
-          "LRU file is corrupted and cannot be parsed. Deleting corrupted LRU file and falling"
-              + " back to full cache scan.",
-          e);
-      try {
-        Files.deleteIfExists(lru);
-        log.log(Level.INFO, "Deleted corrupted LRU file: " + lru);
-      } catch (IOException deleteEx) {
-        log.log(Level.SEVERE, "Failed to delete corrupted LRU file: " + lru, deleteEx);
-      }
-      // Continue with full scan - all files will be processed in the loop below
-    }
-    files.remove(lru);
-    // AtomicFileWriter tmp orphans (`lru.txt.tmp.<uuid>`) from JVM crashes live at the cache
-    // root. They're in `files` whenever hexBucketLevels == 0 (the bucket IS the root), so we
-    // also remove them from `files` to keep the pool below from re-processing them and the
-    // later async delete from racing with itself (NoSuchFileException SEVERE-log spam).
-    String snapshotTmpPrefix = lru.getFileName().toString() + ".tmp.";
-    Set<Path> tmpOrphans = new HashSet<>();
-    try (Stream<Path> rootStream = Files.list(root)) {
-      rootStream
-          .filter(p -> p.getFileName().toString().startsWith(snapshotTmpPrefix))
-          .forEach(tmpOrphans::add);
-    } catch (NoSuchFileException e) {
-      // Root dir doesn't exist yet — initializeRootDirectory will create it.
-    }
-    if (!tmpOrphans.isEmpty()) {
-      files.removeAll(tmpOrphans);
-      deleteFilesBuilder.addAll(tmpOrphans);
-    }
+    loadSnapshots(onStartPut, files, computeDirsBuilder, deleteFilesBuilder);
 
     for (Path file : files) {
       String basename = file.getFileName().toString();
@@ -1842,10 +2199,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     } else {
       // if cas is full or entry is oversized or empty, mark file for later deletion.
       long size = entry.size();
-      if (evictor.currentTotalBytes() + estimateSizeOnDisk(size, blockSize, /* isHardlink= */ false)
-              > maxSizeInBytes
-          || size > maxEntrySizeInBytes
-          || size == 0) {
+      if (size > maxEntrySizeInBytes || size <= 0) {
         synchronized (deleteFiles) {
           deleteFiles.add(path);
         }
@@ -1859,24 +2213,22 @@ public abstract class CASFileCache implements ContentAddressableStorage {
             deleteFiles.add(path);
           }
         } else {
-          String key = fileEntryKey.key();
-          // populate key if it is not currently stored.
-          Entry e = Entry.orphan(key, size, Deadline.after(10, SECONDS));
-          checkState(storage.put(e.key, e) == null, key);
-          onStartPut.accept(fileEntryKey.digest());
-          // Startup runs before the evictor thread starts, so the LRU is pre-seeded directly.
-          // Reserve the bytes through the evictor so its totalBytes accounting is correctly
-          // seeded before the loop begins. The parallel scan pool calls into here concurrently,
-          // so guard the LRU pointer mutation with a synchronized block on the header sentinel —
-          // pre-start contention on this lock is bounded by scan-pool size.
           long diskSize = estimateSizeOnDisk(size, blockSize, /* isHardlink= */ false);
-          synchronized (header) {
-            if (!e.isLinked() && e.state() == Entry.State.LIVE && e.refCount() == 0) {
-              e.addBefore(header);
-              evictor.noteUnreferencedAtStartup();
+          if (!tryReserveStartupBytes(diskSize)) {
+            synchronized (deleteFiles) {
+              deleteFiles.add(path);
+            }
+          } else {
+            boolean admitted = false;
+            try {
+              admitFileAtStartup(onStartPut, fileEntryKey, diskSize);
+              admitted = true;
+            } finally {
+              if (!admitted) {
+                releaseStartupBytes(diskSize);
+              }
             }
           }
-          evictor.addBytesAtStartup(diskSize);
         }
       }
     }
@@ -1934,7 +2286,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       }
       if (e.release()) {
         try {
-          evictor.offerInsertion(e);
+          casShards.offerInsertion(e);
           linked++;
         } catch (InterruptedException ie) {
           Thread.currentThread().interrupt();
@@ -1963,9 +2315,10 @@ public abstract class CASFileCache implements ContentAddressableStorage {
    * write, a digest mismatch, an open-output error. Routes the byte refund through the evictor's
    * totalBytes accounting.
    */
-  private void dischargeReservation(long size) {
+  private void dischargeReservation(String key, long size) {
     long diskSize = estimateSizeOnDisk(size, blockSize, /* isHardlink= */ false);
-    evictor.discharge(diskSize);
+    // Route the refund to the shard the matching charge(key, ...) reserved against.
+    casShards.discharge(key, diskSize);
   }
 
   protected String getDirectoryKey(Digest digest) {
@@ -2026,7 +2379,8 @@ public abstract class CASFileCache implements ContentAddressableStorage {
             "race-loss restore for "
                 + key
                 + " collided with newer entry; discharging orphan bytes");
-        evictor.discharge(estimateSizeOnDisk(replacement.size, blockSize, /* isHardlink= */ false));
+        casShards.discharge(
+            key, estimateSizeOnDisk(replacement.size, blockSize, /* isHardlink= */ false));
       }
     } finally {
       lock.unlock();
@@ -2038,7 +2392,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     // or non-LIVE entries, so this is safe to call unconditionally for refCount==0.
     if (restored && replacement.refCount() == 0) {
       try {
-        evictor.offerInsertion(replacement);
+        casShards.offerInsertion(replacement);
       } catch (InterruptedException ie) {
         Thread.currentThread().interrupt();
         log.log(
@@ -2091,7 +2445,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     lock.lock();
     try {
       if (key.endsWith("_dir")) {
-        Files.move(path, expiredPath, ATOMIC_MOVE, REPLACE_EXISTING);
+        fileMover.move(path, expiredPath, ATOMIC_MOVE, REPLACE_EXISTING);
       } else {
         try {
           Files.createLink(expiredPath, path);
@@ -2603,7 +2957,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       return out;
     } finally {
       if (requiresDischarge.get()) {
-        dischargeReservation(blobSizeInBytes);
+        dischargeReservation(key, blobSizeInBytes);
       }
     }
   }
@@ -2631,7 +2985,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       return false;
     }
     long diskSize = estimateSizeOnDisk(blobSizeInBytes, blockSize, /* isHardlink= */ false);
-    evictor.charge(diskSize);
+    casShards.charge(key, diskSize);
     requiresDischarge.set(true);
     return true;
   }
@@ -2710,7 +3064,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
           out.close();
           Files.delete(writePath);
         } finally {
-          dischargeReservation(blobSizeInBytes);
+          dischargeReservation(key, blobSizeInBytes);
         }
       }
 
@@ -2754,7 +3108,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
           try {
             Files.delete(writePath);
           } finally {
-            dischargeReservation(blobSizeInBytes);
+            dischargeReservation(key, blobSizeInBytes);
           }
           Digest actual = digestUtil.build(hash, size);
           throw new DigestMismatchException(actual, expectedDigest);
@@ -2772,13 +3126,13 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         String fileName = writePath.getFileName().toString();
         Digest actual = digestUtil.build(hash, countingOut.written());
         if (!fileName.equals(getKey(actual, isExecutable) + "." + writeId)) {
-          dischargeReservation(blobSizeInBytes);
+          dischargeReservation(key, blobSizeInBytes);
           throw new DigestMismatchException(actual, expectedDigest);
         }
         try {
           setReadOnlyPerms(writePath, isExecutable, fileStore);
         } catch (IOException e) {
-          dischargeReservation(blobSizeInBytes);
+          dischargeReservation(key, blobSizeInBytes);
           throw e;
         }
 
@@ -2799,7 +3153,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         } finally {
           Files.delete(writePath);
           if (!inserted) {
-            dischargeReservation(blobSizeInBytes);
+            dischargeReservation(key, blobSizeInBytes);
           }
         }
 

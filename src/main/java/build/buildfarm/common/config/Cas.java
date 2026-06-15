@@ -24,7 +24,7 @@ public class Cas {
   private boolean fileDirectoriesIndexInMemory = false;
   private boolean skipLoad = false;
 
-  // Evictor watermark/sweep tunables (Phase 2.1; sharding arrives in Phase 2.2).
+  // Evictor watermark/sweep tunables.
   //
   // lowWatermarkPercent: sweep target. The evictor sweeps until totalBytes drops to lowBytes.
   //   The base differs by mode (see Worker.computeLowBytes): in percent-mode (maxSizePercent set)
@@ -43,6 +43,22 @@ public class Cas {
   private int lowWatermarkPercent = 0;
   private long evictorWakeBudgetMillis = 50L;
   private long evictorIdleHeartbeatMillis = 2000L;
+
+  // evictorShards: number of independent evictor shards the CAS is partitioned into. Each shard
+  //   owns its own LRU list, byte accounting, evictor thread, and snapshot file; a key is routed
+  //   to a shard by hash(key) & (evictorShards - 1). Sharding lets eviction scale with core count
+  //   and isolates a stalled/dead shard to 1/N of the keyspace.
+  //
+  //   0 (the sentinel) auto-derives from vCPU and worker role at startup (see
+  //   CasShards.deriveShardCount): CAS-only workers use nextPowerOfTwo(max(1, vCPU / 4)), exec
+  //   (or combined) workers use nextPowerOfTwo(max(1, vCPU / 8)). An explicit value must be a
+  //   power of two >= 1; N=1 degenerates to the single-evictor (pre-2.2) behavior and is the
+  //   compatibility setting for operators that want the pre-sharding rollout behavior. Auto-derived
+  //   values are clamped so each shard can hold the configured maxEntrySizeBytes within the cache
+  //   cap; explicit values that cannot do that are rejected during config validation. The value is
+  //   persisted into snapshot filenames (lru_num_shards_<N>_shard_<I>.txt) and a changed N triggers
+  //   a one-time snapshot migration on the next startup.
+  private int evictorShards = 0;
 
   // if creating a hardlink fails, copy the file instead
   private boolean execRootCopyFallback = false;
