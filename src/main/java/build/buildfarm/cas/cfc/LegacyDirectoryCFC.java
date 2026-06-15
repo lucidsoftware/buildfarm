@@ -683,7 +683,7 @@ public class LegacyDirectoryCFC extends CASFileCache {
                   path,
                   digest,
                   directoriesByDigest,
-                  (dst, src, size, isExecutable) -> {
+                  (dst, src, srcDigest, size, isExecutable) -> {
                     linkCachedFile(dst, src);
                     // we saw null entries in the built immutable list without synchronization
                     synchronized (inputsBuilder) {

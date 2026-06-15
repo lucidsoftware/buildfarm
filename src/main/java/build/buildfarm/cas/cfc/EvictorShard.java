@@ -249,6 +249,12 @@ final class EvictorShard extends EvictorShardPad1 {
           .labelNames("shard")
           .help("tryEvict EVICTING -> LIVE rollbacks.")
           .register();
+  private static final Counter casDirectoryHardlinkSkipsTotal =
+      Counter.build()
+          .name("evictor_skipped_cas_directory_hardlinks_total")
+          .labelNames("shard")
+          .help("LRU candidates skipped because a CAS directory tree still hardlinks them.")
+          .register();
   private static final Counter wakesTotal =
       Counter.build()
           .name("evictor_wakes_total")
@@ -259,6 +265,11 @@ final class EvictorShard extends EvictorShardPad1 {
   private static final String TRIGGER_BYTE_THRESHOLD = "byte_threshold";
   private static final String TRIGGER_QUEUE_DEPTH = "queue_depth";
   private static final String TRIGGER_SNAPSHOT = "snapshot";
+  // Phase 3: a CAS-directory tree eviction released the last hardlink to a source, so a previously
+  // skipped (casDirectoryHardlinkCount > 0) entry is now evictable. The decrementing walker wakes
+  // the source's shard with this trigger so an evictor parked in the stuckAboveLow state re-sweeps
+  // rather than waiting for a charge/release that may never come.
+  static final String TRIGGER_HARDLINK_RELEASE = "hardlink_release";
   private static final Counter mpscDropsTotal =
       Counter.build()
           .name("mpsc_drops_total")
@@ -371,9 +382,11 @@ final class EvictorShard extends EvictorShardPad1 {
 
   private final Counter.Child evictedChild;
   private final Counter.Child stateRollbacksChild;
+  private final Counter.Child casDirectoryHardlinkSkipsChild;
   private final Counter.Child wakesByteThreshold;
   private final Counter.Child wakesQueueDepth;
   private final Counter.Child wakesSnapshot;
+  private final Counter.Child wakesHardlinkRelease;
   private final Counter.Child mpscDropsAccessChild;
   private final Gauge.Child queueDepthChild;
   private final Counter.Child chargeBackpressureHardCapChild;
@@ -470,9 +483,11 @@ final class EvictorShard extends EvictorShardPad1 {
     this.lowBytes = lowBytes;
     this.evictedChild = evictedTotal.labels(shardLabel);
     this.stateRollbacksChild = stateRollbacksTotal.labels(shardLabel);
+    this.casDirectoryHardlinkSkipsChild = casDirectoryHardlinkSkipsTotal.labels(shardLabel);
     this.wakesByteThreshold = wakesTotal.labels(shardLabel, TRIGGER_BYTE_THRESHOLD);
     this.wakesQueueDepth = wakesTotal.labels(shardLabel, TRIGGER_QUEUE_DEPTH);
     this.wakesSnapshot = wakesTotal.labels(shardLabel, TRIGGER_SNAPSHOT);
+    this.wakesHardlinkRelease = wakesTotal.labels(shardLabel, TRIGGER_HARDLINK_RELEASE);
     this.mpscDropsAccessChild = mpscDropsTotal.labels(shardLabel, "access");
     this.queueDepthChild = queueDepthGauge.labels(shardLabel);
     this.chargeBackpressureHardCapChild =
@@ -749,6 +764,8 @@ final class EvictorShard extends EvictorShardPad1 {
       wakesQueueDepth.inc();
     } else if (trigger == TRIGGER_SNAPSHOT) {
       wakesSnapshot.inc();
+    } else if (trigger == TRIGGER_HARDLINK_RELEASE) {
+      wakesHardlinkRelease.inc();
     } else {
       wakesTotal.labels(shardLabel, trigger).inc();
     }
@@ -1249,6 +1266,18 @@ final class EvictorShard extends EvictorShardPad1 {
           && !stopping) {
         Entry victim = cursor;
         cursor = cursor.after;
+        // Phase 3: a file still hardlinked into a CAS directory tree must not be evicted — its
+        // blocks are accounted to this Entry and the directory tree depends on the inode. Skip it
+        // (volatile read, no state mutation) and advance the cursor freely; it becomes eligible
+        // once the last referencing directory's eviction walker decrements the count back to 0.
+        // This pre-skip is an optimization that avoids the EVICTING-CAS churn for pinned entries;
+        // tryEvict re-reads casDirectoryHardlinkCount under the EVICTING state and is the
+        // authoritative check against a racing 0->1 increment (see Entry.tryEvict).
+        if (victim.casDirectoryHardlinkCount() > 0) {
+          casDirectoryHardlinkSkipsChild.inc();
+          skipsBeforeEviction++;
+          continue;
+        }
         if (!victim.tryEvict()) {
           stateRollbackCount.increment();
           stateRollbacksChild.inc();

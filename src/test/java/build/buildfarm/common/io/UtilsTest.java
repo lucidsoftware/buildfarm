@@ -84,6 +84,16 @@ public class UtilsTest {
   }
 
   @Test
+  public void toInodeKey_preservesUnixDeviceComponent() {
+    Object devOneInodeSeven = Utils.toInodeKey("(dev=1,ino=7)");
+    Object devTwoInodeSeven = Utils.toInodeKey("(dev=2,ino=7)");
+    Object devOneInodeSevenAgain = Utils.toInodeKey("(dev=1,ino=7)");
+
+    assertThat(devOneInodeSeven).isEqualTo(devOneInodeSevenAgain);
+    assertThat(devOneInodeSeven).isNotEqualTo(devTwoInodeSeven);
+  }
+
+  @Test
   public void unTarTisEmpty() throws IOException {
     // ARRANGE
     TarArchiveInputStream tis = Mockito.mock(TarArchiveInputStream.class);

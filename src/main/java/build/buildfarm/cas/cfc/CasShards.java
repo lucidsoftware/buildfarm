@@ -157,6 +157,17 @@ final class CasShards {
     return shards[key.hashCode() & mask];
   }
 
+  /**
+   * Wake the evictor that owns {@code key} so it re-sweeps. Used when an out-of-band event (Phase
+   * 3: a CAS-directory tree eviction releasing the last hardlink to a source) makes a
+   * previously-skipped entry evictable — the entry is already linked on the shard's LRU, so a plain
+   * drain request is enough; without it an evictor parked in the stuckAboveLow state would wait for
+   * a charge/release that may never arrive.
+   */
+  void requestEvictionSweep(String key) {
+    shardFor(key).requestDrain(EvictorShard.TRIGGER_HARDLINK_RELEASE);
+  }
+
   // === Lifecycle ===
 
   void start() {

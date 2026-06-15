@@ -138,6 +138,26 @@ public class EntryTest {
   }
 
   @Test
+  public void tryEvictShouldRollbackWhenCasDirectoryHardlinkPinned() {
+    // A source pinned by a CAS-directory hardlink (casDirectoryHardlinkCount > 0) must not be
+    // evictable even at refCount == 0: a _dir tree depends on the inode and the source's blocks are
+    // accounted to this Entry. tryEvict re-reads the count under the EVICTING state and rolls back
+    // to LIVE — the authoritative guard behind the sweep's pre-skip optimization. Regression test
+    // for the eviction/hardlink TOCTOU (a stale pre-skip read could otherwise reach tryEvict, which
+    // checked only refCount and would have evicted the live-hardlinked source).
+    Entry e = Entry.orphan("k", 7L, Deadline.after(10, SECONDS));
+    new CasInodeIndex().increment(e, new Object());
+    assertThat(e.refCount()).isEqualTo(0);
+    assertThat(e.casDirectoryHardlinkCount()).isEqualTo(1);
+    assertThat(e.isEvictable()).isFalse();
+
+    assertThat(e.tryEvict()).isFalse();
+    // State rolled back to LIVE so the entry stays usable; the pin is untouched.
+    assertThat(e.state()).isEqualTo(Entry.State.LIVE);
+    assertThat(e.casDirectoryHardlinkCount()).isEqualTo(1);
+  }
+
+  @Test
   public void tryAcquireShouldFailWhenEntryIsEvicted() {
     // Companion to tryAcquireShouldFailWhenEntryIsEvicting: once the evictor has driven
     // the entry through the terminal EVICTING -> EVICTED transition, a stale caller

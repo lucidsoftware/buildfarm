@@ -261,6 +261,31 @@ class CASFileCacheTest {
   }
 
   @Test
+  public void putAdoptsExistingExecutableFileWithoutStorageEntry()
+      throws IOException, InterruptedException {
+    FileStore fileStore = Files.getFileStore(root);
+    ByteString blob = ByteString.copyFromUtf8("executable");
+    Digest blobDigest = DIGEST_UTIL.compute(blob);
+    blobs.put(blobDigest, blob);
+    String key = CASFileCache.getKey(blobDigest, true);
+    Path path = fileCache.getPath(key);
+    Files.write(path, blob.toByteArray());
+    EvenMoreFiles.setReadOnlyPerms(path, true, fileStore);
+
+    assertThat(storage.containsKey(key)).isFalse();
+    assertThat(fileCache.size()).isEqualTo(0);
+
+    Path putPath = fileCache.put(blobDigest, true).path();
+
+    assertWithMessage("path").that(putPath.equals(path)).isTrue();
+    assertThat(Files.isExecutable(putPath)).isTrue();
+    assertThat(storage.get(key)).isNotNull();
+    assertThat(storage.get(key).refCount()).isEqualTo(1);
+    assertThat(fileCache.size()).isEqualTo(estimateSizeOnDisk(blobDigest.getSize()));
+    decrementReference(putPath);
+  }
+
+  @Test
   public void putDirectoryCreatesTree() throws IOException, InterruptedException {
     ByteString file = ByteString.copyFromUtf8("Peanut Butter");
     Digest fileDigest = DIGEST_UTIL.compute(file);
@@ -738,6 +763,28 @@ class CASFileCacheTest {
       content.substring(9).writeTo(out);
     }
     assertThat(notified.get()).isTrue();
+    assertThat(write.getCommittedSize()).isEqualTo(digest.getSize());
+    assertThat(write.isComplete()).isTrue();
+  }
+
+  @Test
+  public void writeResetAtOffsetZeroClearsCachedCommittedSize() throws IOException {
+    ByteString content = ByteString.copyFromUtf8("Hello, World");
+    Digest digest = DIGEST_UTIL.compute(content);
+
+    UUID writeId = UUID.randomUUID();
+    String key = fileCache.getKey(digest, false);
+    Path writePath = fileCache.getPath(key).resolveSibling(key + "." + writeId);
+    Files.write(writePath, content.toByteArray());
+    Write write =
+        fileCache.getWrite(
+            Compressor.Value.IDENTITY, digest, writeId, RequestMetadata.getDefaultInstance());
+
+    assertThat(write.getCommittedSize()).isEqualTo(digest.getSize());
+    try (OutputStream out = write.getOutput(0, 1, SECONDS, () -> {})) {
+      content.writeTo(out);
+    }
+
     assertThat(write.getCommittedSize()).isEqualTo(digest.getSize());
     assertThat(write.isComplete()).isTrue();
   }

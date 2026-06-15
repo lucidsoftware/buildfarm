@@ -126,6 +126,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.Stack;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
@@ -260,6 +261,19 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
   private Thread prometheusMetricsThread;
   private final AtomicLong startupAdmissionBytes = new AtomicLong();
+
+  // Phase 3 startup map population. Set false at the top of scanRoot and true once the standalone
+  // file scan has fully admitted every standalone Entry into storage. computeDirectory's
+  // CAS-directory-hardlink reconstruction looks up source Entries by inode, so it must not run
+  // until the standalone scan is complete (Phase 3 invariant 8). Always-on Preconditions check
+  // (not a -ea assert) per codebase convention.
+  protected volatile boolean standaloneScanComplete;
+
+  // Inode -> standalone Entry, built during startup so computeDirectory can pin the source Entries
+  // that existing on-disk _dir trees hardlink. This is cleared immediately after directory
+  // reconstruction; retaining it would duplicate one inode map entry per scanned standalone file
+  // for the cache lifetime.
+  private ConcurrentMap<Object, Entry> startupFileKeys = new ConcurrentHashMap<>();
 
   public long size() {
     return casShards.globalTotalBytes();
@@ -1333,7 +1347,10 @@ public abstract class CASFileCache implements ContentAddressableStorage {
               if (out != null) {
                 out.cancel();
                 out = null;
+              } else {
+                Files.deleteIfExists(getWritePath());
               }
+              fileCommittedSize = 0;
             } catch (IOException e) {
               log.log(
                   Level.SEVERE,
@@ -1348,6 +1365,11 @@ public abstract class CASFileCache implements ContentAddressableStorage {
               }
               isReset = true;
             }
+          }
+
+          private Path getWritePath() {
+            String blobKey = getKey(key.getDigest(), false);
+            return getPath(blobKey).resolveSibling(blobKey + "." + key.getIdentifier());
           }
 
           @Override
@@ -1370,11 +1392,8 @@ public abstract class CASFileCache implements ContentAddressableStorage {
             if (out == null) {
               if (fileCommittedSize < 0) {
                 // we need to cache this from disk until an out stream is acquired
-                String blobKey = getKey(key.getDigest(), false);
-                Path blobKeyPath = getPath(blobKey);
                 try {
-                  fileCommittedSize =
-                      Files.size(blobKeyPath.resolveSibling(blobKey + "." + key.getIdentifier()));
+                  fileCommittedSize = Files.size(getWritePath());
                 } catch (IOException e) {
                   fileCommittedSize = 0;
                 }
@@ -1446,11 +1465,18 @@ public abstract class CASFileCache implements ContentAddressableStorage {
               }
               throw new WriteCompleteException();
             }
+            long committedSize = getCommittedSize();
+            if (offset == 0 && committedSize == key.getDigest().getSize()) {
+              if (!future.isDone()) {
+                log.log(Level.WARNING, format("%s committed but has not completed future", key));
+                future.set(committedSize);
+              }
+              throw new WriteCompleteException();
+            }
             checkState(
-                getCommittedSize() == offset,
+                committedSize == offset,
                 format(
-                    "cannot position stream to %d, committed_size is %d",
-                    offset, getCommittedSize()));
+                    "cannot position stream to %d, committed_size is %d", offset, committedSize));
             SettableFuture<Void> outClosedFuture = SettableFuture.create();
             Digest digest = key.getDigest();
             UniqueWriteOutputStream uniqueOut =
@@ -1782,7 +1808,13 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
     // Phase 2: Compute
     // recursively construct all directory structures.
-    List<Path> invalidDirectories = computeDirectories(scan);
+    List<Path> invalidDirectories;
+    try {
+      invalidDirectories = computeDirectories(scan);
+    } finally {
+      scan.fileKeys().clear();
+      startupFileKeys = new ConcurrentHashMap<>();
+    }
     logComputeDirectoriesResults(invalidDirectories);
     deleteInvalidFileContent(invalidDirectories, removeDirectoryService);
 
@@ -1791,7 +1823,9 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     // start so the LRU walk has no concurrent writer.
     migrateSnapshotsIfPending();
 
-    return new CacheLoadResults(false, scan, invalidDirectories);
+    CacheScanResults retainedScan =
+        new CacheScanResults(scan.computeDirs(), scan.deleteFiles(), Map.of());
+    return new CacheLoadResults(false, retainedScan, invalidDirectories);
   }
 
   private void deleteInvalidFileContent(List<Path> files, ExecutorService removeDirectoryService) {
@@ -1857,7 +1891,8 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       Consumer<Digest> onStartPut,
       Set<Path> files,
       ImmutableList.Builder<Path> computeDirs,
-      ImmutableList.Builder<Path> deleteFiles) {
+      ImmutableList.Builder<Path> deleteFiles,
+      boolean requireFileKeysForDirectoryHardlinks) {
     int shardCount = casShards.shardCount();
     List<SnapshotFile> currentNFiles = new ArrayList<>();
     List<SnapshotFile> staleFiles = new ArrayList<>();
@@ -1923,7 +1958,13 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     currentNFiles.sort(Comparator.comparingInt(f -> f.parsed().index()));
     for (SnapshotFile file : currentNFiles) {
       loadSnapshotFile(
-          onStartPut, file.path(), file.parsed().index(), files, computeDirs, deleteFiles);
+          onStartPut,
+          file.path(),
+          file.parsed().index(),
+          files,
+          computeDirs,
+          deleteFiles,
+          requireFileKeysForDirectoryHardlinks);
     }
     // 2. stale-N files, sorted by (N, I) so overlapping keys resolve the same way on every replay.
     staleFiles.sort(
@@ -1931,11 +1972,24 @@ public abstract class CASFileCache implements ContentAddressableStorage {
             .thenComparingInt(f -> f.parsed().index()));
     for (SnapshotFile file : staleFiles) {
       loadSnapshotFile(
-          onStartPut, file.path(), /* expectedIndex= */ -1, files, computeDirs, deleteFiles);
+          onStartPut,
+          file.path(),
+          /* expectedIndex= */ -1,
+          files,
+          computeDirs,
+          deleteFiles,
+          requireFileKeysForDirectoryHardlinks);
     }
     // 3. legacy single-file snapshot.
     if (legacyFile != null) {
-      loadSnapshotFile(onStartPut, legacyFile, -1, files, computeDirs, deleteFiles);
+      loadSnapshotFile(
+          onStartPut,
+          legacyFile,
+          -1,
+          files,
+          computeDirs,
+          deleteFiles,
+          requireFileKeysForDirectoryHardlinks);
     }
 
     // Schedule the migration rewrite when any non-current-N snapshot was present.
@@ -1967,7 +2021,8 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       int expectedIndex,
       Set<Path> files,
       ImmutableList.Builder<Path> computeDirs,
-      ImmutableList.Builder<Path> deleteFiles) {
+      ImmutableList.Builder<Path> deleteFiles,
+      boolean requireFileKeysForDirectoryHardlinks) {
     try (BufferedReader br = Files.newBufferedReader(file)) {
       for (SizeEntry entry : db.entries(br)) {
         String key = entry.key();
@@ -1985,7 +2040,20 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         Path path = entryPathStrategy.getPath(key);
         if (key.endsWith("_dir")) {
           if (files.remove(path)) {
-            processRootFile(onStartPut, path, entry, computeDirs, deleteFiles);
+            processRootFile(onStartPut, path, entry, /* fileKey= */ null, computeDirs, deleteFiles);
+          }
+          continue;
+        }
+        if (requireFileKeysForDirectoryHardlinks) {
+          if (files.remove(path)) {
+            FileStatus stat = stat(path, false, fileStore);
+            processRootFile(
+                onStartPut,
+                path,
+                new SizeEntry(key, stat.getSize()),
+                stat.fileKey(),
+                computeDirs,
+                deleteFiles);
           }
           continue;
         }
@@ -2003,7 +2071,9 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         }
         boolean admitted = false;
         try {
-          admitFileAtStartup(onStartPut, fastPath.fileEntryKey(), diskSize);
+          // Stat-free fast path: no inode available, so this entry is not added to the startup
+          // inode index (see startupFileKeys).
+          admitFileAtStartup(onStartPut, fastPath.fileEntryKey(), diskSize, /* fileKey= */ null);
           admitted = true;
         } finally {
           if (!admitted) {
@@ -2095,11 +2165,20 @@ public abstract class CASFileCache implements ContentAddressableStorage {
   }
 
   private void admitFileAtStartup(
-      Consumer<Digest> onStartPut, FileEntryKey fileEntryKey, long diskSize) {
+      Consumer<Digest> onStartPut,
+      FileEntryKey fileEntryKey,
+      long diskSize,
+      @Nullable Object fileKey) {
     String key = fileEntryKey.key();
     Entry e = Entry.orphan(key, fileEntryKey.size(), Deadline.after(10, SECONDS));
     checkState(storage.put(e.key, e) == null, key);
     onStartPut.accept(fileEntryKey.digest());
+    // Record the inode -> Entry mapping so computeDirectory can pin source Entries that existing
+    // _dir trees hardlink (Phase 3 invariant 8). Only the stat-bearing full-scan path supplies a
+    // non-null fileKey; the stat-free snapshot fast path passes null and is not indexed here.
+    if (fileKey != null) {
+      startupFileKeys.put(fileKey, e);
+    }
     // Startup runs before the evictor threads start, so the per-shard LRU lists are not yet
     // under their single-writer contract. linkAtStartup routes the entry to its owning shard,
     // links it onto that shard's header under the shard's own lock (the parallel scan pool
@@ -2112,6 +2191,8 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     // create thread pool
     ExecutorService pool = BuildfarmExecutors.getScanCachePool();
     startupAdmissionBytes.set(0);
+    standaloneScanComplete = false;
+    startupFileKeys = new ConcurrentHashMap<>();
 
     // collect keys from cache root.
     ImmutableList.Builder<Path> computeDirsBuilder = new ImmutableList.Builder<>();
@@ -2133,17 +2214,25 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       }
     }
 
-    // Sweep any orphan _removed files left behind by JVM crashes between
-    // safeStorageRemoval's rename and the async Files.delete actually running. The basename
-    // ends in "_removed" — no parseFileEntryKey path ever sees this suffix.
+    // Single pass over the scanned files for two startup decisions:
+    //  - Sweep any orphan _removed files left behind by JVM crashes between safeStorageRemoval's
+    //    rename and the async Files.delete actually running. The basename ends in "_removed" — no
+    //    parseFileEntryKey path ever sees this suffix.
+    //  - Detect whether any CAS-directory tree (_dir) exists. If so, reconstructing its hardlink
+    //    pins needs every standalone file indexed by inode, which forces loadSnapshots to stat each
+    //    entry rather than trust the snapshot's recorded size.
     Set<Path> orphansToDelete = null;
+    boolean requireFileKeysForDirectoryHardlinks = false;
     for (Path file : files) {
-      if (file.getFileName().toString().endsWith("_removed")) {
+      String basename = file.getFileName().toString();
+      if (basename.endsWith("_removed")) {
         if (orphansToDelete == null) {
           orphansToDelete = new HashSet<>();
         }
         orphansToDelete.add(file);
         deleteFilesBuilder.add(file);
+      } else if (basename.endsWith("_dir")) {
+        requireFileKeysForDirectoryHardlinks = true;
       }
     }
     if (orphansToDelete != null) {
@@ -2155,7 +2244,12 @@ public abstract class CASFileCache implements ContentAddressableStorage {
               orphansToDelete.size()));
     }
 
-    loadSnapshots(onStartPut, files, computeDirsBuilder, deleteFilesBuilder);
+    loadSnapshots(
+        onStartPut,
+        files,
+        computeDirsBuilder,
+        deleteFilesBuilder,
+        requireFileKeysForDirectoryHardlinks);
 
     for (Path file : files) {
       String basename = file.getFileName().toString();
@@ -2167,6 +2261,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
                   onStartPut,
                   file,
                   new SizeEntry(basename, stat.getSize()),
+                  stat.fileKey(),
                   computeDirsBuilder,
                   deleteFilesBuilder);
             } catch (Exception e) {
@@ -2177,8 +2272,14 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
     joinThreads(pool, "Scanning Cache Root...");
 
+    // Every standalone Entry is now in storage and indexed by inode (full-scan path).
+    // computeDirectory
+    // may now reconstruct CAS-directory-hardlink pins (Phase 3 invariant 8).
+    standaloneScanComplete = true;
+
     // log information from scanning cache root.
-    return new CacheScanResults(computeDirsBuilder.build(), deleteFilesBuilder.build(), null);
+    return new CacheScanResults(
+        computeDirsBuilder.build(), deleteFilesBuilder.build(), startupFileKeys);
   }
 
   @SuppressWarnings("SynchronizationOnLocalVariableOrMethodParameter")
@@ -2186,6 +2287,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       Consumer<Digest> onStartPut,
       Path path,
       SizeEntry entry,
+      @Nullable Object fileKey,
       ImmutableList.Builder<Path> computeDirs,
       ImmutableList.Builder<Path> deleteFiles)
       throws IOException {
@@ -2221,7 +2323,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
           } else {
             boolean admitted = false;
             try {
-              admitFileAtStartup(onStartPut, fileEntryKey, diskSize);
+              admitFileAtStartup(onStartPut, fileEntryKey, diskSize, fileKey);
               admitted = true;
             } finally {
               if (!admitted) {
@@ -2480,7 +2582,8 @@ public abstract class CASFileCache implements ContentAddressableStorage {
   }
 
   interface FileContent {
-    void call(Path filePath, Path cacheFilePath, long size, boolean isExecutable) throws Exception;
+    void call(Path filePath, Path cacheFilePath, Digest digest, long size, boolean isExecutable)
+        throws Exception;
   }
 
   @SuppressWarnings("ConstantConditions")
@@ -2504,7 +2607,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
                 cacheFilePath -> {
                   try {
                     onFileContent.call(
-                        filePath, cacheFilePath.path(), digest.getSize(), isExecutable);
+                        filePath, cacheFilePath.path(), digest, digest.getSize(), isExecutable);
                   } catch (Exception e) {
                     return immediateFailedFuture(e);
                   }
@@ -2606,6 +2709,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
       Path path = pathDirectoryPair.getKey();
       Directory directory = pathDirectoryPair.getValue();
 
+      validateDirectoryEntryNames(path, directory);
       removeFilePath(path);
       Files.createDirectory(path);
       directoryOverhead += estimateDirectorySizeOnDisk(directory, blockSize);
@@ -2631,15 +2735,40 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     return directoryOverhead;
   }
 
-  private void removeFilePath(Path path) throws IOException {
+  private static void validateDirectoryEntryNames(Path path, Directory directory)
+      throws IOException {
+    Set<String> names = new HashSet<>();
+    for (FileNode fileNode : directory.getFilesList()) {
+      checkUniqueDirectoryEntryName(path, names, fileNode.getName());
+    }
+    for (DirectoryNode directoryNode : directory.getDirectoriesList()) {
+      checkUniqueDirectoryEntryName(path, names, directoryNode.getName());
+    }
+    for (SymlinkNode symlinkNode : directory.getSymlinksList()) {
+      checkUniqueDirectoryEntryName(path, names, symlinkNode.getName());
+    }
+  }
+
+  private static void checkUniqueDirectoryEntryName(Path path, Set<String> names, String name)
+      throws IOException {
+    if (!names.add(name)) {
+      throw new IOException(format("duplicate directory entry %s under %s", name, path));
+    }
+  }
+
+  protected void removeFilePath(Path path) throws IOException {
     if (Files.exists(path)) {
       if (Files.isDirectory(path)) {
         log.log(Level.FINER, "removing existing directory " + path + " for fetch");
-        Directories.remove(path, fileStore);
+        removeDirectoryForFetch(path);
       } else {
         Files.delete(path);
       }
     }
+  }
+
+  protected void removeDirectoryForFetch(Path path) throws IOException {
+    Directories.remove(path, fileStore);
   }
 
   private Directory getDirectoryFromDigest(
@@ -3137,57 +3266,89 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         }
 
         Entry entry = new Entry(key, blobSizeInBytes, Deadline.after(10, SECONDS));
+        Path canonicalPath = CASFileCache.this.getPath(key);
 
         Entry existingEntry = null;
         boolean inserted = false;
+        boolean storageOwnsReservation = false;
         try {
-          // createLink runs before the per-key lock acquired in safeStorageInsertion: a
-          // concurrent evictor mid-safeStorageRemoval for the same key still holds the canonical
-          // file, so createLink throws FileAlreadyExistsException and we fall through to the
-          // "look up the existing entry" polling branch below.
-          Files.createLink(CASFileCache.this.getPath(key), writePath);
-          existingEntry = safeStorageInsertion(key, entry);
-          inserted = existingEntry == null;
-        } catch (FileAlreadyExistsException e) {
-          log.log(Level.FINER, "file already exists for " + key + ", nonexistent entry will fail");
-        } finally {
-          Files.delete(writePath);
-          if (!inserted) {
-            dischargeReservation(key, blobSizeInBytes);
+          try {
+            // createLink runs before the per-key lock acquired in safeStorageInsertion: a
+            // concurrent evictor mid-safeStorageRemoval for the same key still holds the canonical
+            // file, so createLink throws FileAlreadyExistsException and we fall through to the
+            // "look up the existing entry" polling branch below.
+            Files.createLink(canonicalPath, writePath);
+            existingEntry = safeStorageInsertion(key, entry);
+            inserted = existingEntry == null;
+            storageOwnsReservation = inserted;
+          } catch (FileAlreadyExistsException e) {
+            log.log(Level.FINER, "file already exists for " + key);
+          } finally {
+            Files.delete(writePath);
           }
-        }
 
-        int attempts = 10;
-        if (!inserted) {
-          while (existingEntry == null && attempts-- != 0) {
-            existingEntry = storage.get(key);
-            try {
-              MILLISECONDS.sleep(10);
-            } catch (InterruptedException intEx) {
-              throw new IOException(intEx);
+          int attempts = 10;
+          if (!inserted) {
+            while (existingEntry == null && attempts-- != 0) {
+              existingEntry = storage.get(key);
+              try {
+                MILLISECONDS.sleep(10);
+              } catch (InterruptedException intEx) {
+                throw new IOException(intEx);
+              }
+            }
+
+            if (existingEntry == null) {
+              verifyCanonicalFileMatches(canonicalPath);
+              existingEntry = safeStorageInsertion(key, entry);
+              inserted = existingEntry == null;
+              storageOwnsReservation = inserted;
+              if (inserted) {
+                log.log(Level.FINER, "adopted existing canonical file for " + key);
+              }
             }
           }
 
-          if (existingEntry == null) {
-            throw new IOException("existing entry did not appear for " + key);
+          if (existingEntry != null) {
+            log.log(Level.FINER, "lost the race to insert " + key);
+            if (!referenceIfExists(key)) {
+              // we would lose our accountability and have a presumed reference if we returned
+              throw new IllegalStateException("storage conflict with existing key for " + key);
+            }
+          } else if (writeWinner.get()) {
+            log.log(Level.FINER, "won the race to insert " + key);
+            try {
+              onInsert.run();
+            } catch (RuntimeException e) {
+              throw new IOException(e);
+            }
+          } else {
+            log.log(Level.FINER, "did not win the race to insert " + key);
+          }
+        } finally {
+          if (!storageOwnsReservation) {
+            dischargeReservation(key, blobSizeInBytes);
           }
         }
+      }
 
-        if (existingEntry != null) {
-          log.log(Level.FINER, "lost the race to insert " + key);
-          if (!referenceIfExists(key)) {
-            // we would lose our accountability and have a presumed reference if we returned
-            throw new IllegalStateException("storage conflict with existing key for " + key);
-          }
-        } else if (writeWinner.get()) {
-          log.log(Level.FINER, "won the race to insert " + key);
-          try {
-            onInsert.run();
-          } catch (RuntimeException e) {
-            throw new IOException(e);
-          }
-        } else {
-          log.log(Level.FINER, "did not win the race to insert " + key);
+      private void verifyCanonicalFileMatches(Path canonicalPath) throws IOException {
+        long existingSize = Files.size(canonicalPath);
+        if (existingSize != blobSizeInBytes) {
+          throw new IOException(
+              format(
+                  "existing file size for %s was %d, expected %d",
+                  key, existingSize, blobSizeInBytes));
+        }
+
+        HashingOutputStream existingHashOut = digestUtil.newHashingOutputStream(nullOutputStream());
+        try (InputStream in = Files.newInputStream(canonicalPath)) {
+          ByteStreams.copy(in, existingHashOut);
+        }
+
+        Digest existingDigest = digestUtil.build(existingHashOut.hash().toString(), existingSize);
+        if (!getKey(existingDigest, isExecutable).equals(key)) {
+          throw new DigestMismatchException(existingDigest, expectedDigest);
         }
       }
     };
@@ -3207,12 +3368,15 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
     private static final VarHandle REFCOUNT;
     private static final VarHandle STATE;
+    private static final VarHandle CAS_DIRECTORY_HARDLINK_COUNT;
 
     static {
       try {
         MethodHandles.Lookup lookup = MethodHandles.lookup();
         REFCOUNT = lookup.findVarHandle(Entry.class, "refCount", int.class);
         STATE = lookup.findVarHandle(Entry.class, "state", State.class);
+        CAS_DIRECTORY_HARDLINK_COUNT =
+            lookup.findVarHandle(Entry.class, "casDirectoryHardlinkCount", int.class);
       } catch (ReflectiveOperationException e) {
         throw new ExceptionInInitializerError(e);
       }
@@ -3228,6 +3392,20 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
     @SuppressWarnings("unused")
     volatile State state;
+
+    // Counts hardlinks held by CAS-internal directory tree construction — specifically, hardlinks
+    // created by DirectoryEntryCFC.linkAndReference. Other hardlinks to this Entry's inode (e.g.,
+    // exec-root hardlinks created by CFCLinkExecFileSystem.put) are tracked separately via
+    // referenceCount, because their cleanup path has the key in hand and decrements via
+    // storage.get(key). This counter exists specifically because the directory tree walker
+    // (during parent-dir eviction) does NOT have the source key — only the file's inode — and
+    // must look up the source Entry via the CasInodeIndex. Keeping this counter separate from
+    // referenceCount lets us clean the index eagerly (on the 1->0 transition); a single combined
+    // counter would force lazy cleanup at full eviction and bloat the map at scale. Mutations go
+    // through CasInodeIndex (which pairs the atomic update with the inode-keyed map bookkeeping),
+    // never directly.
+    @SuppressWarnings("unused")
+    volatile int casDirectoryHardlinkCount;
 
     volatile Deadline existsDeadline;
 
@@ -3269,6 +3447,25 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     }
 
     /**
+     * Volatile read of the CAS-directory-hardlink count. {@code > 0} pins the Entry against
+     * eviction — the evictor's sweep skips such entries (see {@link EvictorShard}). Read by both
+     * the sweep and {@link CasInodeIndex}'s re-read-inside-compute pattern.
+     */
+    public int casDirectoryHardlinkCount() {
+      return (int) CAS_DIRECTORY_HARDLINK_COUNT.getVolatile(this);
+    }
+
+    /**
+     * Atomic {@code getAndAdd} on the CAS-directory-hardlink count, returning the previous value.
+     * Package-private and intended for use only by {@link CasInodeIndex}, which pairs the atomic
+     * update with the inode-keyed map bookkeeping. The VarHandle stays encapsulated here, next to
+     * the field it guards; the indexing strategy stays in {@code CasInodeIndex}.
+     */
+    int getAndAddCasDirectoryHardlinkCount(int delta) {
+      return (int) CAS_DIRECTORY_HARDLINK_COUNT.getAndAdd(this, delta);
+    }
+
+    /**
      * True for the no-arg-constructed dummy returned by {@link CASFileCache#getEntry} when the
      * cache is not running (STARTING / STOPPED) and the digest is not in {@code storage}. Real
      * entries never carry a negative refCount — {@link #release} throws on underflow rather than
@@ -3280,7 +3477,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
     @VisibleForTesting
     public boolean isEvictable() {
-      return state() == State.LIVE && refCount() == 0;
+      return state() == State.LIVE && refCount() == 0 && casDirectoryHardlinkCount() == 0;
     }
 
     public boolean isLinked() {
@@ -3340,9 +3537,10 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     }
 
     /**
-     * CAS state LIVE -> EVICTING and re-check refCount. Returns true if the caller now owns the
-     * eviction; false otherwise (entry resurrected via a concurrent acquire — the state is rolled
-     * back to LIVE in that case).
+     * CAS state LIVE -> EVICTING, then re-check both refCount and casDirectoryHardlinkCount under
+     * the published EVICTING state. Returns true if the caller now owns the eviction; false
+     * otherwise (entry resurrected via a concurrent acquire, or still pinned by a CAS-directory
+     * hardlink — the state is rolled back to LIVE in either case).
      */
     public boolean tryEvict() {
       if (!STATE.compareAndSet(this, State.LIVE, State.EVICTING)) {
@@ -3352,6 +3550,20 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         // CAS rather than setVolatile so a future EVICTING -> X transition added elsewhere
         // surfaces as a failed checkState rather than silently overwriting state.
         // checkState (not assert) so the invariant holds in production where -ea is off.
+        checkState(
+            STATE.compareAndSet(this, State.EVICTING, State.LIVE),
+            "tryEvict rollback observed unexpected state for %s",
+            key);
+        return false;
+      }
+      // A CAS-directory tree still hardlinks this source's inode: evicting it would delete the
+      // standalone file and discharge its bytes while the directory hardlink keeps the inode's
+      // blocks on disk (an accounting leak) and strands a stale CasInodeIndex mapping. The EVICTING
+      // state we just published is the serialization point: a concurrent linkAndReference either
+      // still holds src's refCount (caught above) or has already driven the count 0 -> 1 (caught
+      // here), and any acquire arriving after the CAS fails in tryAcquire. The sweep's pre-skip on
+      // casDirectoryHardlinkCount() > 0 is an optimization; this recheck is authoritative.
+      if (casDirectoryHardlinkCount() != 0) {
         checkState(
             STATE.compareAndSet(this, State.EVICTING, State.LIVE),
             "tryEvict rollback observed unexpected state for %s",
