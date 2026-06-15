@@ -46,10 +46,111 @@ import lombok.extern.java.Log;
 import org.jctools.queues.varhandle.MpscUnboundedVarHandleArrayQueue;
 import org.jctools.queues.varhandle.MpscVarHandleArrayQueue;
 
+// === Cache-line padding via inheritance (Phase 2.2) ===
+//
+// EvictorShard instances live in an EvictorShard[] managed by CasShards. Two adjacent shards'
+// objects can be placed adjacently on the heap, and a shard's hot mutable fields (the byte
+// counter, the wake flags, the lock) are written from producer threads on every charge. Without
+// padding, those writes would dirty a cache line that another core is spinning on for a NEIGHBORING
+// shard's read-only fields -> cross-core ping-pong under hot-key skew.
+//
+// We isolate the hot fields by sandwiching them between two 120-byte pad regions declared in
+// superclasses. HotSpot lays superclass fields before subclass fields, so the hot block lands
+// after EvictorShardPad0's pad and before EvictorShardPad1's pad; EvictorShard's own (cold) fields
+// follow the trailing pad. The result: each shard's hot block is >=120 bytes away from any other
+// shard object's fields on both sides. What this isolates is the in-object volatile scalars (the
+// wake flags, parked, the sequence/timestamp longs) written on the wake path; shardBytes/dequeued-
+// Count/lock/cond are references, and their write-contended state lives in the separately-allocated
+// LongAdder Cell[] / ReentrantLock AQS objects, which self-isolate (LongAdder.Cell is @Contended;
+// JCTools pads its queue producer/consumer indices). We deliberately do NOT use @Contended (it
+// needs -XX:-RestrictContended at deploy time) and do NOT double-pad those already-padded
+// structures. The JOL layout regression test pins this layout against future field-addition
+// regressions. See plan principle 3: per-Entry padding (69 GB at 540M entries) is forbidden; this
+// per-shard pad is ~7.7 KB at N=32. (The dominant per-shard cost is not the pad but the pre-
+// allocated MPSC backing arrays: the insertion and stale queues each eagerly allocate a 64K-ref
+// chunk and the access queue a 32K-ref one, so ~640 KB/shard under compressed oops (4-byte refs)
+// and ~1.25 MB/shard with 8-byte refs on a >32 GB heap. Either way trivial against a CAS worker's
+// heap.)
+abstract class EvictorShardPad0 {
+  @SuppressWarnings("unused")
+  byte p000, p001, p002, p003, p004, p005, p006, p007, p008, p009, p010, p011, p012, p013, p014;
+  @SuppressWarnings("unused")
+  byte p015, p016, p017, p018, p019, p020, p021, p022, p023, p024, p025, p026, p027, p028, p029;
+  @SuppressWarnings("unused")
+  byte p030, p031, p032, p033, p034, p035, p036, p037, p038, p039, p040, p041, p042, p043, p044;
+  @SuppressWarnings("unused")
+  byte p045, p046, p047, p048, p049, p050, p051, p052, p053, p054, p055, p056, p057, p058, p059;
+  @SuppressWarnings("unused")
+  byte p060, p061, p062, p063, p064, p065, p066, p067, p068, p069, p070, p071, p072, p073, p074;
+  @SuppressWarnings("unused")
+  byte p075, p076, p077, p078, p079, p080, p081, p082, p083, p084, p085, p086, p087, p088, p089;
+  @SuppressWarnings("unused")
+  byte p090, p091, p092, p093, p094, p095, p096, p097, p098, p099, p100, p101, p102, p103, p104;
+  @SuppressWarnings("unused")
+  byte p105, p106, p107, p108, p109, p110, p111, p112, p113, p114, p115, p116, p117, p118, p119;
+}
+
+/** Hot mutable fields written from producer threads and the evictor thread, isolated by padding. */
+abstract class EvictorShardHotRefs extends EvictorShardPad0 {
+  // Per-shard byte accounting. Producers add on charge; the evictor subtracts on eviction. The
+  // ground-truth eviction/backpressure trigger (sum() vs the per-shard watermarks).
+  final LongAdder shardBytes = new LongAdder();
+  // Incremented by the evictor on each MPSC poll; read by producers for the cheap depth probe.
+  final LongAdder dequeuedCount = new LongAdder();
+
+  final ReentrantLock lock = new ReentrantLock();
+  final Condition cond = lock.newCondition();
+
+  volatile boolean workPending;
+  volatile boolean snapshotPending;
+  volatile boolean stopping;
+
+  // True while the evictor thread is parked on {@link #cond}. Producers check this BEFORE
+  // taking the lock so a steady-state {@code requestDrain} on a running evictor is a single
+  // volatile read instead of a full mutex acquire. Written by the evictor inside the park block;
+  // read by producers without the lock. The wait loop re-checks the predicate AFTER publishing
+  // parked=true (Dekker handshake) so a producer that set workPending and observed parked==false
+  // (and thus skipped its signal) cannot be lost.
+  volatile boolean parked;
+
+  // Published by the evictor under {@link #lock} on each pre-await; readers (tests calling
+  // awaitQuiescence) read it without the lock. Single-writer + volatile gives the happens-before
+  // edge tests need.
+  volatile long quiescedSequence;
+
+  volatile long lastWakeNanos;
+
+  // Wall-clock (System.nanoTime) heartbeat for the per-shard heartbeat-age gauge; distinct from
+  // lastWakeNanos, which uses the injectable nanosSupplier so tests can drive it deterministically.
+  volatile long heartbeatWallNanos = System.nanoTime();
+}
+
+/** Trailing pad separating the hot block from EvictorShard's cold fields and neighbor objects. */
+abstract class EvictorShardPad1 extends EvictorShardHotRefs {
+  @SuppressWarnings("unused")
+  byte q000, q001, q002, q003, q004, q005, q006, q007, q008, q009, q010, q011, q012, q013, q014;
+  @SuppressWarnings("unused")
+  byte q015, q016, q017, q018, q019, q020, q021, q022, q023, q024, q025, q026, q027, q028, q029;
+  @SuppressWarnings("unused")
+  byte q030, q031, q032, q033, q034, q035, q036, q037, q038, q039, q040, q041, q042, q043, q044;
+  @SuppressWarnings("unused")
+  byte q045, q046, q047, q048, q049, q050, q051, q052, q053, q054, q055, q056, q057, q058, q059;
+  @SuppressWarnings("unused")
+  byte q060, q061, q062, q063, q064, q065, q066, q067, q068, q069, q070, q071, q072, q073, q074;
+  @SuppressWarnings("unused")
+  byte q075, q076, q077, q078, q079, q080, q081, q082, q083, q084, q085, q086, q087, q088, q089;
+  @SuppressWarnings("unused")
+  byte q090, q091, q092, q093, q094, q095, q096, q097, q098, q099, q100, q101, q102, q103, q104;
+  @SuppressWarnings("unused")
+  byte q105, q106, q107, q108, q109, q110, q111, q112, q113, q114, q115, q116, q117, q118, q119;
+}
+
 /**
- * Single asynchronous evictor that owns the LRU list and totalBytes accounting, and serves as the
- * lock-free integration point between producer cache calls ({@code charge}, {@code recordAccess})
- * and the per-{@link Entry} atomic state machine.
+ * One asynchronous evictor shard that owns its slice of the LRU list and shardBytes accounting, and
+ * serves as the lock-free integration point between producer cache calls ({@code charge}, {@code
+ * recordAccess}) and the per-{@link Entry} atomic state machine. {@link CasShards} owns an array of
+ * these and routes keys to shards by {@code hash(key) & (N - 1)}; at {@code N == 1} a single shard
+ * holds the whole cache (the pre-2.2 behavior).
  *
  * <h2>Wake protocol</h2>
  *
@@ -57,13 +158,13 @@ import org.jctools.queues.varhandle.MpscVarHandleArrayQueue;
  * producers crossing a wake threshold), {@code snapshotPending} (set by the snapshot scheduler),
  * {@code stopping} (set by {@link #stop}). Producers MUST NOT hold {@link #lock} while computing
  * what they signal. {@code workPending} is a wake-DEBOUNCE flag, not a work-presence flag — work
- * presence is carried by the MPSC queues and {@code totalBytes}, which the park predicate re-checks
+ * presence is carried by the MPSC queues and {@code shardBytes}, which the park predicate re-checks
  * directly. The consumer clears {@code workPending} only at the idle gate, after a drain+sweep has
  * established quiescence, and re-checks the predicate AFTER publishing {@code parked=true} (the
  * Dekker handshake on {@link #parked}) so a producer that set {@code workPending} and observed
  * {@code parked==false} (and thus skipped its signal) cannot be lost. Correctness rests on (1)
  * predicate re-check on every wake, (2) {@link #idleHeartbeatNanos} heartbeat self-heals lost
- * signals, (3) {@code totalBytes.sum() > lowBytes} is the ground-truth trigger.
+ * signals, (3) {@code shardBytes.sum() > lowBytes} is the ground-truth trigger.
  *
  * <h2>Notifications</h2>
  *
@@ -81,11 +182,12 @@ import org.jctools.queues.varhandle.MpscVarHandleArrayQueue;
  *
  * <h2>Snapshot</h2>
  *
- * The evictor thread walks the LRU and writes the snapshot file synchronously. Single-evictor
- * design (no sharding); a future sharded layout would benefit from pipelined SPSC handoff.
+ * The shard's evictor thread walks its LRU and writes its own snapshot file ({@code
+ * lru_num_shards_<N>_shard_<index>.txt}) synchronously. Per-shard snapshots parallelize the walk
+ * across shards; first fires are staggered by {@code index} so they don't all trigger at once.
  */
 @Log
-final class Evictor {
+final class EvictorShard extends EvictorShardPad1 {
   static final int INSERTION_QUEUE_CAPACITY = 64 * 1024;
   static final int ACCESS_QUEUE_CAPACITY = 32 * 1024;
   private static final int INSERTION_DRAIN_BATCH = 8192;
@@ -106,7 +208,7 @@ final class Evictor {
   static final long DEFAULT_WAKE_BUDGET_NANOS = 50_000_000L;
   static final long DEFAULT_IDLE_HEARTBEAT_NANOS = 2_000_000_000L;
 
-  // Wake threshold offsets: wake when totalBytes crosses (parkBytes - 2%) so producers
+  // Wake threshold offsets: wake when shardBytes crosses (parkBytes - 2%) so producers
   // typically observe sub-cap state before they reach the hard cap; clamp above lowBytes
   // by 1% of cap so a config with low close to park still yields a non-empty wake window.
   private static final int WAKE_BELOW_PARK_PERCENT = 2;
@@ -120,75 +222,69 @@ final class Evictor {
   // === Prometheus metrics (lock-free counters; Prometheus Histogram for the
   //     evictor-thread-recorded histograms — single-writer, no producer-side contention) ===
 
+  // All counters carry a {shard} label so per-shard rates are distinguishable; the high-cardinality
+  // histograms (evictions_per_wake, sweep_duration, skip_prefix_length, snapshot_duration) stay
+  // GLOBAL per plan step 11 to avoid N_SHARDS x quantiles series. Per-shard children are resolved
+  // once into instance fields in the constructor so the producer hot path calls inc() on a cached
+  // Child rather than re-resolving labels.
   private static final Counter evictedTotal =
-      Counter.build().name("evictor_evicted_total").help("Successful evictions.").register();
+      Counter.build()
+          .name("evictor_evicted_total")
+          .labelNames("shard")
+          .help("Successful evictions.")
+          .register();
   private static final Counter stateRollbacksTotal =
       Counter.build()
           .name("evictor_state_rollbacks_total")
+          .labelNames("shard")
           .help("tryEvict EVICTING -> LIVE rollbacks.")
           .register();
   private static final Counter wakesTotal =
       Counter.build()
           .name("evictor_wakes_total")
-          .labelNames("trigger")
+          .labelNames("shard", "trigger")
           .help("Evictor wakeups by trigger.")
           .register();
 
-  // Cached per-trigger children. Counter.labels(...) allocates a List on each call and
-  // does a ConcurrentHashMap lookup; on the producer hot path we resolve the Child once
-  // at class init and call inc() directly.
   private static final String TRIGGER_BYTE_THRESHOLD = "byte_threshold";
   private static final String TRIGGER_QUEUE_DEPTH = "queue_depth";
   private static final String TRIGGER_SNAPSHOT = "snapshot";
-  private static final Counter.Child wakesByteThreshold = wakesTotal.labels(TRIGGER_BYTE_THRESHOLD);
-  private static final Counter.Child wakesQueueDepth = wakesTotal.labels(TRIGGER_QUEUE_DEPTH);
-  private static final Counter.Child wakesSnapshot = wakesTotal.labels(TRIGGER_SNAPSHOT);
-  private static final Counter.Child mpscDropsAccess =
+  private static final Counter mpscDropsTotal =
       Counter.build()
           .name("mpsc_drops_total")
-          .labelNames("queue")
+          .labelNames("shard", "queue")
           .help("MPSC queue offer-full drops.")
-          .register()
-          .labels("access");
+          .register();
   private static final Counter expireEntryFallbackFailureTotal =
       Counter.build()
           .name("expire_entry_fallback_failure_total")
-          .labelNames("reason")
+          .labelNames("shard", "reason")
           .help("Delegate-fallback failures during eviction, labeled by exception simple name.")
           .register();
   private static final Counter restartsTotal =
       Counter.build()
           .name("evictor_restarts_total")
-          .labelNames("reason")
+          .labelNames("shard", "reason")
           .help("Evictor loop body restarts.")
           .register();
   private static final Counter lruSnapshotFailureTotal =
       Counter.build()
           .name("lru_snapshot_failure_total")
-          .labelNames("error_class")
+          .labelNames("shard", "error_class")
           .help("Snapshot write failures.")
           .register();
 
   private static final Gauge queueDepthGauge =
       Gauge.build()
           .name("evictor_queue_depth")
+          .labelNames("shard")
           .help("Approximate insertion and stale-entry queue depth.")
           .register();
-  private static final AtomicLong heartbeatLastAdvancedNanos = new AtomicLong(System.nanoTime());
-
-  @SuppressWarnings("unused")
   private static final Gauge heartbeatAgeGauge =
       Gauge.build()
           .name("evictor_heartbeat_age_seconds")
-          .help("Seconds since evictor loop body last advanced.")
-          .create()
-          .setChild(
-              new Gauge.Child() {
-                @Override
-                public double get() {
-                  return Math.max(0, System.nanoTime() - heartbeatLastAdvancedNanos.get()) / 1e9;
-                }
-              })
+          .labelNames("shard")
+          .help("Seconds since the shard's evictor loop body last advanced.")
           .register();
 
   private static final Histogram evictionsPerWake =
@@ -219,9 +315,14 @@ final class Evictor {
   // === Configuration ===
 
   private final CasEvictorBacking backing;
+  final int index;
+  private final int shardCount;
+  private final String shardLabel;
   private final ExecutorService asyncCleanupExecutor;
   private final Clock clock;
   private final long parkBytes;
+  // Transient loader-side gate; reset after the scan. Runtime accounting lives in shardBytes.
+  private final AtomicLong startupAdmissionBytes = new AtomicLong();
   private final long wakeBytes;
   private final long lowBytes;
   private final long wakeBudgetNanos;
@@ -229,43 +330,27 @@ final class Evictor {
   private final LRUDB lruDb;
   private final Path snapshotPath;
 
+  // === Per-shard cached metric children (resolved once in the constructor) ===
+
+  private final Counter.Child evictedChild;
+  private final Counter.Child stateRollbacksChild;
+  private final Counter.Child wakesByteThreshold;
+  private final Counter.Child wakesQueueDepth;
+  private final Counter.Child wakesSnapshot;
+  private final Counter.Child mpscDropsAccessChild;
+  private final Gauge.Child queueDepthChild;
+
   // === Concurrency state ===
+  // (lock, cond, the wake flags, parked, quiescedSequence, lastWakeNanos, shardBytes, and
+  //  dequeuedCount live in the padded superclasses EvictorShardHotRefs / EvictorShardPad0/1.)
 
-  private final ReentrantLock lock = new ReentrantLock();
-  private final Condition cond = lock.newCondition();
-
-  private volatile boolean workPending;
-  private volatile boolean snapshotPending;
-  private volatile boolean stopping;
-
-  // True while the evictor thread is parked on {@link #cond}. Producers check this BEFORE
-  // taking the lock so a steady-state {@link #requestDrain} on a running evictor is a
-  // single volatile read instead of a full mutex acquire. Written by the evictor inside the
-  // park block; read by producers without the lock. The wait loop re-checks the predicate
-  // AFTER publishing parked=true so the JMM total order on volatile reads/writes pairs the
-  // producer's (workPending=true; read parked) sequence with our (parked=true; re-read
-  // workPending) sequence — if the producer's parked-read sees false (so it skipped the
-  // signal), our re-read MUST see workPending=true. Without the re-check, both reads can
-  // observe stale values in a legal SC interleaving and the evictor sleeps until the
-  // heartbeat self-heals (idleHeartbeatNanos, default 2s) — a latency spike, not a
-  // correctness bug, but unacceptable when the signal exists to unblock cap pressure.
-  private volatile boolean parked;
-
-  // Published by the evictor under {@link #lock} on each pre-await; readers (tests calling
-  // {@link #awaitQuiescence}) read the volatile value without the lock. Single-writer +
-  // volatile gives the happens-before edge tests need.
-  private volatile long quiescedSequence;
-
-  private volatile long lastWakeNanos;
   private volatile long lastSnapshotMs;
 
-  // === Hot accounting ===
+  // === Hot accounting (single-writer: the evictor thread) ===
 
-  private final LongAdder totalBytes = new LongAdder();
   private final LongAdder unreferencedCount = new LongAdder();
   private final LongAdder removedBytes = new LongAdder();
   private final LongAdder removedCount = new LongAdder();
-  private final LongAdder dequeuedCount = new LongAdder();
   private final LongAdder stateRollbackCount = new LongAdder();
 
   // === MPSC queues ===
@@ -287,8 +372,10 @@ final class Evictor {
   private Thread snapshotSchedulerThread;
   private boolean evictOneDischarged;
 
-  Evictor(
+  EvictorShard(
       CasEvictorBacking backing,
+      int index,
+      int shardCount,
       ExecutorService asyncCleanupExecutor,
       Clock clock,
       Entry header,
@@ -298,16 +385,42 @@ final class Evictor {
       long idleHeartbeatNanos,
       LRUDB lruDb,
       Path snapshotPath) {
+    checkArgument(index >= 0 && index < shardCount, "index must be in [0, shardCount)");
+    checkArgument(Integer.bitCount(shardCount) == 1, "shardCount must be a power of two");
     checkArgument(parkBytes > 0, "parkBytes must be positive");
     checkArgument(lowBytes >= 0 && lowBytes <= parkBytes, "lowBytes must be in [0, parkBytes]");
     checkArgument(wakeBudgetNanos > 0, "wakeBudgetNanos must be positive");
     checkArgument(idleHeartbeatNanos > 0, "idleHeartbeatNanos must be positive");
     this.backing = backing;
+    this.index = index;
+    this.shardCount = shardCount;
+    this.shardLabel = Integer.toString(index);
     this.asyncCleanupExecutor = asyncCleanupExecutor;
     this.clock = clock;
     this.header = header;
     this.parkBytes = parkBytes;
     this.lowBytes = lowBytes;
+    this.evictedChild = evictedTotal.labels(shardLabel);
+    this.stateRollbacksChild = stateRollbacksTotal.labels(shardLabel);
+    this.wakesByteThreshold = wakesTotal.labels(shardLabel, TRIGGER_BYTE_THRESHOLD);
+    this.wakesQueueDepth = wakesTotal.labels(shardLabel, TRIGGER_QUEUE_DEPTH);
+    this.wakesSnapshot = wakesTotal.labels(shardLabel, TRIGGER_SNAPSHOT);
+    this.mpscDropsAccessChild = mpscDropsTotal.labels(shardLabel, "access");
+    this.queueDepthChild = queueDepthGauge.labels(shardLabel);
+    // setChild registers a callback child keyed on shard index alone in the shared static gauge, so
+    // it computes age at scrape time without a per-wake metric write. This assumes a single CAS
+    // instance per JVM (production): if two caches existed, the second's shard i would replace the
+    // first's heartbeat child. The other per-shard metrics use idempotent labels(...) and are
+    // unaffected. Tests construct many caches but never assert this gauge, so the replacement is
+    // benign there.
+    heartbeatAgeGauge.setChild(
+        new Gauge.Child() {
+          @Override
+          public double get() {
+            return Math.max(0, System.nanoTime() - heartbeatWallNanos) / 1e9;
+          }
+        },
+        shardLabel);
     // Wake threshold sits at max(2% below park, 1% above low) clamped to at most parkBytes - 1.
     // Picking max() means a config with lowBytes close to parkBytes places the wake near
     // parkBytes - 1, not 2% below park — the goal is a non-empty wake window above lowBytes,
@@ -335,13 +448,14 @@ final class Evictor {
         return;
       }
       lastWakeNanos = nowNanos();
+      heartbeatWallNanos = System.nanoTime();
       lastSnapshotMs = clock.millis();
       stopping = false;
-      evictorThread = new Thread(this::loop, "buildfarm-cas-evictor");
+      evictorThread = new Thread(this::loop, "buildfarm-cas-evictor-" + index);
       evictorThread.setDaemon(true);
       evictorThread.start();
       snapshotSchedulerThread =
-          new Thread(this::snapshotSchedulerLoop, "buildfarm-cas-snapshot-scheduler");
+          new Thread(this::snapshotSchedulerLoop, "buildfarm-cas-snapshot-scheduler-" + index);
       snapshotSchedulerThread.setDaemon(true);
       snapshotSchedulerThread.start();
     } finally {
@@ -350,7 +464,11 @@ final class Evictor {
   }
 
   void stop() throws InterruptedException {
-    Thread evictor;
+    requestStop();
+    awaitStopped();
+  }
+
+  void requestStop() {
     Thread scheduler;
     lock.lock();
     try {
@@ -360,13 +478,26 @@ final class Evictor {
       stopping = true;
       snapshotPending = true; // shutdown snapshot
       cond.signalAll();
-      evictor = evictorThread;
       scheduler = snapshotSchedulerThread;
     } finally {
       lock.unlock();
     }
     if (scheduler != null) {
       scheduler.interrupt();
+    }
+  }
+
+  void awaitStopped() throws InterruptedException {
+    Thread evictor;
+    Thread scheduler;
+    lock.lock();
+    try {
+      evictor = evictorThread;
+      scheduler = snapshotSchedulerThread;
+    } finally {
+      lock.unlock();
+    }
+    if (scheduler != null) {
       scheduler.join();
     }
     if (evictor != null) {
@@ -392,13 +523,13 @@ final class Evictor {
    * if interrupted while parked; {@link IOException} if the 5-minute hard-cap timeout fires.
    */
   void charge(long bytes) throws InterruptedException, IOException {
-    totalBytes.add(bytes);
-    long current = totalBytes.sum();
-    // Wake whenever totalBytes is above the wake watermark; requestDrain's workPending guard
+    shardBytes.add(bytes);
+    long current = shardBytes.sum();
+    // Wake whenever shardBytes is above the wake watermark; requestDrain's workPending guard
     // debounces redundant signals so steady-state above-watermark charges cost one volatile
     // read each. An earlier "edge-triggered" form computed (current - bytes) and only fired
     // on the producer that observed the crossing, but two concurrent producers each adding
-    // less than the wake-margin could both read totalBytes.sum() after both adds had landed
+    // less than the wake-margin could both read shardBytes.sum() after both adds had landed
     // and so each see (current - bytes) > wakeBytes — leaving NO producer to fire the wake.
     // Always-fire + workPending-dedup is correct and removes the lost-wake hazard.
     if (current > wakeBytes) {
@@ -410,28 +541,77 @@ final class Evictor {
   }
 
   /**
-   * Add startup-time bytes to {@link #totalBytes} without the wake/park machinery. Used by the
-   * cache's {@code scanRoot} when seeding totalBytes from on-disk files; safe whether or not the
-   * evictor thread has been started, because the additions are accumulating LongAdder cells and
-   * don't touch the LRU.
+   * Add startup-time bytes to {@link #shardBytes} without the wake/park machinery. Production
+   * startup goes through {@link #linkAtStartup}, which reserves bytes itself; this finer-grained
+   * primitive exists only for tests that construct an {@code EvictorShard} directly and seed its
+   * accounting by hand. Safe before {@link #start} since it only accumulates LongAdder cells.
    */
+  @VisibleForTesting
   void addBytesAtStartup(long bytes) {
-    totalBytes.add(bytes);
+    shardBytes.add(bytes);
   }
 
   /**
-   * Account a newly LRU-linked entry at startup. Increments the unreferenced count so the
-   * post-start metrics agree with the LRU walk. Callers must hold whatever lock the cache uses to
-   * serialize concurrent {@link Entry#addBefore} on {@link #header} with the evictor's drain — in
-   * practice this is the {@code synchronized(header)} block inside {@code processRootFile}.
+   * Reserve {@code diskSize} against this shard's own cap ({@code parkBytes}), returning false when
+   * the shard is full so the loader skips the blob rather than overfilling one skewed shard.
    */
+  boolean tryReserveStartupBytes(long diskSize) {
+    while (true) {
+      long current = startupAdmissionBytes.get();
+      long next = current + diskSize;
+      if (next < current || next > parkBytes) {
+        return false;
+      }
+      if (startupAdmissionBytes.compareAndSet(current, next)) {
+        return true;
+      }
+    }
+  }
+
+  /** Reverse a prior {@link #tryReserveStartupBytes} reservation that did not get linked. */
+  void releaseStartupBytes(long diskSize) {
+    if (diskSize != 0) {
+      startupAdmissionBytes.addAndGet(-diskSize);
+    }
+  }
+
+  /** Zero the startup gate after the load; runtime accounting uses shardBytes. */
+  void resetStartupAdmission() {
+    startupAdmissionBytes.set(0);
+  }
+
+  /**
+   * Increment the unreferenced count for an entry the caller has already linked onto {@link
+   * #header}. Production startup goes through {@link #linkAtStartup}, which does the link and this
+   * increment together under the header lock; this primitive exists only for tests that link a
+   * victim by hand and need the count to match.
+   */
+  @VisibleForTesting
   void noteUnreferencedAtStartup() {
     unreferencedCount.increment();
   }
 
+  /**
+   * Link a freshly-scanned orphan entry onto this shard's LRU and reserve its bytes, the startup
+   * counterpart to the runtime {@code charge} + {@code offerInsertion} path. Startup runs before
+   * {@link #start} spawns the evictor thread, so the LRU has no single-writer yet; the parallel
+   * scan pool routes many keys to many shards concurrently, so we serialize the pointer mutation on
+   * this shard's own {@code header} (per-shard locks contend far less than a single global header
+   * lock). The byte reservation is unconditional and matches the link's accounting.
+   */
+  void linkAtStartup(Entry e, long diskSize) {
+    synchronized (header) {
+      if (!e.isLinked() && e.state() == Entry.State.LIVE && e.refCount() == 0) {
+        e.addBefore(header);
+        unreferencedCount.increment();
+      }
+    }
+    shardBytes.add(diskSize);
+  }
+
   /** Reverse a prior {@link #charge} reservation. */
   void discharge(long bytes) {
-    totalBytes.add(-bytes);
+    shardBytes.add(-bytes);
     // Use plain lock (not tryLock): a missed signal leaves a hard-cap-parked producer
     // waiting until the 2-second heartbeat self-heals, introducing latency variance.
     // discharge is off the producer hot path (writer cancel/error + evictor sweep), so
@@ -454,7 +634,7 @@ final class Evictor {
    * just churn the lock.
    */
   private void dischargeNoSignal(long bytes) {
-    totalBytes.add(-bytes);
+    shardBytes.add(-bytes);
   }
 
   /**
@@ -479,7 +659,7 @@ final class Evictor {
       if (accessEvents.offer(key)) {
         offered = true;
       } else {
-        mpscDropsAccess.inc();
+        mpscDropsAccessChild.inc();
       }
     }
     if (offered) {
@@ -503,7 +683,7 @@ final class Evictor {
     } else if (trigger == TRIGGER_SNAPSHOT) {
       wakesSnapshot.inc();
     } else {
-      wakesTotal.labels(trigger).inc();
+      wakesTotal.labels(shardLabel, trigger).inc();
     }
     if (!parked) {
       // Evictor is running; it'll re-check workPending on its next loop iteration. Skip
@@ -556,8 +736,8 @@ final class Evictor {
     this.nanosSupplier = supplier;
   }
 
-  long currentTotalBytes() {
-    return totalBytes.sum();
+  long currentShardBytes() {
+    return shardBytes.sum();
   }
 
   long currentUnreferencedCount() {
@@ -581,17 +761,16 @@ final class Evictor {
   }
 
   /**
-   * Operator-facing count of evictions since the last call. {@code sumThenReset} is a best-effort
-   * rate counter, not an exact total; the monotonic {@code evictor_evicted_total} is the
-   * authoritative completed-eviction count. Clamp to int range rather than silently wrapping on a
-   * very long poll gap.
+   * Cumulative evictions since startup. Non-destructive ({@code sum()}, not {@code sumThenReset()})
+   * so concurrent readers don't steal the count from each other; {@code evictor_evicted_total} is
+   * authoritative. Clamped to int range.
    */
   int getEvictedCount() {
-    return (int) Math.min(removedCount.sumThenReset(), Integer.MAX_VALUE);
+    return (int) Math.min(removedCount.sum(), Integer.MAX_VALUE);
   }
 
   long getEvictedSize() {
-    return removedBytes.sumThenReset();
+    return removedBytes.sum();
   }
 
   // === Hard-cap park ===
@@ -605,16 +784,16 @@ final class Evictor {
     } catch (InterruptedException ie) {
       // Lock not held: roll back the reservation but skip signalAll (no lock). Sibling parkers
       // self-heal via the heartbeat or the next discharge's signal.
-      totalBytes.add(-bytesReserved);
+      shardBytes.add(-bytesReserved);
       throw ie;
     }
     try {
-      while (totalBytes.sum() > parkBytes && !stopping) {
+      while (shardBytes.sum() > parkBytes && !stopping) {
         long remainingNanos = deadlineNanos - nowNanos();
         if (remainingNanos <= 0) {
           // Roll back AND wake sibling parkers: the freed bytes are headroom they may need.
           // Without this, a parker timing out leaves the next one to wait for the heartbeat.
-          totalBytes.add(-bytesReserved);
+          shardBytes.add(-bytesReserved);
           cond.signalAll();
           throw new IOException(
               "cas charge backpressure: parked "
@@ -623,16 +802,16 @@ final class Evictor {
         }
         cond.await(remainingNanos, NANOSECONDS);
       }
-      if (stopping && totalBytes.sum() > parkBytes) {
+      if (stopping && shardBytes.sum() > parkBytes) {
         // stop() set stopping and signalAll-woke us; the evictor will not run more sweeps so
-        // we cannot expect totalBytes to drop. Roll back the reservation and surface a typed
+        // we cannot expect shardBytes to drop. Roll back the reservation and surface a typed
         // failure so the caller exits promptly instead of waiting the full hard-cap timeout.
-        totalBytes.add(-bytesReserved);
+        shardBytes.add(-bytesReserved);
         cond.signalAll();
         throw new IOException("cas charge backpressure: evictor stopped while parked");
       }
     } catch (InterruptedException ie) {
-      totalBytes.add(-bytesReserved);
+      shardBytes.add(-bytesReserved);
       cond.signalAll();
       throw ie;
     } finally {
@@ -645,15 +824,16 @@ final class Evictor {
   private void loop() {
     int restartCount = 0;
     int consecutiveSuccesses = 0;
-    boolean shutdownSnapshotEmitted = false;
     while (!stopping) {
       lastWakeNanos = nowNanos();
-      heartbeatLastAdvancedNanos.set(System.nanoTime());
+      heartbeatWallNanos = System.nanoTime();
       try {
         long dequeuedBefore = dequeuedCount.sum();
         drainMpsc();
         long dequeuedAfter = dequeuedCount.sum();
-        queueDepthGauge.set(insertionEvents.size() + staleEvents.size());
+        // Widen to long before summing: each size() can transiently report up to Integer.MAX_VALUE
+        // (unbounded-queue estimate), and an int sum could overflow negative on the gauge.
+        queueDepthChild.set((long) insertionEvents.size() + staleEvents.size());
         if (dequeuedAfter > dequeuedBefore) {
           lock.lock();
           try {
@@ -663,17 +843,17 @@ final class Evictor {
           }
         }
 
-        if (snapshotPending && snapshotIsOverdue()) {
+        if (snapshotPending && snapshotIsOverdue() && !stopping) {
           // Sustained-pressure preemption: shard stayed above LOW for two intervals; force a
-          // snapshot to keep warm-LRU fresh.
+          // snapshot to keep warm-LRU fresh. Skipped when stopping — the post-loop drain handles
+          // it.
           performSnapshot();
           snapshotPending = false;
-          if (stopping) shutdownSnapshotEmitted = true;
           continue;
         }
 
         boolean stuckAboveLow = false;
-        if (totalBytes.sum() > lowBytes) {
+        if (shardBytes.sum() > lowBytes) {
           int evicted = sweepWithBudget(wakeBudgetNanos);
           if (evicted > 0
               || !insertionEvents.isEmpty()
@@ -687,15 +867,14 @@ final class Evictor {
           stuckAboveLow = true;
         }
 
-        if (snapshotPending) {
+        if (snapshotPending && !stopping) {
           performSnapshot();
           snapshotPending = false;
-          if (stopping) shutdownSnapshotEmitted = true;
           continue;
         }
 
         // Park on the heartbeat condvar. The wait predicate accepts two distinct quiescent
-        // states: (a) genuinely idle (totalBytes <= lowBytes), or (b) stuck above LOW with
+        // states: (a) genuinely idle (shardBytes <= lowBytes), or (b) stuck above LOW with
         // nothing evictable yet — in both cases the wake signal comes from charge() (new
         // work) or offerInsertion (new LRU candidate from release).
         lock.lock();
@@ -706,7 +885,7 @@ final class Evictor {
               && insertionEvents.isEmpty()
               && staleEvents.isEmpty()
               && accessEvents.isEmpty()
-              && (totalBytes.sum() <= lowBytes || stuckAboveLow)) {
+              && (shardBytes.sum() <= lowBytes || stuckAboveLow)) {
             quiescedSequence++;
             parked = true;
             try {
@@ -725,7 +904,7 @@ final class Evictor {
                   || !insertionEvents.isEmpty()
                   || !staleEvents.isEmpty()
                   || !accessEvents.isEmpty()
-                  || (totalBytes.sum() > lowBytes && !stuckAboveLow)) {
+                  || (shardBytes.sum() > lowBytes && !stuckAboveLow)) {
                 continue;
               }
               cond.await(idleHeartbeatNanos, NANOSECONDS);
@@ -766,7 +945,7 @@ final class Evictor {
         // matters, the JVM) die is the intended behavior.
         log.log(Level.SEVERE, "evictor loop iteration failed; backoff restart", e);
         String reason = (e instanceof IOException) ? "io_exception" : "runtime_exception";
-        restartsTotal.labels(reason).inc();
+        restartsTotal.labels(shardLabel, reason).inc();
         restartCount++;
         consecutiveSuccesses = 0;
         long sleepMs =
@@ -797,29 +976,40 @@ final class Evictor {
         }
       }
     }
-    // Shutdown snapshot. Skip if the loop body already emitted one after stopping was set —
-    // stop() sets both snapshotPending and stopping, so a still-running loop iteration will
-    // typically run performSnapshot before noticing stopping. Re-running here doubles the
-    // shutdown latency on large workers.
-    if (!shutdownSnapshotEmitted) {
-      try {
-        drainMpscUntilEmpty();
-        performSnapshot();
-      } catch (Exception e) {
-        log.log(Level.WARNING, "shutdown snapshot failed", e);
-      }
+    // The in-loop snapshot sites skip when stopping, so this is the sole shutdown snapshot.
+    shutdownSnapshot();
+  }
+
+  /**
+   * Final drain + snapshot after the loop exits. Drains the queues to empty FIRST so events queued
+   * in the last window are persisted, not lost (lost events degrade post-restart LRU recency).
+   */
+  @VisibleForTesting
+  void shutdownSnapshot() {
+    try {
+      drainMpscUntilEmpty();
+      performSnapshot();
+    } catch (Exception e) {
+      log.log(Level.WARNING, "shutdown snapshot failed", e);
     }
   }
 
   private void snapshotSchedulerLoop() {
+    // Staggered first fire: shard i fires initially at interval * (i + 1) / N so the N shards'
+    // first snapshots spread across the first interval window instead of triggering simultaneously
+    // (which would spike disk I/O and contend for the scan/io budget). Subsequent fires are at the
+    // full interval cadence.
+    long firstFireMs = Math.max(1L, SNAPSHOT_INTERVAL_MS * (index + 1) / shardCount);
+    long nextSleepMs = firstFireMs;
     while (!stopping) {
       try {
-        Thread.sleep(SNAPSHOT_INTERVAL_MS);
+        Thread.sleep(nextSleepMs);
       } catch (InterruptedException e) {
         if (stopping) break;
         Thread.interrupted();
         continue;
       }
+      nextSleepMs = SNAPSHOT_INTERVAL_MS;
       requestSnapshot();
     }
   }
@@ -913,14 +1103,14 @@ final class Evictor {
     try {
       Entry cursor = header.after;
       while (cursor != header
-          && totalBytes.sum() > lowBytes
+          && shardBytes.sum() > lowBytes
           && nowNanos() < deadlineNanos
           && !stopping) {
         Entry victim = cursor;
         cursor = cursor.after;
         if (!victim.tryEvict()) {
           stateRollbackCount.increment();
-          stateRollbacksTotal.inc();
+          stateRollbacksChild.inc();
           // tryEvict returns false in two cases:
           //   (1) CAS failed because state != LIVE — entry is EVICTING (off-thread evictor has
           //       it) or EVICTED (terminal); detach so we never re-walk it.
@@ -975,7 +1165,7 @@ final class Evictor {
    * Drive a single victim to EVICTED. Must be called only after {@link Entry#tryEvict} returned
    * true. {@code victimDiskSize} must be captured by the caller BEFORE any state mutation, in the
    * same units {@code charge} used (block-aligned on-disk bytes), so {@code discharge} matches
-   * across the charge/discharge boundary — otherwise totalBytes drifts by (block - logical) per
+   * across the charge/discharge boundary — otherwise shardBytes drifts by (block - logical) per
    * eviction, eventually starving backpressure. The sweep also uses this value to credit
    * bytesFreedThisWake even when this method throws.
    */
@@ -992,7 +1182,7 @@ final class Evictor {
         try {
           backing.expireEntryFallback(victim.key, victim.size);
         } catch (RuntimeException e) {
-          expireEntryFallbackFailureTotal.labels(e.getClass().getSimpleName()).inc();
+          expireEntryFallbackFailureTotal.labels(shardLabel, e.getClass().getSimpleName()).inc();
           log.log(
               Level.SEVERE, format("expireEntryFallback failed for %s; continuing", victim.key), e);
         }
@@ -1001,7 +1191,7 @@ final class Evictor {
       // listener completion is dispatched off-thread. We MUST still run safeStorageRemoval if a
       // shutdown-race fallback throws — without this guard, a throw here leaves the file present,
       // storage map populated, and the in-memory Entry transitioned to EVICTED in the rollback
-      // finally. Net: silent disk leak counted against totalBytes.
+      // finally. Net: silent disk leak counted against shardBytes.
       try {
         backing.invalidateWriteForKey(victim.key, victim.size);
       } catch (RuntimeException e) {
@@ -1038,10 +1228,10 @@ final class Evictor {
       submitAsyncCleanup(victim.key);
       victim.completeEviction();
       // Count the eviction only after the full success path. removedBytes/removedCount
-      // bytes accounting is incremented above so totalBytes backpressure unblocks promptly,
+      // bytes accounting is incremented above so shardBytes backpressure unblocks promptly,
       // but evictedTotal is the operator-facing "completed successfully" metric and should
       // skip evictions that threw mid-completion.
-      evictedTotal.inc();
+      evictedChild.inc();
       completed = true;
     } finally {
       if (!completed) {
@@ -1105,6 +1295,37 @@ final class Evictor {
 
   // === Snapshot ===
 
+  /**
+   * Write this shard's LRU to its snapshot file, rethrowing on failure. Used by the startup
+   * migration path (CasShards) to persist the post-migration current-N snapshot before the stale-N
+   * source files are deleted — the all-or-nothing crash-safety contract (see {@link
+   * CasShards#migrateSnapshots} for the warmth-only durability semantics). Must be called only
+   * while no evictor thread is running (startup scan), since it walks the LRU without holding the
+   * single-writer invariant. Unlike {@link #performSnapshot}, propagates the IOException so the
+   * migration can leave the stale files in place.
+   */
+  void writeSnapshotNow() throws IOException {
+    writeSnapshotTo(snapshotPath);
+  }
+
+  /**
+   * Write this shard's LRU to {@code path}, rethrowing on failure. {@code path} may be a temp
+   * staging file: migration stages every shard before committing, so one failure leaves the
+   * existing snapshots untouched. Same single-writer (startup-scan-only) caveat as {@link
+   * #writeSnapshotNow}.
+   */
+  void writeSnapshotTo(Path path) throws IOException {
+    if (failSnapshotWriteForTesting) {
+      throw new IOException("injected snapshot write failure for testing");
+    }
+    lruDb.save(new LruEntryIterator(header), path);
+  }
+
+  /** This shard's canonical current-N snapshot path. */
+  Path snapshotPath() {
+    return snapshotPath;
+  }
+
   private void performSnapshot() {
     long startMs = clock.millis();
     try {
@@ -1120,7 +1341,7 @@ final class Evictor {
       lastSnapshotMs = endMs;
       lruSnapshotDurationSeconds.observe((endMs - startMs) / 1000.0);
     } catch (IOException e) {
-      lruSnapshotFailureTotal.labels(e.getClass().getSimpleName()).inc();
+      lruSnapshotFailureTotal.labels(shardLabel, e.getClass().getSimpleName()).inc();
       log.log(Level.WARNING, "snapshot write failed", e);
     }
   }
@@ -1161,7 +1382,7 @@ final class Evictor {
    * elapsed. Returns true on success; false on timeout. Tests use this instead of {@code
    * shutdownAndAwaitTermination} so the cache remains usable post-wait.
    *
-   * <p>The {@code atRest} predicate (no pending work/snapshot/stop flags, {@code totalBytes <=
+   * <p>The {@code atRest} predicate (no pending work/snapshot/stop flags, {@code shardBytes <=
    * lowBytes}, MPSC queues empty) plus the {@link #QUIESCENCE_STABILITY_MS} stability window is the
    * PRIMARY quiescence test. The {@code quiescedSequence} straddle read is a secondary guard only:
    * {@code quiescedSequence} is incremented just before the evictor parks, so reading it before and
@@ -1179,7 +1400,7 @@ final class Evictor {
           !workPending
               && !snapshotPending
               && !stopping
-              && totalBytes.sum() <= lowBytes
+              && shardBytes.sum() <= lowBytes
               && insertionEvents.isEmpty()
               && staleEvents.isEmpty()
               && accessEvents.isEmpty();
@@ -1199,9 +1420,16 @@ final class Evictor {
     return false;
   }
 
+  /**
+   * When true, {@link #writeSnapshotNow} throws instead of writing. Lets the migration-failure test
+   * exercise the all-or-nothing path (stale files retained when a shard's snapshot write fails)
+   * without depending on filesystem-specific failure injection.
+   */
+  @VisibleForTesting volatile boolean failSnapshotWriteForTesting;
+
   @VisibleForTesting
   void setTotalBytesForTesting(long bytes) {
-    totalBytes.reset();
-    totalBytes.add(bytes);
+    shardBytes.reset();
+    shardBytes.add(bytes);
   }
 }

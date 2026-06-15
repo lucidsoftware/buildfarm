@@ -118,4 +118,46 @@ public class WorkerTest {
 
     assertThat(Worker.computeLowBytes(cas, 10_000L)).isEqualTo(9_900L);
   }
+
+  // ===== computeEvictorShards (explicit value clamping) =====
+
+  @Test
+  public void computeEvictorShards_explicitNonPowerOfTwo_clampsDownToPowerOfTwo() {
+    // A non-power-of-two value is clamped down rather than crashing the constructor.
+    Cas cas = new Cas();
+    cas.setEvictorShards(6);
+    assertThat(
+            Worker.computeEvictorShards(
+                cas, /* maxEntrySizeInBytes= */ 1024L, /* maxSizeBytes= */ 1L << 20))
+        .isEqualTo(4);
+  }
+
+  @Test
+  public void computeEvictorShards_explicitValidPowerOfTwo_isHonored() {
+    // A valid power-of-two within the entry-size bound passes through unchanged.
+    Cas cas = new Cas();
+    cas.setEvictorShards(8);
+    assertThat(Worker.computeEvictorShards(cas, /* maxEntrySizeInBytes= */ 1024L, 1L << 20))
+        .isEqualTo(8);
+  }
+
+  @Test
+  public void computeEvictorShards_explicitTooLargeForEntrySize_clampsToEntryBound() {
+    // maxSizeBytes / maxEntrySizeBytes == 4, so at most 4 shards can each hold a max-size entry.
+    // An explicit 64 exceeds that and would crash the constructor; it is clamped to 4.
+    Cas cas = new Cas();
+    cas.setEvictorShards(64);
+    assertThat(
+            Worker.computeEvictorShards(
+                cas, /* maxEntrySizeInBytes= */ 1L << 18, /* maxSizeBytes= */ 1L << 20))
+        .isEqualTo(4);
+  }
+
+  @Test
+  public void computeEvictorShards_explicitOne_isHonored() {
+    Cas cas = new Cas();
+    cas.setEvictorShards(1);
+    assertThat(Worker.computeEvictorShards(cas, /* maxEntrySizeInBytes= */ 1024L, 1L << 20))
+        .isEqualTo(1);
+  }
 }

@@ -211,6 +211,10 @@ maven.install(
         "io.grpc:grpc-inprocess:1.75.0",
         "io.grpc:grpc-testing:1.75.0",
         "junit:junit:4.13.2",
+        # JOL inspects object layout via sun.misc.Unsafe; confined to test targets so no production
+        # code path loads it (JEP 471 would otherwise warn on a future JDK). Used by the EvictorShard
+        # cache-line padding regression test.
+        "org.openjdk.jol:jol-core:0.17",
     ]]
 ]
 

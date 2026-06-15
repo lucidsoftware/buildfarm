@@ -138,6 +138,46 @@ public class DirectoryEntryCFC extends CASFileCache {
         clock);
   }
 
+  public DirectoryEntryCFC(
+      Path root,
+      long maxSizeInBytes,
+      long maxEntrySizeInBytes,
+      int hexBucketLevels,
+      ExecutorService expireService,
+      Executor accessRecorder,
+      ConcurrentMap<String, Entry> storage,
+      FixedBufferPool zstdBufferPool,
+      Consumer<Digest> onPut,
+      Consumer<Iterable<Digest>> onExpire,
+      @Nullable ContentAddressableStorage delegate,
+      boolean delegateSkipLoad,
+      InputStreamFactory externalInputStreamFactory,
+      long lowBytes,
+      long wakeBudgetNanos,
+      long idleHeartbeatNanos,
+      java.time.Clock clock,
+      int shardCount) {
+    super(
+        root,
+        maxSizeInBytes,
+        maxEntrySizeInBytes,
+        hexBucketLevels,
+        expireService,
+        accessRecorder,
+        storage,
+        zstdBufferPool,
+        onPut,
+        onExpire,
+        delegate,
+        delegateSkipLoad,
+        externalInputStreamFactory,
+        lowBytes,
+        wakeBudgetNanos,
+        idleHeartbeatNanos,
+        clock,
+        shardCount);
+  }
+
   private void computeDirectory(Path path, ImmutableList.Builder<Path> invalidDirectories) {
     String key = path.getFileName().toString();
     try {
@@ -166,24 +206,25 @@ public class DirectoryEntryCFC extends CASFileCache {
       // actually reserved below (estimateSizeOnDisk), not the raw aggregate — otherwise a
       // directory could be admitted whose charged cost slightly exceeds the cap.
       long diskSize = estimateSizeOnDisk(e.size, blockSize, /* isHardlink= */ false);
-      if (evictor.currentTotalBytes() + diskSize > maxSizeInBytes
-          || e.size > maxEntrySizeInBytes
-          || e.size == 0) {
+      if (e.size > maxEntrySizeInBytes || e.size == 0 || !tryReserveStartupBytes(key, diskSize)) {
         synchronized (invalidDirectories) {
           invalidDirectories.add(path);
         }
       } else {
-        storage.put(key, e);
-        // Startup runs before the evictor thread starts, so the LRU is not yet under the
-        // evictor's single-writer contract. synchronized(header) serializes against other
-        // scan-thread linkages.
-        synchronized (header) {
-          if (!e.isLinked() && e.state() == Entry.State.LIVE && e.refCount() == 0) {
-            e.addBefore(header);
-            evictor.noteUnreferencedAtStartup();
+        boolean admitted = false;
+        try {
+          storage.put(key, e);
+          // Startup runs before the evictor threads start, so the per-shard LRU lists are not yet
+          // under their single-writer contract. linkAtStartup routes this _dir entry to its owning
+          // shard and links it under that shard's header lock (serializing concurrent scan
+          // threads).
+          casShards.linkAtStartup(e, diskSize);
+          admitted = true;
+        } finally {
+          if (!admitted) {
+            releaseStartupBytes(key, diskSize);
           }
         }
-        evictor.addBytesAtStartup(diskSize);
       }
     } catch (Exception e) {
       log.log(Level.SEVERE, "error processing directory " + path.toString(), e);

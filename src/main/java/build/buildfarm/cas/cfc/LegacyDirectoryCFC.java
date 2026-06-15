@@ -126,9 +126,10 @@ public class LegacyDirectoryCFC extends CASFileCache {
         delegateSkipLoad,
         externalInputStreamFactory,
         /* lowBytes= */ 0, // sentinel; CASFileCache fills in the default
-        Evictor.DEFAULT_WAKE_BUDGET_NANOS,
-        Evictor.DEFAULT_IDLE_HEARTBEAT_NANOS,
-        Clock.systemUTC());
+        EvictorShard.DEFAULT_WAKE_BUDGET_NANOS,
+        EvictorShard.DEFAULT_IDLE_HEARTBEAT_NANOS,
+        Clock.systemUTC(),
+        /* shardCount= */ 1);
   }
 
   public LegacyDirectoryCFC(
@@ -151,7 +152,8 @@ public class LegacyDirectoryCFC extends CASFileCache {
       long lowBytes,
       long wakeBudgetNanos,
       long idleHeartbeatNanos,
-      Clock clock) {
+      Clock clock,
+      int shardCount) {
     super(
         root,
         maxSizeInBytes,
@@ -169,7 +171,8 @@ public class LegacyDirectoryCFC extends CASFileCache {
         lowBytes,
         wakeBudgetNanos,
         idleHeartbeatNanos,
-        clock);
+        clock,
+        shardCount);
     this.execRootFallback = execRootFallback;
     this.directoriesIndexDbName = directoriesIndexDbName;
 

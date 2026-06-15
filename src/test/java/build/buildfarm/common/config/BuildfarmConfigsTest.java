@@ -317,6 +317,85 @@ public class BuildfarmConfigsTest {
   }
 
   @Test
+  public void validateCasEvictorConfig_evictorShardsZero_passes() throws ConfigurationException {
+    // 0 is the auto-derive sentinel.
+    Cas cas = new Cas();
+    cas.setEvictorShards(0);
+    BuildfarmConfigs.validateCasEvictorConfig(cas);
+  }
+
+  @Test
+  public void validateCasEvictorConfig_evictorShardsPowerOfTwo_passes()
+      throws ConfigurationException {
+    for (int n : new int[] {1, 2, 4, 8, 16, 32}) {
+      Cas cas = new Cas();
+      cas.setEvictorShards(n);
+      BuildfarmConfigs.validateCasEvictorConfig(cas);
+    }
+  }
+
+  @Test
+  public void validateCasEvictorConfig_evictorShardsNotPowerOfTwo_throws() {
+    Cas cas = new Cas();
+    cas.setEvictorShards(3);
+    ConfigurationException ex =
+        assertThrows(
+            ConfigurationException.class, () -> BuildfarmConfigs.validateCasEvictorConfig(cas));
+    assertTrue(
+        "message should reference evictorShards: " + ex.getMessage(),
+        ex.getMessage().contains("evictorShards"));
+  }
+
+  @Test
+  public void validateCasEvictorConfig_evictorShardsNegative_throws() {
+    Cas cas = new Cas();
+    cas.setEvictorShards(-1);
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validateCasEvictorConfig(cas));
+  }
+
+  @Test
+  public void validateCasEvictorConfig_evictorShardsTooHighForMaxEntry_throws() {
+    BuildfarmConfigs configs = BuildfarmConfigs.getInstance();
+    long previousMaxEntrySizeBytes = configs.getMaxEntrySizeBytes();
+    try {
+      configs.setMaxEntrySizeBytes(1024);
+      Cas cas = new Cas();
+      cas.setMaxSizeBytes(4096);
+      cas.setEvictorShards(8);
+
+      ConfigurationException ex =
+          assertThrows(
+              ConfigurationException.class, () -> BuildfarmConfigs.validateCasEvictorConfig(cas));
+      assertTrue(ex.getMessage().contains("maxEntrySizeBytes"));
+    } finally {
+      configs.setMaxEntrySizeBytes(previousMaxEntrySizeBytes);
+    }
+  }
+
+  @Test
+  public void validateCasEvictorConfig_percentModeEvictorShardsTooHigh_throws() {
+    // The shard bound must be enforced in percent mode too (maxSizeBytes still 0). An absurd
+    // power-of-two count exceeds the bound for any plausible resolved cap, so it throws regardless
+    // of the test machine's disk size.
+    BuildfarmConfigs configs = BuildfarmConfigs.getInstance();
+    long previousMaxEntrySizeBytes = configs.getMaxEntrySizeBytes();
+    try {
+      configs.setMaxEntrySizeBytes(1L << 20); // 1 MiB
+      Cas cas = new Cas();
+      cas.setMaxSizePercent(50); // percent mode: maxSizeBytes stays 0
+      cas.setEvictorShards(1 << 28); // power of two; cap / 1 MiB < 2^28 for any cap < 256 TiB
+
+      ConfigurationException ex =
+          assertThrows(
+              ConfigurationException.class, () -> BuildfarmConfigs.validateCasEvictorConfig(cas));
+      assertTrue(ex.getMessage().contains("maxEntrySizeBytes"));
+    } finally {
+      configs.setMaxEntrySizeBytes(previousMaxEntrySizeBytes);
+    }
+  }
+
+  @Test
   public void validateCasEvictorConfig_allDefaults_passes() throws ConfigurationException {
     // Default Cas (operator left every field unset) must clear the validator.
     BuildfarmConfigs.validateCasEvictorConfig(new Cas());
