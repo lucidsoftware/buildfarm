@@ -32,6 +32,7 @@ import build.bazel.remote.execution.v2.FindMissingBlobsResponse;
 import build.bazel.remote.execution.v2.GetTreeRequest;
 import build.bazel.remote.execution.v2.GetTreeResponse;
 import build.bazel.remote.execution.v2.RequestMetadata;
+import build.buildfarm.common.CASBackpressureException;
 import build.buildfarm.instance.Instance;
 import com.google.common.collect.ImmutableList;
 import io.grpc.Status;
@@ -92,6 +93,33 @@ public class ContentAddressableStorageServiceTest {
         .findMissingBlobs(
             any(Iterable.class), any(DigestFunction.Value.class), any(RequestMetadata.class));
     verifyNoMoreInteractions(instance);
+  }
+
+  @Test
+  public void codeForMapsBackpressureToRetryableStatus() {
+    // The batchUpdateBlobs per-blob mapping must surface CAS backpressure as the gRPC-canonical
+    // retryable code (so Bazel reroutes), not as the UNKNOWN that Status.fromThrowable defaults to.
+    // Guards against a refactor that drops the findInCauseChain remap from putAllBlobs.
+    CASBackpressureException hardCap =
+        new CASBackpressureException(
+            CASBackpressureException.Reason.HARD_CAP, 0, 0, 4096, 300, 0.0);
+    assertThat(ContentAddressableStorageService.codeFor(hardCap))
+        .isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
+
+    CASBackpressureException shardDead =
+        new CASBackpressureException(
+            CASBackpressureException.Reason.SHARD_DEAD, 0, 0, 4096, 0, 0.0);
+    assertThat(ContentAddressableStorageService.codeFor(shardDead))
+        .isEqualTo(Status.Code.UNAVAILABLE);
+
+    // Wrapped in a Status.UNKNOWN exception (the synchronous catch path) is still unwrapped.
+    Throwable wrapped = Status.fromThrowable(hardCap).asException();
+    assertThat(ContentAddressableStorageService.codeFor(wrapped))
+        .isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
+
+    // Non-backpressure throwables keep their default mapping.
+    assertThat(ContentAddressableStorageService.codeFor(new RuntimeException("boom")))
+        .isEqualTo(Status.Code.UNKNOWN);
   }
 
   @Test

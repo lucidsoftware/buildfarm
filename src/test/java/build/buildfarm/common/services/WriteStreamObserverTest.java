@@ -1,6 +1,7 @@
 package build.buildfarm.common.services;
 
 import static build.buildfarm.common.resources.ResourceParser.uploadResourceName;
+import static com.google.common.truth.Truth.assertThat;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.atLeastOnce;
@@ -17,6 +18,7 @@ import static org.mockito.Mockito.when;
 
 import build.bazel.remote.execution.v2.Compressor;
 import build.bazel.remote.execution.v2.RequestMetadata;
+import build.buildfarm.common.CASBackpressureException;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.DigestUtil.HashFunction;
 import build.buildfarm.common.Write;
@@ -32,6 +34,7 @@ import com.google.common.util.concurrent.SettableFuture;
 import com.google.protobuf.ByteString;
 import io.grpc.Context;
 import io.grpc.Context.CancellableContext;
+import io.grpc.Status;
 import io.grpc.stub.ServerCallStreamObserver;
 import java.io.IOException;
 import java.util.UUID;
@@ -39,6 +42,7 @@ import java.util.concurrent.TimeUnit;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.stubbing.Answer;
 
@@ -154,6 +158,50 @@ public class WriteStreamObserverTest {
             eq(uuid),
             any(RequestMetadata.class));
     verifyNoInteractions(responseObserver);
+  }
+
+  @Test
+  public void writeFutureBackpressureMapsToResourceExhausted() throws Exception {
+    // When the worker's charge() rejects a write under hard-cap backpressure, the write future
+    // fails with a CASBackpressureException. errorResponse must remap it to the gRPC-canonical
+    // RESOURCE_EXHAUSTED (not the UNKNOWN that Status.fromThrowable would yield) so Bazel reroutes.
+    // Guards the write-path entry point against a refactor that drops the findInCauseChain remap.
+    Instance instance = mock(Instance.class);
+    ServerCallStreamObserver<WriteResponse> responseObserver = mock(ServerCallStreamObserver.class);
+    ByteString data = ByteString.copyFromUtf8("backpressure data");
+    Digest digest = DIGEST_UTIL.compute(data);
+    UUID uuid = UUID.randomUUID();
+    UploadBlobRequest uploadBlobRequest =
+        UploadBlobRequest.newBuilder()
+            .setBlob(BlobInformation.newBuilder().setDigest(digest))
+            .setUuid(uuid.toString())
+            .build();
+    SettableFuture<Long> future = SettableFuture.create();
+    Write write = mock(Write.class);
+    when(write.getFuture()).thenReturn(future);
+    when(instance.getBlobWrite(
+            eq(Compressor.Value.IDENTITY), eq(digest), eq(uuid), any(RequestMetadata.class)))
+        .thenReturn(write);
+    FeedbackOutputStream outputStream = mock(FeedbackOutputStream.class);
+    when(write.getOutput(
+            any(Long.class), any(Long.class), any(TimeUnit.class), any(Runnable.class)))
+        .thenReturn(outputStream);
+
+    WriteStreamObserver observer =
+        new WriteStreamObserver(instance, 1, SECONDS, () -> {}, responseObserver);
+    observer.onNext(
+        WriteRequest.newBuilder()
+            .setResourceName(uploadResourceName(uploadBlobRequest))
+            .setData(data)
+            .build());
+    future.setException(
+        new CASBackpressureException(
+            CASBackpressureException.Reason.HARD_CAP, 0, 0, 4096, 300, 0.0));
+
+    ArgumentCaptor<Throwable> errorCaptor = ArgumentCaptor.forClass(Throwable.class);
+    verify(responseObserver, times(1)).onError(errorCaptor.capture());
+    assertThat(Status.fromThrowable(errorCaptor.getValue()).getCode())
+        .isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
   }
 
   @Test

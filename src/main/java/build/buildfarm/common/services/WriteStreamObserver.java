@@ -27,6 +27,7 @@ import static java.lang.String.format;
 import build.bazel.remote.execution.v2.Compressor;
 import build.bazel.remote.execution.v2.RequestMetadata;
 import build.buildfarm.cas.DigestMismatchException;
+import build.buildfarm.common.CASBackpressureException;
 import build.buildfarm.common.EntryLimitException;
 import build.buildfarm.common.Write;
 import build.buildfarm.common.Write.WriteCompleteException;
@@ -296,6 +297,14 @@ public class WriteStreamObserver implements StreamObserver<WriteRequest> {
       if (Status.fromThrowable(t).getCode() == Status.Code.CANCELLED
           || Context.current().isCancelled()) {
         return false;
+      }
+      // A charge() that hit backpressure surfaces either directly (the write future's onFailure)
+      // or wrapped in a Status.UNKNOWN exception (the synchronous handleRequest catch pre-maps via
+      // Status.fromThrowable). Detect it anywhere in the cause chain and remap to the
+      // gRPC-canonical RESOURCE_EXHAUSTED / UNAVAILABLE so Bazel retries on another worker.
+      CASBackpressureException backpressure = CASBackpressureException.findInCauseChain(t);
+      if (backpressure != null) {
+        t = backpressure.toStatus().asException();
       }
       boolean isEntryLimitException = t instanceof EntryLimitException;
       if (isEntryLimitException) {
