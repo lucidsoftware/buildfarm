@@ -23,6 +23,7 @@ import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 import build.buildfarm.cas.cfc.CASFileCache.Entry;
+import build.buildfarm.common.CASBackpressureException;
 import com.google.common.annotations.VisibleForTesting;
 import io.prometheus.client.Counter;
 import io.prometheus.client.Gauge;
@@ -218,6 +219,16 @@ final class EvictorShard extends EvictorShardPad1 {
   // awaitQuiescence poll cadence.
   private static final long QUIESCENCE_POLL_INTERVAL_MS = 5L;
 
+  // Rolling window over which recentEvictionsPerSec is captured-and-reset, driven off the loop-top
+  // heartbeat (no dedicated scheduler). Diagnostic-only; up to one window of staleness is fine.
+  private static final long EVICTION_RATE_WINDOW_MS = 10_000L;
+  // A saturated shard times out many concurrent chargers in the same second; coalesce the WARN log
+  // to one per window per shard. The per-call exception and the Prometheus counter are unaffected.
+  private static final long BACKPRESSURE_LOG_WINDOW_NANOS = 10_000_000_000L;
+
+  private static final String BACKPRESSURE_HARD_CAP = "hard_cap";
+  private static final String BACKPRESSURE_SHARD_DEAD = "shard_dead";
+
   // === Prometheus metrics (lock-free counters; Prometheus Histogram for the
   //     evictor-thread-recorded histograms — single-writer, no producer-side contention) ===
 
@@ -311,6 +322,35 @@ final class EvictorShard extends EvictorShardPad1 {
           .help("Snapshot walk + write wall time.")
           .register();
 
+  // === Phase 2.3 liveness / backpressure metrics (per-shard labeled) ===
+
+  private static final Counter uncaughtErrorTotal =
+      Counter.build()
+          .name("evictor_uncaught_error_total")
+          .labelNames("shard", "error_class")
+          .help(
+              "Errors that reached the evictor's uncaught-exception handler and killed the shard.")
+          .register();
+  private static final Counter chargeBackpressureTotal =
+      Counter.build()
+          .name("cas_charge_backpressure_total")
+          .labelNames("shard", "reason")
+          .help("charge() rejections due to backpressure (hard_cap park timeout or dead shard).")
+          .register();
+  private static final Gauge parkedAtHardCapGauge =
+      Gauge.build()
+          .name("charger_threads_parked_at_hard_cap")
+          .labelNames("shard")
+          .help("Charger threads currently parked at the per-shard hard cap.")
+          .register();
+  private static final Histogram chargeHardCapWaitSeconds =
+      Histogram.build()
+          .name("charge_hard_cap_wait_seconds")
+          .labelNames("shard")
+          .buckets(0.001, 0.01, 0.1, 1, 5, 30, 60, 120, 300)
+          .help("Wait duration when a charger parks at the hard cap (any park exit).")
+          .register();
+
   // === Configuration ===
 
   private final CasEvictorBacking backing;
@@ -336,6 +376,9 @@ final class EvictorShard extends EvictorShardPad1 {
   private final Counter.Child wakesSnapshot;
   private final Counter.Child mpscDropsAccessChild;
   private final Gauge.Child queueDepthChild;
+  private final Counter.Child chargeBackpressureHardCapChild;
+  private final Counter.Child chargeBackpressureShardDeadChild;
+  private final Histogram.Child chargeHardCapWaitChild;
 
   // === Concurrency state ===
   // (lock, cond, the wake flags, parked, quiescedSequence, lastWakeNanos, shardBytes, and
@@ -349,6 +392,34 @@ final class EvictorShard extends EvictorShardPad1 {
   private final LongAdder removedBytes = new LongAdder();
   private final LongAdder removedCount = new LongAdder();
   private final LongAdder stateRollbackCount = new LongAdder();
+
+  // === Backpressure / liveness state (Phase 2.3) ===
+
+  // True once the evictor thread has terminated via an uncaught Error (the UncaughtExceptionHandler
+  // installed in start() sets it). Written exactly once; read on the charge() producer path. It is
+  // NOT placed in the padded hot block: it needs no false-sharing protection (written once, never
+  // contended) and a charge already reads shardBytes (a LongAdder spanning several cache lines), so
+  // one more volatile read off a cold line is noise. Adding it to the hot block disturbs that
+  // block's hand-tuned layout (caught by EvictorShardLayoutTest). While set, charge() fails fast
+  // with a SHARD_DEAD backpressure exception; reads keep working, so the shard degrades to
+  // read-only-and-failing-writes for its 1/N of the keyspace.
+  volatile boolean dead;
+
+  // Currently-parked charger count (the charger_threads_parked_at_hard_cap gauge reads this at
+  // scrape time). Incremented on park entry, decremented on park exit (success, timeout, or
+  // interrupt) so the gauge is a true currently-parked count, not a rate.
+  private final LongAdder parkedAtHardCap = new LongAdder();
+  // Successful evictions in the current rate window; captured-and-reset by the evictor every
+  // ~EVICTION_RATE_WINDOW_MS to publish recentEvictionsPerSec.
+  private final LongAdder evictedThisWindow = new LongAdder();
+  // Latest published eviction rate; read by a charger building a backpressure exception. Diagnostic
+  // only (informs the exception message and helps distinguish "evictor stuck" from "workload
+  // exceeds eviction rate"); up to one window of staleness is tolerated.
+  private volatile double recentEvictionsPerSec;
+  private long lastEvictionRateUpdateMs;
+  // Last WARN emission for log coalescing; raced past freely (a few duplicate logs per window is
+  // acceptable, perfect dedup would need a CAS not worth the contention).
+  private volatile long lastBackpressureLogNanos;
 
   // === MPSC queues ===
 
@@ -404,6 +475,22 @@ final class EvictorShard extends EvictorShardPad1 {
     this.wakesSnapshot = wakesTotal.labels(shardLabel, TRIGGER_SNAPSHOT);
     this.mpscDropsAccessChild = mpscDropsTotal.labels(shardLabel, "access");
     this.queueDepthChild = queueDepthGauge.labels(shardLabel);
+    this.chargeBackpressureHardCapChild =
+        chargeBackpressureTotal.labels(shardLabel, BACKPRESSURE_HARD_CAP);
+    this.chargeBackpressureShardDeadChild =
+        chargeBackpressureTotal.labels(shardLabel, BACKPRESSURE_SHARD_DEAD);
+    this.chargeHardCapWaitChild = chargeHardCapWaitSeconds.labels(shardLabel);
+    // Callback gauge keyed on shard index, mirroring heartbeatAgeGauge below: it reads
+    // parkedAtHardCap.sum() at scrape time so park entry/exit only touch a LongAdder, never a
+    // metric. Same single-CAS-instance-per-JVM caveat as heartbeatAgeGauge.
+    parkedAtHardCapGauge.setChild(
+        new Gauge.Child() {
+          @Override
+          public double get() {
+            return parkedAtHardCap.sum();
+          }
+        },
+        shardLabel);
     // setChild registers a callback child keyed on shard index alone in the shared static gauge, so
     // it computes age at scrape time without a per-wake metric write. This assumes a single CAS
     // instance per JVM (production): if two caches existed, the second's shard i would replace the
@@ -447,9 +534,15 @@ final class EvictorShard extends EvictorShardPad1 {
       lastWakeNanos = nowNanos();
       heartbeatWallNanos = System.nanoTime();
       lastSnapshotMs = clock.millis();
+      lastEvictionRateUpdateMs = clock.millis();
       stopping = false;
       evictorThread = new Thread(this::loop, "buildfarm-cas-evictor-" + index);
       evictorThread.setDaemon(true);
+      // No in-process recovery: an Error escaping the loop kills the thread. The handler records
+      // the death (SEVERE + metric) and sets dead=true so charge() fails fast for this shard's
+      // keys. Reads keep working, other shards are unaffected, and the JVM is NOT brought down;
+      // operators page on evictor_heartbeat_age_seconds / evictor_uncaught_error_total to redeploy.
+      evictorThread.setUncaughtExceptionHandler(this::onEvictorThreadDied);
       evictorThread.start();
       snapshotSchedulerThread =
           new Thread(this::snapshotSchedulerLoop, "buildfarm-cas-snapshot-scheduler-" + index);
@@ -520,6 +613,12 @@ final class EvictorShard extends EvictorShardPad1 {
    * if interrupted while parked; {@link IOException} if the 5-minute hard-cap timeout fires.
    */
   void charge(long bytes) throws InterruptedException, IOException {
+    if (dead) {
+      // Fail fast BEFORE reserving bytes or touching any queue: without the evictor draining its
+      // queues, a reservation here would never be linked or reclaimed and the shard's disk slice
+      // would fill with orphaned files. The action retries on another worker (UNAVAILABLE).
+      throw deadShardBackpressure();
+    }
     shardBytes.add(bytes);
     long current = shardBytes.sum();
     // Wake whenever shardBytes is above the wake watermark; requestDrain's workPending guard
@@ -752,10 +851,12 @@ final class EvictorShard extends EvictorShardPad1 {
       lock.lockInterruptibly();
     } catch (InterruptedException ie) {
       // Lock not held: roll back the reservation but skip signalAll (no lock). Sibling parkers
-      // self-heal via the heartbeat or the next discharge's signal.
+      // self-heal via the heartbeat or the next discharge's signal. The charger never actually
+      // parked, so don't count it in the parked gauge or the wait histogram.
       shardBytes.add(-bytesReserved);
       throw ie;
     }
+    parkedAtHardCap.increment();
     try {
       while (shardBytes.sum() > parkBytes && !stopping) {
         long remainingNanos = deadlineNanos - nowNanos();
@@ -764,17 +865,20 @@ final class EvictorShard extends EvictorShardPad1 {
           // Without this, a parker timing out leaves the next one to wait for the heartbeat.
           shardBytes.add(-bytesReserved);
           cond.signalAll();
-          throw new IOException(
-              "cas charge backpressure: parked "
-                  + HARD_CAP_PARK_TIMEOUT_SECONDS
-                  + "s at hard cap; try another worker");
+          chargeBackpressureHardCapChild.inc();
+          CASBackpressureException backpressure =
+              backpressureException(CASBackpressureException.Reason.HARD_CAP);
+          maybeLogBackpressure(backpressure.getMessage());
+          throw backpressure;
         }
         cond.await(remainingNanos, NANOSECONDS);
       }
       if (stopping && shardBytes.sum() > parkBytes) {
         // stop() set stopping and signalAll-woke us; the evictor will not run more sweeps so
-        // we cannot expect shardBytes to drop. Roll back the reservation and surface a typed
-        // failure so the caller exits promptly instead of waiting the full hard-cap timeout.
+        // we cannot expect shardBytes to drop. Roll back the reservation and surface a failure so
+        // the caller exits promptly instead of waiting the full hard-cap timeout. This is a
+        // shutdown race, not a capacity signal, so it stays a plain IOException (not the typed
+        // RESOURCE_EXHAUSTED backpressure exception).
         shardBytes.add(-bytesReserved);
         cond.signalAll();
         throw new IOException("cas charge backpressure: evictor stopped while parked");
@@ -784,8 +888,62 @@ final class EvictorShard extends EvictorShardPad1 {
       cond.signalAll();
       throw ie;
     } finally {
+      parkedAtHardCap.decrement();
+      // Record the wait for every park exit (success, timeout, interrupt, stop) so the histogram
+      // reflects how long chargers actually waited, not just the timeout tail.
+      chargeHardCapWaitChild.observe((nowNanos() - startNanos) / 1e9);
       lock.unlock();
     }
+  }
+
+  /** Build a backpressure exception snapshotting the shard's current diagnostic state. */
+  private CASBackpressureException backpressureException(CASBackpressureException.Reason reason) {
+    long parkSeconds =
+        reason == CASBackpressureException.Reason.HARD_CAP ? HARD_CAP_PARK_TIMEOUT_SECONDS : 0L;
+    return new CASBackpressureException(
+        reason, index, shardBytes.sum(), parkBytes, parkSeconds, recentEvictionsPerSec);
+  }
+
+  private CASBackpressureException deadShardBackpressure() {
+    chargeBackpressureShardDeadChild.inc();
+    CASBackpressureException backpressure =
+        backpressureException(CASBackpressureException.Reason.SHARD_DEAD);
+    maybeLogBackpressure(backpressure.getMessage());
+    return backpressure;
+  }
+
+  /** Emit a WARN at most once per {@link #BACKPRESSURE_LOG_WINDOW_NANOS} per shard. */
+  private void maybeLogBackpressure(String message) {
+    long now = nowNanos();
+    if (now - lastBackpressureLogNanos > BACKPRESSURE_LOG_WINDOW_NANOS) {
+      lastBackpressureLogNanos = now;
+      log.log(Level.WARNING, message);
+    }
+  }
+
+  /**
+   * Uncaught-exception handler installed on the evictor thread. An {@code Error} escaping {@link
+   * #loop} (the loop catches only transient {@code Exception}s) terminates the thread and lands
+   * here. Records the death and sets {@link #dead} so producers fail fast; takes no recovery
+   * action.
+   *
+   * <p>The snapshot scheduler thread is intentionally left running: it stays near-idle (one wake
+   * per snapshot interval, signalling a condition the dead evictor no longer drains) until {@code
+   * stop} or — the expected response to a dead shard — a redeploy. We do not set {@code stopping}
+   * here to tear it down, because that path also makes an already-parked charger surface a plain
+   * {@code IOException} (UNKNOWN) instead of the typed {@code SHARD_DEAD}/timeout backpressure; the
+   * negligible leaked daemon is the better trade against the cleaner client-facing status.
+   */
+  private void onEvictorThreadDied(Thread thread, Throwable error) {
+    dead = true;
+    uncaughtErrorTotal.labels(shardLabel, error.getClass().getSimpleName()).inc();
+    log.log(
+        Level.SEVERE,
+        format(
+            "evictor shard %d terminated by uncaught error; shard is now read-only and will reject"
+                + " writes until redeploy",
+            index),
+        error);
   }
 
   // === Evictor loop ===
@@ -797,6 +955,7 @@ final class EvictorShard extends EvictorShardPad1 {
     while (!stopping) {
       lastWakeNanos = nowNanos();
       heartbeatWallNanos = System.nanoTime();
+      maybeUpdateEvictionRate();
       try {
         long dequeuedBefore = dequeuedCount.sum();
         drainMpsc();
@@ -911,9 +1070,9 @@ final class EvictorShard extends EvictorShardPad1 {
         // Only transient Exceptions get the backoff-restart treatment: a RuntimeException from
         // a backing hook, or a stray IOException. Errors (OutOfMemoryError, LinkageError, ...)
         // are deliberately NOT caught — they propagate out of the loop and kill the evictor
-        // thread. The JVM state after an unrecoverable Error is undefined, so we make no
-        // attempt to survive it and install no handler; letting the thread (and, where it
-        // matters, the JVM) die is the intended behavior.
+        // thread. The JVM state after an unrecoverable Error is undefined, so we make no attempt
+        // to recover or restart; the UncaughtExceptionHandler installed in start() records the
+        // death and marks the shard dead (read-only, failing writes) without bringing down the JVM.
         log.log(Level.SEVERE, "evictor loop iteration failed; backoff restart", e);
         String reason = (e instanceof IOException) ? "io_exception" : "runtime_exception";
         restartsTotal.labels(shardLabel, reason).inc();
@@ -983,6 +1142,21 @@ final class EvictorShard extends EvictorShardPad1 {
 
   private boolean snapshotIsOverdue() {
     return clock.millis() - lastSnapshotMs > OVERDUE_SNAPSHOT_FACTOR * SNAPSHOT_INTERVAL_MS;
+  }
+
+  /**
+   * Publish {@link #recentEvictionsPerSec} once per rate window, driven off the loop-top heartbeat
+   * so no extra thread is needed. Divides by the actual elapsed window (not a fixed 10s) because
+   * the loop body fires irregularly — every iteration when sweeping, every heartbeat when idle.
+   */
+  private void maybeUpdateEvictionRate() {
+    long nowMs = clock.millis();
+    long elapsedMs = nowMs - lastEvictionRateUpdateMs;
+    if (elapsedMs >= EVICTION_RATE_WINDOW_MS) {
+      long evicted = evictedThisWindow.sumThenReset();
+      recentEvictionsPerSec = elapsedMs > 0 ? evicted * 1000.0 / elapsedMs : 0.0;
+      lastEvictionRateUpdateMs = nowMs;
+    }
   }
 
   // === MPSC drain ===
@@ -1199,6 +1373,9 @@ final class EvictorShard extends EvictorShardPad1 {
       // but evictedTotal is the operator-facing "completed successfully" metric and should
       // skip evictions that threw mid-completion.
       evictedChild.inc();
+      // Feeds the recentEvictionsPerSec rate published off the loop-top heartbeat; only
+      // fully-completed evictions count toward the operator-facing rate.
+      evictedThisWindow.increment();
       completed = true;
     } finally {
       if (!completed) {

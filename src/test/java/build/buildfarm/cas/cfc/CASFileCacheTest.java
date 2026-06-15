@@ -50,6 +50,7 @@ import build.buildfarm.cas.ContentAddressableStorage.Blob;
 import build.buildfarm.cas.DigestMismatchException;
 import build.buildfarm.cas.cfc.CASFileCache.CancellableOutputStream;
 import build.buildfarm.cas.cfc.CASFileCache.Entry;
+import build.buildfarm.common.CASBackpressureException;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.DigestUtil.HashFunction;
 import build.buildfarm.common.InputStreamFactory;
@@ -3602,6 +3603,297 @@ class CASFileCacheTest {
             .isEqualTo(expectedPerShard[i]);
       }
       assertThat(cache.size()).isAtMost(cache.maxSize());
+    } finally {
+      cache.casShardsForTesting().stop();
+    }
+  }
+
+  // === Phase 2.3 — defense in depth ===
+
+  @Test
+  public void errorEscapingEvictorShouldTerminateShardViaUncaughtExceptionHandler()
+      throws Exception {
+    // An Error escaping the evictor loop (the loop catches only transient Exceptions) terminates
+    // the thread; the installed UncaughtExceptionHandler must set dead=true and the JVM must NOT
+    // exit. Inject the Error via onDiskSize, which the sweep calls right after tryEvict succeeds.
+    fileCache.evictorForTesting().stop();
+    Entry header = fileCache.headerForTesting();
+    Entry victim = Entry.orphan("uncaught-error-victim", 100, Deadline.after(10, SECONDS));
+    victim.addBefore(header);
+    long diskSize = estimateSizeOnDisk(victim.size);
+    CasEvictorBacking backing =
+        new CasEvictorBacking() {
+          @Override
+          public Entry lookupEntry(String key) {
+            return null;
+          }
+
+          @Override
+          public Entry safeStorageRemoval(String key) {
+            return null;
+          }
+
+          @Override
+          public void deleteExpiredKey(String key) {}
+
+          @Override
+          public void expireEntryFallback(String key, long size) {}
+
+          @Override
+          public void invalidateWriteForKey(String key, long size) {}
+
+          @Override
+          public void restoreEntryAfterRaceLoss(String key, Entry replacement) {}
+
+          @Override
+          public long onDiskSize(Entry entry) {
+            throw new AssertionError("injected evictor error");
+          }
+
+          @Override
+          public void onDigestFullyExpired(String key, long size) {}
+
+          @Override
+          public void onEntryEvicted(Entry entry) {}
+        };
+    EvictorShard evictor =
+        new EvictorShard(
+            backing,
+            /* index= */ 0,
+            /* shardCount= */ 1,
+            expireService,
+            java.time.Clock.systemUTC(),
+            header,
+            /* parkBytes= */ 24576,
+            /* lowBytes= */ 0,
+            /* wakeBudgetNanos= */ 50_000_000L,
+            /* idleHeartbeatNanos= */ SECONDS.toNanos(30),
+            new TextLRUDB(),
+            root.resolve("uncaught-error-lru.txt"));
+    evictor.addBytesAtStartup(diskSize);
+    evictor.noteUnreferencedAtStartup();
+    evictor.start();
+    try {
+      // dead is set only by the UncaughtExceptionHandler, which runs only when the evictor thread
+      // terminates abnormally — so observing dead==true proves both the termination and the
+      // handler.
+      long deadlineNanos = System.nanoTime() + SECONDS.toNanos(5);
+      while (!evictor.dead) {
+        if (System.nanoTime() > deadlineNanos) {
+          fail("evictor did not mark the shard dead within 5s");
+        }
+        Thread.sleep(2);
+      }
+      assertThat(evictor.dead).isTrue();
+      // Reaching here proves the JVM did not exit (no System.exit in the handler).
+    } finally {
+      evictor.stop();
+    }
+  }
+
+  @Test
+  public void chargeToDeadShardShouldFailFastWithoutSideEffects() throws Exception {
+    // A dead shard rejects new writes fast (UNAVAILABLE) without reserving bytes, queuing, or
+    // writing a file — so its disk slice can't fill with orphans the dead evictor will never link.
+    fileCache.evictorForTesting().dead = true;
+    ByteString content = ByteString.copyFromUtf8("dead-shard-charge");
+    Digest digest = DIGEST_UTIL.compute(content);
+    blobs.put(digest, content);
+    long sizeBefore = fileCache.size();
+
+    CASBackpressureException thrown =
+        assertThrows(CASBackpressureException.class, () -> fileCache.put(digest, false));
+    assertThat(thrown.getReason()).isEqualTo(CASBackpressureException.Reason.SHARD_DEAD);
+    assertThat(thrown.toStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+
+    // No reservation landed, no entry in storage, no file on disk for this key.
+    assertThat(fileCache.size()).isEqualTo(sizeBefore);
+    String key = fileCache.getKey(digest, false);
+    assertThat(storage.containsKey(key)).isFalse();
+    assertThat(Files.exists(fileCache.getPath(key))).isFalse();
+  }
+
+  @Test
+  public void readsToDeadShardShouldContinueWorking() throws Exception {
+    // A dead shard degrades to read-only-and-failing-writes: reads must keep serving its 1/N of the
+    // keyspace. A read does enqueue an LRU-recency touch onto the dead shard's lossy accessEvents
+    // queue (which nothing drains anymore), but that offer is non-blocking and never consults
+    // `dead` — so reads never block on or fail because of the dead evictor.
+    ByteString content = ByteString.copyFromUtf8("dead-shard-read");
+    Digest digest = DIGEST_UTIL.compute(content);
+    blobs.put(digest, content);
+    Path path = fileCache.put(digest, false).path();
+    decrementReference(path);
+
+    fileCache.evictorForTesting().dead = true;
+
+    assertThat(fileCache.contains(digest, /* result= */ null)).isTrue();
+    try (InputStream in = fileCache.newInput(Compressor.Value.IDENTITY, digest, 0L)) {
+      assertThat(ByteString.readFrom(in)).isEqualTo(content);
+    }
+  }
+
+  @Test
+  public void chargerCondvarTimeoutShouldThrowBackpressureMappedToResourceExhausted()
+      throws Exception {
+    // Fill a shard above its hard cap, then advance the injected nanos clock past the park timeout
+    // so the parked charger times out with a HARD_CAP backpressure exception mapped to
+    // RESOURCE_EXHAUSTED. No evictor thread is started: the timeout fires off the nanos clock
+    // alone,
+    // and nothing can free space, so the park always reaches the deadline.
+    fileCache.evictorForTesting().stop();
+    Entry header = fileCache.headerForTesting();
+    CasEvictorBacking backing =
+        new CasEvictorBacking() {
+          @Override
+          public Entry lookupEntry(String key) {
+            return null;
+          }
+
+          @Override
+          public Entry safeStorageRemoval(String key) {
+            return null;
+          }
+
+          @Override
+          public void deleteExpiredKey(String key) {}
+
+          @Override
+          public void expireEntryFallback(String key, long size) {}
+
+          @Override
+          public void invalidateWriteForKey(String key, long size) {}
+
+          @Override
+          public void restoreEntryAfterRaceLoss(String key, Entry replacement) {}
+
+          @Override
+          public long onDiskSize(Entry entry) {
+            return 0;
+          }
+
+          @Override
+          public void onDigestFullyExpired(String key, long size) {}
+
+          @Override
+          public void onEntryEvicted(Entry entry) {}
+        };
+    long parkBytes = 1000;
+    EvictorShard evictor =
+        new EvictorShard(
+            backing,
+            /* index= */ 0,
+            /* shardCount= */ 1,
+            expireService,
+            java.time.Clock.systemUTC(),
+            header,
+            parkBytes,
+            /* lowBytes= */ 0,
+            /* wakeBudgetNanos= */ 1,
+            /* idleHeartbeatNanos= */ SECONDS.toNanos(30),
+            new TextLRUDB(),
+            root.resolve("hard-cap-lru.txt"));
+    // First nanos read (startNanos) returns 0; every later read jumps past the 5-minute deadline so
+    // the very first deadline check in the park loop times out without a real wait.
+    AtomicInteger nanosCalls = new AtomicInteger();
+    evictor.setNanosSupplier(() -> nanosCalls.getAndIncrement() == 0 ? 0L : SECONDS.toNanos(301));
+    // Seed shardBytes to the cap so a small charge pushes it over parkBytes and parks.
+    evictor.addBytesAtStartup(parkBytes);
+    try {
+      CASBackpressureException thrown =
+          assertThrows(CASBackpressureException.class, () -> evictor.charge(50));
+      assertThat(thrown.getReason()).isEqualTo(CASBackpressureException.Reason.HARD_CAP);
+      assertThat(thrown.toStatus().getCode()).isEqualTo(Status.Code.RESOURCE_EXHAUSTED);
+      // The reservation was rolled back on timeout (only the seeded cap remains).
+      assertThat(evictor.currentShardBytes()).isEqualTo(parkBytes);
+    } finally {
+      evictor.stop();
+    }
+  }
+
+  @Test
+  public void deadShardShouldNotAffectOtherShards() throws Exception {
+    // Per-shard fault isolation is the headline of the sharded design: when one shard's evictor
+    // dies, only its 1/N of the keyspace fails writes. Build a multi-shard cache, kill shard 0, and
+    // assert a write routed elsewhere still succeeds and that shard's evictor keeps running, while
+    // a write routed to the dead shard fails fast with SHARD_DEAD -> UNAVAILABLE.
+    int shardCount = 4;
+    ConcurrentMap<String, Entry> shardedStorage = Maps.newConcurrentMap();
+    CASFileCache[] holder = new CASFileCache[1];
+    DirectoryEntryCFC cache =
+        new DirectoryEntryCFC(
+            root.resolveSibling("dead-shard-isolation"),
+            /* maxSizeInBytes= */ 1 << 20,
+            /* maxEntrySizeInBytes= */ 64 * 1024,
+            /* hexBucketLevels= */ 1,
+            expireService,
+            /* accessRecorder= */ directExecutor(),
+            shardedStorage,
+            /* zstdBufferPool= */ null,
+            onPut,
+            onExpire,
+            delegate,
+            /* delegateSkipLoad= */ false,
+            (compressor, digest, offset) -> {
+              ByteString content = blobs.get(digest);
+              if (content == null) {
+                return holder[0].newTransparentInput(compressor, digest, offset);
+              }
+              checkArgument(compressor == Compressor.Value.IDENTITY);
+              return content.substring((int) offset).newInput();
+            },
+            // lowBytes == cap disables eager eviction so a single tiny put never triggers a sweep —
+            // the live shard quiesces purely because its evictor drained the insertion and parked.
+            /* lowBytes= */ 1 << 20,
+            /* wakeBudgetNanos= */ 50_000_000L,
+            /* idleHeartbeatNanos= */ 2_000_000_000L,
+            java.time.Clock.systemUTC(),
+            shardCount);
+    holder[0] = cache;
+    cache.initializeRootDirectory();
+    cache.setBlockSizeForTesting(TEST_BLOCK_SIZE);
+    cache.casShardsForTesting().start();
+    try {
+      CasShards shards = cache.casShardsForTesting();
+      // Find one digest routed to shard 0 (to be killed) and one routed to any other shard.
+      Digest deadShardDigest = null;
+      Digest liveShardDigest = null;
+      int liveShardIndex = -1;
+      for (int i = 0; i < 1000 && (deadShardDigest == null || liveShardDigest == null); i++) {
+        ByteString content = ByteString.copyFromUtf8("iso-" + i);
+        Digest digest = DIGEST_UTIL.compute(content);
+        int shardIndex = shards.shardFor(cache.getKey(digest, false)).index;
+        if (shardIndex == 0 && deadShardDigest == null) {
+          deadShardDigest = digest;
+          blobs.put(digest, content);
+        } else if (shardIndex != 0 && liveShardDigest == null) {
+          liveShardDigest = digest;
+          liveShardIndex = shardIndex;
+          blobs.put(digest, content);
+        }
+      }
+      assertWithMessage("did not find digests routing to both a dead and a live shard")
+          .that(deadShardDigest != null && liveShardDigest != null)
+          .isTrue();
+
+      shards.shard(0).dead = true;
+
+      // A write routed to the dead shard fails fast, reserves nothing, and maps to UNAVAILABLE.
+      Digest deadDigest = deadShardDigest;
+      CASBackpressureException thrown =
+          assertThrows(CASBackpressureException.class, () -> cache.put(deadDigest, false));
+      assertThat(thrown.getReason()).isEqualTo(CASBackpressureException.Reason.SHARD_DEAD);
+      assertThat(thrown.getShardIndex()).isEqualTo(0);
+      assertThat(thrown.toStatus().getCode()).isEqualTo(Status.Code.UNAVAILABLE);
+      assertThat(shards.shard(0).currentShardBytes()).isEqualTo(0L);
+
+      // A write routed to a live shard still succeeds, and that shard's evictor is still draining
+      // and parking (a dead evictor would leave the insertion undrained and never quiesce).
+      Path livePath = cache.put(liveShardDigest, false).path();
+      assertThat(Files.exists(livePath)).isTrue();
+      decrementReference(cache, livePath);
+      assertThat(shards.shard(liveShardIndex).awaitQuiescence(java.time.Duration.ofSeconds(5)))
+          .isTrue();
     } finally {
       cache.casShardsForTesting().stop();
     }

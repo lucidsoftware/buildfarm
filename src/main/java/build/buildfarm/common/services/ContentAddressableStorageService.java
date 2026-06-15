@@ -36,11 +36,13 @@ import build.bazel.remote.execution.v2.FindMissingBlobsRequest;
 import build.bazel.remote.execution.v2.FindMissingBlobsResponse;
 import build.bazel.remote.execution.v2.GetTreeRequest;
 import build.bazel.remote.execution.v2.GetTreeResponse;
+import build.buildfarm.common.CASBackpressureException;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.config.BuildfarmConfigs;
 import build.buildfarm.common.grpc.TracingMetadataUtils;
 import build.buildfarm.instance.Instance;
 import build.buildfarm.v1test.Tree;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Stopwatch;
 import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.FutureCallback;
@@ -141,6 +143,21 @@ public class ContentAddressableStorageService
     return com.google.rpc.Status.newBuilder().setCode(code.value()).build();
   }
 
+  /**
+   * Resolve the per-blob status code for a failed {@code putBlobFuture}. A charge() that hit CAS
+   * backpressure surfaces as RESOURCE_EXHAUSTED / UNAVAILABLE so Bazel retries on another worker;
+   * everything else keeps {@code Status.fromThrowable}'s default mapping. The batch response
+   * carries only the code, so the exception's structured description is necessarily dropped here.
+   */
+  @VisibleForTesting
+  static Code codeFor(Throwable e) {
+    CASBackpressureException backpressure = CASBackpressureException.findInCauseChain(e);
+    if (backpressure != null) {
+      return backpressure.toStatus().getCode();
+    }
+    return Status.fromThrowable(e).getCode();
+  }
+
   private static ListenableFuture<Response> toResponseFuture(
       ListenableFuture<Code> codeFuture, Digest digest) {
     return transform(
@@ -173,7 +190,7 @@ public class ContentAddressableStorageService
               catching(
                   transform(future, d -> Code.OK, directExecutor()),
                   Throwable.class,
-                  (e) -> Status.fromThrowable(e).getCode(),
+                  ContentAddressableStorageService::codeFor,
                   directExecutor()),
               DigestUtil.toDigest(digest)));
     }
