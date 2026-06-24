@@ -43,6 +43,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.ListenableFuture;
+import io.prometheus.client.Histogram;
 import java.io.IOException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -122,6 +123,7 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
           if (digest.getSize() != 0) {
             try {
               Files.createLink(path, pathResult.path());
+              materializePathTotal.labels("hardlink_file").inc();
             } catch (IOException e) {
               return immediateFailedFuture(e);
             }
@@ -153,6 +155,7 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
                     "putDirectory(%s, %s) created", execPath, DigestUtil.toString(digest)));
           }
           Files.createSymbolicLink(execPath, path);
+          materializePathTotal.labels("symlink_dir").inc();
           return immediateFuture(pathResult);
         },
         fetchService);
@@ -366,6 +369,8 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
       @Nullable UserPrincipal owner,
       WorkerExecutedMetadata.Builder workerExecutedMetadata)
       throws IOException, InterruptedException {
+    Histogram.Timer materializeTimer = materializeExecRootSeconds.labels("regular").startTimer();
+    try {
     Digest inputRootDigest = DigestUtil.fromDigest(action.getInputRootDigest(), digestFunction);
     OutputDirectory outputDirectory = createOutputDirectory(command);
 
@@ -465,6 +470,9 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
       Directories.setAllOwner(execDir, owner);
     }
     return execDir;
+    } finally {
+      materializeTimer.observeDuration();
+    }
   }
 
   @Override
