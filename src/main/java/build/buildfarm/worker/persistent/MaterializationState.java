@@ -24,6 +24,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
+import io.prometheus.client.Counter;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -44,6 +45,16 @@ import lombok.extern.java.Log;
  */
 @Log
 public class MaterializationState implements AutoCloseable {
+  // Leak/accounting canary (plan Group 3 / Phase 7): the PW analog of the inode-map leak. close()
+  // decrements the CAS refs this state carried across requests; a decrement failure here means
+  // carried refs are not released, under-evicting (leaking) the CAS entries that backed the
+  // persistent links. Expect 0; nonzero is a carried-ref bug.
+  private static final Counter refCleanupFailureTotal =
+      Counter.build()
+          .name("persistent_worker_ref_cleanup_failure_total")
+          .help("MaterializationState.close() failures to decrement carried CAS refs (expect 0).")
+          .register();
+
   /** Result of diffing the previous state against a new FetchResult. */
   public record DiffResult(
       /** Entries in the new FetchResult but not in the previous state. */
@@ -186,6 +197,7 @@ public class MaterializationState implements AutoCloseable {
         // close() is best-effort and runs from teardown finally-blocks/loops (shutdown drain,
         // destroyObject, onTimeout) where throwing would strand sibling states. Stay open so a
         // later call can retry.
+        refCleanupFailureTotal.inc();
         log.log(Level.SEVERE, cleanupFailureMessage(), e);
         if (e instanceof InterruptedException) {
           Thread.currentThread().interrupt();

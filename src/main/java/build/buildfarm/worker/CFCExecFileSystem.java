@@ -41,11 +41,14 @@ import build.buildfarm.common.io.Dirent;
 import build.buildfarm.v1test.Digest;
 import build.buildfarm.v1test.WorkerExecutedMetadata;
 import build.buildfarm.worker.ExecDirException.ViolationException;
+import build.buildfarm.worker.persistent.MaterializationMetrics;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.common.util.concurrent.ListenableFuture;
+import io.prometheus.client.Counter;
+import io.prometheus.client.Histogram;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.FileStore;
@@ -69,6 +72,28 @@ import org.jspecify.annotations.Nullable;
 
 @Log
 public class CFCExecFileSystem implements ExecFileSystem {
+  // --- Materialization metrics (§0 of the materialization/PW metrics plan) ---
+  // materialize_exec_root_seconds{kind}: wall time to build one action's exec root. kind=regular
+  // here (this class and the CFCLink subclass); the persistent_worker kinds are recorded by
+  // ProtoCoordinator. Registered once in MaterializationMetrics (persistent package) because both
+  // packages write it -- see that class for why. This is the direct "is it faster?" number the
+  // hardlink/PW phases are judged against. materialize_path_total{method} below is worker-only and
+  // stays local.
+  // materialize_path_total{method}: composition of a materialization -- how much is cheap linking
+  // vs expensive copying. method=symlink_dir (whole input dir symlinked), hardlink_file (CAS file
+  // hardlinked into the exec root), copy_file (byte copy). At baseline the copy variant emits
+  // copy_file and the link variant emits hardlink_file + symlink_dir; the Phase-3 hardlink work
+  // shifts the mix, which is exactly what this counter makes visible. Zero-byte files (created
+  // empty, neither linked nor copied) are intentionally not counted.
+  static final Counter materializePathTotal =
+      Counter.build()
+          .name("materialize_path_total")
+          .labelNames("method")
+          .help(
+              "Filesystem ops to materialize exec roots "
+                  + "(symlink_dir / hardlink_file / copy_file).")
+          .register();
+
   private final Path root;
   protected final CASFileCache fileCache;
   private final ImmutableMap<String, UserPrincipal> owners;
@@ -212,6 +237,7 @@ public class CFCExecFileSystem implements ExecFileSystem {
           if (digest.getSize() != 0) {
             try {
               Files.copy(pathResult.path(), path);
+              materializePathTotal.labels("copy_file").inc();
             } catch (IOException e) {
               return immediateFailedFuture(e);
             } finally {
@@ -394,6 +420,11 @@ public class CFCExecFileSystem implements ExecFileSystem {
       @Nullable UserPrincipal owner,
       WorkerExecutedMetadata.Builder workerExecutedMetadata)
       throws IOException, InterruptedException {
+    Histogram.Timer materializeTimer =
+        MaterializationMetrics.MATERIALIZE_EXEC_ROOT_SECONDS
+            .labels(MaterializationMetrics.KIND_REGULAR)
+            .startTimer();
+    try {
     OutputDirectory outputDirectory = createOutputDirectory(command);
 
     Path execDir = root.resolve(operationName);
@@ -434,6 +465,9 @@ public class CFCExecFileSystem implements ExecFileSystem {
       Directories.setAllOwner(execDir, owner);
     }
     return execDir;
+    } finally {
+      materializeTimer.observeDuration();
+    }
   }
 
   @Override

@@ -23,6 +23,8 @@ import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
 import com.google.protobuf.util.Durations;
+import io.prometheus.client.Counter;
+import io.prometheus.client.Histogram;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -62,6 +64,44 @@ import persistent.bazel.client.WorkerSupervisor;
 public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, CommonsWorkerPool> {
   private static final String WORKER_INIT_LOG_SUFFIX = ".initargs.log";
   private static final long DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 5;
+
+  // --- Phase 6 (PW fetch/link split) materialization metrics ---
+  // persistent_worker_inputs_{linked,copied}_total: confirm the phase actually links non-tool
+  // inputs into the PW exec root instead of copying them. With FetchResult linking, copied should
+  // fall toward ~0 (only the no-fetchResult fallback path copies); a rising copied share means PW
+  // actions are back on the slow double-copy path. Counted per input in linkFromFetchResult vs the
+  // copyNontoolInputs fallback.
+  private static final Counter persistentWorkerInputsLinkedTotal =
+      Counter.build()
+          .name("persistent_worker_inputs_linked_total")
+          .help("Non-tool PW inputs materialized by link (hardlink/symlink) from FetchResult.")
+          .register();
+  private static final Counter persistentWorkerInputsCopiedTotal =
+      Counter.build()
+          .name("persistent_worker_inputs_copied_total")
+          .help("Non-tool PW inputs materialized by byte-copy (the no-FetchResult fallback path).")
+          .register();
+  // --- Phase 7 (incremental PW materialization) ---
+  // persistent_worker_full_rematerialize_total{reason}: how often a reused/first PW exec root takes
+  // the full-rebuild path instead of an incremental delta. Incremental hit rate = 1 - full/total;
+  // a high full share means the optimization is not firing -- investigate the reason.
+  private static final Counter persistentWorkerFullRematerializeTotal =
+      Counter.build()
+          .name("persistent_worker_full_rematerialize_total")
+          .labelNames("reason")
+          .help("PW exec-root full (re)materializations by reason (descended_directories_changed / "
+              + "first_request).")
+          .register();
+  // persistent_worker_incremental_files{op}: diff size per op for an incremental update. Small
+  // diffs = the optimization working; near-full-tree every time = effectively a full rebuild on
+  // the incremental path.
+  private static final Histogram persistentWorkerIncrementalFiles =
+      Histogram.build()
+          .name("persistent_worker_incremental_files")
+          .labelNames("op")
+          .buckets(0, 1, 5, 25, 100, 500, 2500, 10000)
+          .help("Incremental PW exec-root diff size per op (added / removed / changed).")
+          .register();
 
   private record PendingRequest(PersistentWorker worker, RequestTimeoutHandler task) {
     private PendingRequest {
@@ -339,8 +379,17 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
             log.log(
                 Level.FINE,
                 () -> "Persistent worker: full re-materialization into " + workerExecRoot);
-            cleanUpPreviousState(previousState, workerExecRoot);
-            linkFromFetchResult(request, workerExecRoot);
+            persistentWorkerFullRematerializeTotal.labels("descended_directories_changed").inc();
+            Histogram.Timer materializeTimer =
+                MaterializationMetrics.MATERIALIZE_EXEC_ROOT_SECONDS
+                    .labels(MaterializationMetrics.KIND_PERSISTENT_WORKER)
+                    .startTimer();
+            try {
+              cleanUpPreviousState(previousState, workerExecRoot);
+              linkFromFetchResult(request, workerExecRoot);
+            } finally {
+              materializeTimer.observeDuration();
+            }
           } else {
             log.log(
                 Level.FINE,
@@ -354,18 +403,48 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
                         + " changed="
                         + diffResult.changed().size()
                         + ")");
-            applyDelta(diffResult, request, workerExecRoot);
+            // Diff size per op: small diffs = the optimization working; near-full-tree every time
+            // = effectively a full rebuild even on the incremental path.
+            persistentWorkerIncrementalFiles.labels("added").observe(diffResult.added().size());
+            persistentWorkerIncrementalFiles.labels("removed").observe(diffResult.removed().size());
+            persistentWorkerIncrementalFiles.labels("changed").observe(diffResult.changed().size());
+            Histogram.Timer materializeTimer =
+                MaterializationMetrics.MATERIALIZE_EXEC_ROOT_SECONDS
+                    .labels(MaterializationMetrics.KIND_PERSISTENT_WORKER_INCREMENTAL)
+                    .startTimer();
+            try {
+              applyDelta(diffResult, request, workerExecRoot);
+            } finally {
+              materializeTimer.observeDuration();
+            }
           }
         } else {
           // First request to this worker — full materialization
           log.log(Level.FINE, () -> "Persistent worker: first-time linking into " + workerExecRoot);
-          linkFromFetchResult(request, workerExecRoot);
+          persistentWorkerFullRematerializeTotal.labels("first_request").inc();
+          Histogram.Timer materializeTimer =
+              MaterializationMetrics.MATERIALIZE_EXEC_ROOT_SECONDS
+                  .labels(MaterializationMetrics.KIND_PERSISTENT_WORKER)
+                  .startTimer();
+          try {
+            linkFromFetchResult(request, workerExecRoot);
+          } finally {
+            materializeTimer.observeDuration();
+          }
         }
       } else {
         log.log(
             Level.FINE,
             () -> "Persistent worker: copying non-tool inputs into " + worker.getExecRoot());
-        copyNontoolInputs(request.workerInputs, worker.getExecRoot());
+        Histogram.Timer materializeTimer =
+            MaterializationMetrics.MATERIALIZE_EXEC_ROOT_SECONDS
+                .labels(MaterializationMetrics.KIND_PERSISTENT_WORKER)
+                .startTimer();
+        try {
+          copyNontoolInputs(request.workerInputs, worker.getExecRoot());
+        } finally {
+          materializeTimer.observeDuration();
+        }
       }
     } catch (Exception e) {
       pendingReqs.remove(request);
@@ -609,6 +688,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       if (!workerInputs.allToolInputs.contains(opPath)) {
         Path execPath = workerInputs.relativizeInput(workerExecRoot, opPath);
         workerInputs.copyInputFile(opPath, execPath);
+        persistentWorkerInputsCopiedTotal.inc();
       }
     }
   }
@@ -735,13 +815,15 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
     switch (entry.type()) {
       case DIRECTORY:
         FileAccessUtils.createSymlink(entry.casPath(), execPath);
+        persistentWorkerInputsLinkedTotal.inc();
         break;
       case FILE:
         FileAccessUtils.createHardlink(entry.casPath(), execPath);
+        persistentWorkerInputsLinkedTotal.inc();
         break;
       case ZERO_SIZE_FILE:
         // Zero-size file: no CAS entry. Ignore the executable bit, matching
-        // CFCLinkExecFileSystem.put's size-0 handling.
+        // CFCLinkExecFileSystem.put's size-0 handling. Neither linked nor copied -> not counted.
         FileAccessUtils.createReplacingOnConflict(execPath, Files::createFile);
         break;
       case SYMLINK_NODE:
@@ -750,6 +832,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
             link ->
                 Files.createSymbolicLink(
                     link, link.getFileSystem().getPath(entry.symlinkTarget())));
+        persistentWorkerInputsLinkedTotal.inc();
         break;
     }
     request.trackedLinks.add(execPath);
