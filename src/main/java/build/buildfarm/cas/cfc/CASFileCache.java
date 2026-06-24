@@ -167,6 +167,31 @@ public abstract class CASFileCache implements ContentAddressableStorage {
 
   private static final Counter readIOErrors =
       Counter.build().name("read_io_errors").help("Number of IO errors on read.").register();
+  private static final Histogram casChargeSeconds =
+      Histogram.build()
+          .name("cas_charge_seconds")
+          .buckets(0.0001, 0.001, 0.01, 0.1, 1, 5, 30, 60, 120)
+          .help("Wall time of CASFileCache.charge() including any inline eviction.")
+          .register();
+  private static final Histogram casWriteStallSeconds =
+      Histogram.build()
+          .name("cas_write_stall_seconds")
+          .buckets(0.001, 0.01, 0.1, 1, 5, 30, 60, 300, 1500)
+          .help(
+              "Wall time spent in the inline eviction loop under the global lock (stop-the-world).")
+          .register();
+  private static final Counter casLookups =
+      Counter.build()
+          .name("cas_lookups_total")
+          .labelNames("result")
+          .help("CAS blob presence lookups in findMissingBlobs (result=hit present / miss absent).")
+          .register();
+  private static final Histogram casChargeLockWaitSeconds =
+      Histogram.build()
+          .name("cas_charge_lock_wait_seconds")
+          .buckets(0.0001, 0.001, 0.01, 0.1, 1, 5, 30, 60)
+          .help("Time a charge() thread blocked acquiring the global lock (baseline-only).")
+          .register();
 
   @Getter private final Path root;
   protected final EntryPathStrategy entryPathStrategy;
@@ -507,12 +532,19 @@ public abstract class CASFileCache implements ContentAddressableStorage {
     build.bazel.remote.execution.v2.Digest.Builder result =
         build.bazel.remote.execution.v2.Digest.newBuilder();
     for (build.bazel.remote.execution.v2.Digest digest : digests) {
-      if (digest.getSizeBytes() != 0
-          && !containsLocal(DigestUtil.fromDigest(digest, digestFunction), result, found::add)) {
+      boolean missing =
+          digest.getSizeBytes() != 0
+              && !containsLocal(DigestUtil.fromDigest(digest, digestFunction), result, found::add);
+      if (missing) {
         builder.add(digest);
+        if (digest.getSizeBytes() > 0) {
+          casLookups.labels("miss").inc();
+        }
       } else if (digest.getSizeBytes() == -1) {
         // may misbehave with delegate
         builder.add(result.build());
+      } else if (digest.getSizeBytes() > 0) {
+        casLookups.labels("hit").inc();
       }
     }
     if (state.shouldRecordAccess()) {
@@ -1384,7 +1416,9 @@ public abstract class CASFileCache implements ContentAddressableStorage {
                 try {
                   casSizeMetric.set(size());
                   casEntryCountMetric.set(entryCount());
-                  MINUTES.sleep(5);
+                  // 15s, not 5min: the coarse interval isn't granular enough to cache-fill and
+                  // evict dynamics
+                  Thread.sleep(15_000);
                 } catch (InterruptedException e) {
                   Thread.currentThread().interrupt();
                   break;
@@ -2432,74 +2466,88 @@ public abstract class CASFileCache implements ContentAddressableStorage {
   @SuppressWarnings({"ConstantConditions", "ResultOfMethodCallIgnored"})
   protected boolean charge(String key, long blobSizeInBytes, AtomicBoolean requiresDischarge)
       throws IOException, InterruptedException {
-    boolean interrupted = false;
-    Iterable<ListenableFuture<Digest>> expiredDigestsFutures;
-    synchronized (this) {
-      if (referenceIfExists(key)) {
-        return false;
-      }
-      sizeInBytes += estimateSizeOnDisk(blobSizeInBytes, blockSize, /* isHardlink= */ false);
-      requiresDischarge.set(true);
+    Histogram.Timer chargeTimer = casChargeSeconds.startTimer();
+    try {
+      boolean interrupted = false;
+      Iterable<ListenableFuture<Digest>> expiredDigestsFutures;
+      long lockWaitStartNanos = System.nanoTime();
+      synchronized (this) {
+        casChargeLockWaitSeconds.observe((System.nanoTime() - lockWaitStartNanos) / 1e9);
+        if (referenceIfExists(key)) {
+          return false;
+        }
+        sizeInBytes += estimateSizeOnDisk(blobSizeInBytes, blockSize, /* isHardlink= */ false);
+        requiresDischarge.set(true);
 
-      ImmutableList.Builder<ListenableFuture<Digest>> builder = ImmutableList.builder();
-      try {
-        while (!interrupted && sizeInBytes > maxSizeInBytes) {
-          ListenableFuture<Entry> expiredFuture = expireEntry(blobSizeInBytes, expireService);
-          interrupted = Thread.interrupted();
-          if (expiredFuture != null) {
-            builder.add(
-                transformAsync(
-                    expiredFuture,
-                    (expiredEntry) -> {
-                      String expiredKey = expiredEntry.key;
-                      try {
-                        deleteExpiredKey(expiredKey);
-                      } catch (NoSuchFileException eNoEnt) {
-                        log.log(
-                            Level.SEVERE,
-                            format(
-                                "CASFileCache::putImpl: expired key %s did not exist to delete",
-                                expiredKey),
-                            eNoEnt);
-                      }
-                      FileEntryKey fileEntryKey = parseFileEntryKey(expiredKey, expiredEntry.size);
-                      if (fileEntryKey != null
-                          && storage.containsKey(
-                              getKey(fileEntryKey.digest(), !fileEntryKey.isExecutable()))) {
-                        return immediateFuture(null);
-                      }
-                      expiredKeyCounter.inc();
-                      return immediateFuture(fileEntryKey != null ? fileEntryKey.digest() : null);
-                    },
-                    expireService));
+        ImmutableList.Builder<ListenableFuture<Digest>> builder = ImmutableList.builder();
+        boolean stalled = sizeInBytes > maxSizeInBytes;
+        long stallStartNanos = System.nanoTime();
+        try {
+          while (!interrupted && sizeInBytes > maxSizeInBytes) {
+            ListenableFuture<Entry> expiredFuture = expireEntry(blobSizeInBytes, expireService);
+            interrupted = Thread.interrupted();
+            if (expiredFuture != null) {
+              builder.add(
+                  transformAsync(
+                      expiredFuture,
+                      (expiredEntry) -> {
+                        String expiredKey = expiredEntry.key;
+                        try {
+                          deleteExpiredKey(expiredKey);
+                        } catch (NoSuchFileException eNoEnt) {
+                          log.log(
+                              Level.SEVERE,
+                              format(
+                                  "CASFileCache::putImpl: expired key %s did not exist to delete",
+                                  expiredKey),
+                              eNoEnt);
+                        }
+                        FileEntryKey fileEntryKey =
+                            parseFileEntryKey(expiredKey, expiredEntry.size);
+                        if (fileEntryKey != null
+                            && storage.containsKey(
+                                getKey(fileEntryKey.digest(), !fileEntryKey.isExecutable()))) {
+                          return immediateFuture(null);
+                        }
+                        expiredKeyCounter.inc();
+                        return immediateFuture(fileEntryKey != null ? fileEntryKey.digest() : null);
+                      },
+                      expireService));
+            }
+          }
+        } catch (InterruptedException e) {
+          // clear interrupted flag
+          Thread.interrupted();
+          interrupted = true;
+        } finally {
+          if (stalled) {
+            casWriteStallSeconds.observe((System.nanoTime() - stallStartNanos) / 1e9);
           }
         }
-      } catch (InterruptedException e) {
-        // clear interrupted flag
-        Thread.interrupted();
-        interrupted = true;
+        expiredDigestsFutures = builder.build();
       }
-      expiredDigestsFutures = builder.build();
-    }
 
-    ImmutableSet.Builder<Digest> builder = ImmutableSet.builder();
-    for (ListenableFuture<Digest> expiredDigestFuture : expiredDigestsFutures) {
-      Digest digest = getOrIOException(expiredDigestFuture);
-      if (Thread.interrupted()) {
-        interrupted = true;
+      ImmutableSet.Builder<Digest> builder = ImmutableSet.builder();
+      for (ListenableFuture<Digest> expiredDigestFuture : expiredDigestsFutures) {
+        Digest digest = getOrIOException(expiredDigestFuture);
+        if (Thread.interrupted()) {
+          interrupted = true;
+        }
+        if (digest != null) {
+          builder.add(digest);
+        }
       }
-      if (digest != null) {
-        builder.add(digest);
+      Set<Digest> expiredDigests = builder.build();
+      if (!expiredDigests.isEmpty()) {
+        onExpire.accept(expiredDigests);
       }
+      if (interrupted || Thread.currentThread().isInterrupted()) {
+        throw new InterruptedException();
+      }
+      return true;
+    } finally {
+      chargeTimer.observeDuration();
     }
-    Set<Digest> expiredDigests = builder.build();
-    if (!expiredDigests.isEmpty()) {
-      onExpire.accept(expiredDigests);
-    }
-    if (interrupted || Thread.currentThread().isInterrupted()) {
-      throw new InterruptedException();
-    }
-    return true;
   }
 
   private CancellableOutputStream putOrReferenceGuarded(

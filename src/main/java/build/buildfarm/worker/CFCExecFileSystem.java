@@ -46,6 +46,8 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.common.util.concurrent.ListenableFuture;
+import io.prometheus.client.Counter;
+import io.prometheus.client.Histogram;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.FileStore;
@@ -68,6 +70,22 @@ import org.jspecify.annotations.Nullable;
 
 @Log
 public class CFCExecFileSystem implements ExecFileSystem {
+  static final Histogram materializeExecRootSeconds =
+      Histogram.build()
+          .name("materialize_exec_root_seconds")
+          .labelNames("kind")
+          .buckets(0.001, 0.01, 0.1, 0.5, 1, 5, 10, 30)
+          .help("Wall time to materialize an action exec root, by materialization kind.")
+          .register();
+  static final Counter materializePathTotal =
+      Counter.build()
+          .name("materialize_path_total")
+          .labelNames("method")
+          .help(
+              "Filesystem ops to materialize exec roots "
+                  + "(symlink_dir / hardlink_file / copy_file).")
+          .register();
+
   private final Path root;
   protected final CASFileCache fileCache;
   private final ImmutableMap<String, UserPrincipal> owners;
@@ -211,6 +229,7 @@ public class CFCExecFileSystem implements ExecFileSystem {
           if (digest.getSize() != 0) {
             try {
               Files.copy(pathResult.path(), path);
+              materializePathTotal.labels("copy_file").inc();
             } catch (IOException e) {
               return immediateFailedFuture(e);
             } finally {
@@ -346,73 +365,78 @@ public class CFCExecFileSystem implements ExecFileSystem {
       @Nullable UserPrincipal owner,
       WorkerExecutedMetadata.Builder workerExecutedMetadata)
       throws IOException, InterruptedException {
-    OutputDirectory outputDirectory = createOutputDirectory(command);
-
-    Path execDir = root.resolve(operationName);
-    checkState(!Files.exists(execDir));
-
-    log.log(Level.FINER, operationName + " walking execTree");
-    ExecTree execTree = new ExecTree(directoriesIndex);
-    ExecFileVisitor visitor = new ExecFileVisitor(workerExecutedMetadata);
-    execTree.walk(
-        execDir, DigestUtil.fromDigest(action.getInputRootDigest(), digestFunction), visitor);
-
-    // TODO refactor into single future that produces all exceptions in a list
-    Iterable<ListenableFuture<Void>> fetchedFutures = visitor.futures();
-
-    boolean success = false;
+    Histogram.Timer materializeTimer = materializeExecRootSeconds.labels("regular").startTimer();
     try {
-      InterruptedException exception = null;
-      boolean wasInterrupted = false;
-      ImmutableList.Builder<Throwable> exceptions = ImmutableList.builder();
-      for (ListenableFuture<Void> fetchedFuture : fetchedFutures) {
-        if (exception != null || wasInterrupted) {
-          fetchedFuture.cancel(true);
-        } else {
-          try {
-            fetchedFuture.get();
-          } catch (ExecutionException e) {
-            // just to ensure that no other code can react to interrupt status
-            exceptions.add(e.getCause());
-          } catch (InterruptedException e) {
+      OutputDirectory outputDirectory = createOutputDirectory(command);
+
+      Path execDir = root.resolve(operationName);
+      checkState(!Files.exists(execDir));
+
+      log.log(Level.FINER, operationName + " walking execTree");
+      ExecTree execTree = new ExecTree(directoriesIndex);
+      ExecFileVisitor visitor = new ExecFileVisitor(workerExecutedMetadata);
+      execTree.walk(
+          execDir, DigestUtil.fromDigest(action.getInputRootDigest(), digestFunction), visitor);
+
+      // TODO refactor into single future that produces all exceptions in a list
+      Iterable<ListenableFuture<Void>> fetchedFutures = visitor.futures();
+
+      boolean success = false;
+      try {
+        InterruptedException exception = null;
+        boolean wasInterrupted = false;
+        ImmutableList.Builder<Throwable> exceptions = ImmutableList.builder();
+        for (ListenableFuture<Void> fetchedFuture : fetchedFutures) {
+          if (exception != null || wasInterrupted) {
             fetchedFuture.cancel(true);
-            exception = e;
+          } else {
+            try {
+              fetchedFuture.get();
+            } catch (ExecutionException e) {
+              // just to ensure that no other code can react to interrupt status
+              exceptions.add(e.getCause());
+            } catch (InterruptedException e) {
+              fetchedFuture.cancel(true);
+              exception = e;
+            }
+          }
+          wasInterrupted = Thread.interrupted() || wasInterrupted;
+        }
+        if (wasInterrupted) {
+          Thread.currentThread().interrupt();
+          // unlikely, but worth guarding
+          if (exception == null) {
+            exception = new InterruptedException();
           }
         }
-        wasInterrupted = Thread.interrupted() || wasInterrupted;
-      }
-      if (wasInterrupted) {
-        Thread.currentThread().interrupt();
-        // unlikely, but worth guarding
-        if (exception == null) {
-          exception = new InterruptedException();
+        if (exception != null) {
+          throw exception;
+        }
+        checkExecErrors(execDir, exceptions.build());
+        success = true;
+      } finally {
+        if (!success) {
+          Directories.remove(execDir, fileStore);
         }
       }
-      if (exception != null) {
-        throw exception;
-      }
-      checkExecErrors(execDir, exceptions.build());
-      success = true;
-    } finally {
-      if (!success) {
-        Directories.remove(execDir, fileStore);
-      }
-    }
 
-    log.log(Level.FINER, operationName + " stamping output directories");
-    boolean stamped = false;
-    try {
-      outputDirectory.stamp(execDir);
-      stamped = true;
-    } finally {
-      if (!stamped) {
-        destroyExecDir(execDir);
+      log.log(Level.FINER, operationName + " stamping output directories");
+      boolean stamped = false;
+      try {
+        outputDirectory.stamp(execDir);
+        stamped = true;
+      } finally {
+        if (!stamped) {
+          destroyExecDir(execDir);
+        }
       }
+      if (owner != null) {
+        Directories.setAllOwner(execDir, owner);
+      }
+      return execDir;
+    } finally {
+      materializeTimer.observeDuration();
     }
-    if (owner != null) {
-      Directories.setAllOwner(execDir, owner);
-    }
-    return execDir;
   }
 
   @Override
