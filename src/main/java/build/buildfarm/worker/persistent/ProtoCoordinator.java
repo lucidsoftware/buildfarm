@@ -21,6 +21,8 @@ import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
 import com.google.protobuf.util.Durations;
+import io.prometheus.client.Counter;
+import io.prometheus.client.Histogram;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -55,6 +57,23 @@ import persistent.bazel.client.WorkerSupervisor;
 @Log
 public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, CommonsWorkerPool> {
   private static final String WORKER_INIT_LOG_SUFFIX = ".initargs.log";
+
+  // --- Phase 6 (PW fetch/link split) materialization metrics ---
+  // persistent_worker_inputs_{linked,copied}_total: confirm the phase actually links non-tool
+  // inputs into the PW exec root instead of copying them. With FetchResult linking, copied should
+  // fall toward ~0 (only the no-fetchResult fallback path copies); a rising copied share means PW
+  // actions are back on the slow double-copy path. Counted per input in linkFromFetchResult vs the
+  // copyNontoolInputs fallback.
+  private static final Counter persistentWorkerInputsLinkedTotal =
+      Counter.build()
+          .name("persistent_worker_inputs_linked_total")
+          .help("Non-tool PW inputs materialized by link (hardlink/symlink) from FetchResult.")
+          .register();
+  private static final Counter persistentWorkerInputsCopiedTotal =
+      Counter.build()
+          .name("persistent_worker_inputs_copied_total")
+          .help("Non-tool PW inputs materialized by byte-copy (the no-FetchResult fallback path).")
+          .register();
 
   private record PendingRequest(PersistentWorker worker, RequestTimeoutHandler task) {
     private PendingRequest {
@@ -222,17 +241,25 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
           timeoutScheduler.schedule(
               task, Durations.toMillis(request.timeout), TimeUnit.MILLISECONDS);
 
-      if (request.fetchResult != null) {
-        // Link from FetchResult CAS paths (local sym/hardlinks only, no CAS operations)
-        log.log(
-            Level.FINE,
-            () -> "Persistent worker: linking from FetchResult into " + worker.getExecRoot());
-        linkFromFetchResult(request, worker.getExecRoot());
-      } else {
-        log.log(
-            Level.FINE,
-            () -> "Persistent worker: copying non-tool inputs into " + worker.getExecRoot());
-        copyNontoolInputs(request.workerInputs, worker.getExecRoot());
+      Histogram.Timer materializeTimer =
+          MaterializationMetrics.MATERIALIZE_EXEC_ROOT_SECONDS
+              .labels(MaterializationMetrics.KIND_PERSISTENT_WORKER)
+              .startTimer();
+      try {
+        if (request.fetchResult != null) {
+          // Link from FetchResult CAS paths (local sym/hardlinks only, no CAS operations)
+          log.log(
+              Level.FINE,
+              () -> "Persistent worker: linking from FetchResult into " + worker.getExecRoot());
+          linkFromFetchResult(request, worker.getExecRoot());
+        } else {
+          log.log(
+              Level.FINE,
+              () -> "Persistent worker: copying non-tool inputs into " + worker.getExecRoot());
+          copyNontoolInputs(request.workerInputs, worker.getExecRoot());
+        }
+      } finally {
+        materializeTimer.observeDuration();
       }
     } catch (Exception e) {
       pendingReqs.remove(request);
@@ -312,6 +339,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       if (!workerInputs.allToolInputs.contains(opPath)) {
         Path execPath = workerInputs.relativizeInput(workerExecRoot, opPath);
         workerInputs.copyInputFile(opPath, execPath);
+        persistentWorkerInputsCopiedTotal.inc();
       }
     }
   }
@@ -378,13 +406,15 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
       switch (entry.type()) {
         case DIRECTORY:
           FileAccessUtils.createSymlink(entry.casPath(), execPath);
+          persistentWorkerInputsLinkedTotal.inc();
           break;
         case FILE:
           FileAccessUtils.createHardlink(entry.casPath(), execPath);
+          persistentWorkerInputsLinkedTotal.inc();
           break;
         case ZERO_SIZE_FILE:
           // Zero-size file: no CAS entry. Ignore the executable bit, matching
-          // CFCLinkExecFileSystem.put's size-0 handling.
+          // CFCLinkExecFileSystem.put's size-0 handling. Neither linked nor copied -> not counted.
           FileAccessUtils.createReplacingOnConflict(execPath, Files::createFile);
           break;
         case SYMLINK_NODE:
@@ -393,6 +423,7 @@ public class ProtoCoordinator extends WorkCoordinator<RequestCtx, ResponseCtx, C
               link ->
                   Files.createSymbolicLink(
                       link, link.getFileSystem().getPath(entry.symlinkTarget())));
+          persistentWorkerInputsLinkedTotal.inc();
           break;
       }
       request.trackedLinks.add(execPath);
