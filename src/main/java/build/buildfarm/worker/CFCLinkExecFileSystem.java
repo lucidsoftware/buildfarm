@@ -43,6 +43,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.ListenableFuture;
+import io.prometheus.client.Histogram;
 import java.io.IOException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -122,6 +123,7 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
           if (digest.getSize() != 0) {
             try {
               Files.createLink(path, pathResult.path());
+              materializePathTotal.labels("hardlink_file").inc();
             } catch (IOException e) {
               return immediateFailedFuture(e);
             }
@@ -153,6 +155,7 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
                     "putDirectory(%s, %s) created", execPath, DigestUtil.toString(digest)));
           }
           Files.createSymbolicLink(execPath, path);
+          materializePathTotal.labels("symlink_dir").inc();
           return immediateFuture(pathResult);
         },
         fetchService);
@@ -366,105 +369,111 @@ public class CFCLinkExecFileSystem extends CFCExecFileSystem {
       @Nullable UserPrincipal owner,
       WorkerExecutedMetadata.Builder workerExecutedMetadata)
       throws IOException, InterruptedException {
-    Digest inputRootDigest = DigestUtil.fromDigest(action.getInputRootDigest(), digestFunction);
-    OutputDirectory outputDirectory = createOutputDirectory(command);
-
-    Path execDir = root().resolve(operationName);
-    if (Files.exists(execDir)) {
-      Directories.remove(execDir, fileStore);
-    }
-    Files.createDirectories(execDir);
-
-    Set<Path> linkedInputDirectories =
-        linkInputDirectories
-            ? ImmutableSet.copyOf(
-                Iterables.transform(
-                    linkedDirectories(directoriesIndex, DigestUtil.toDigest(inputRootDigest)),
-                    execDir::resolve))
-            : ImmutableSet.of(); // does this work on windows with / separators?
-
-    // When output_paths is used (REAPI >= 2.1), output directories are indistinguishable from
-    // output files. Exclude them from linking so they remain writable for the action.
-    if (command.getOutputPathsCount() != 0 && !linkedInputDirectories.isEmpty()) {
-      Set<Path> outputPaths =
-          ImmutableSet.copyOf(
-              CommandUtils.getResolvedOutputPaths(
-                  command, execDir.resolve(command.getWorkingDirectory())));
-      linkedInputDirectories = Sets.difference(linkedInputDirectories, outputPaths).immutableCopy();
-    }
-
-    log.log(Level.FINER, operationName + " walking execTree");
-    ExecTree execTree = new ExecTree(directoriesIndex);
-    LinkExecFileVisitor visitor =
-        new LinkExecFileVisitor(
-            workerExecutedMetadata,
-            execDir,
-            linkedInputDirectories,
-            directoriesIndex,
-            outputDirectory);
-    execTree.walk(execDir, inputRootDigest, visitor);
-    Iterable<ListenableFuture<Void>> fetchedFutures = visitor.futures();
-    boolean success = false;
+    Histogram.Timer materializeTimer = materializeExecRootSeconds.labels("regular").startTimer();
     try {
-      InterruptedException exception = null;
-      boolean wasInterrupted = false;
-      ImmutableList.Builder<Throwable> exceptions = ImmutableList.builder();
-      for (ListenableFuture<Void> fetchedFuture : fetchedFutures) {
-        if (exception != null || wasInterrupted) {
-          fetchedFuture.cancel(true);
-        } else {
-          try {
-            fetchedFuture.get();
-          } catch (CancellationException e) {
-            exceptions.add(e);
-          } catch (ExecutionException e) {
-            // just to ensure that no other code can react to interrupt status
-            exceptions.add(e.getCause());
-          } catch (InterruptedException e) {
-            fetchedFuture.cancel(true);
-            exception = e;
-          }
-        }
-        wasInterrupted = Thread.interrupted() || wasInterrupted;
-      }
-      if (wasInterrupted) {
-        Thread.currentThread().interrupt();
-        // unlikely, but worth guarding
-        if (exception == null) {
-          exception = new InterruptedException();
-        }
-      }
-      if (exception != null) {
-        throw exception;
-      }
-      checkExecErrors(execDir, exceptions.build());
-      success = true;
-    } finally {
-      if (!success) {
-        fileCache.decrementReferences(
-            visitor.inputFiles(), visitor.inputDirectories(), digestFunction);
+      Digest inputRootDigest = DigestUtil.fromDigest(action.getInputRootDigest(), digestFunction);
+      OutputDirectory outputDirectory = createOutputDirectory(command);
+
+      Path execDir = root().resolve(operationName);
+      if (Files.exists(execDir)) {
         Directories.remove(execDir, fileStore);
       }
-    }
+      Files.createDirectories(execDir);
 
-    rootInputDigestFunction.put(execDir, digestFunction);
-    rootInputFiles.put(execDir, visitor.inputFiles());
-    rootInputDirectories.put(execDir, visitor.inputDirectories());
+      Set<Path> linkedInputDirectories =
+          linkInputDirectories
+              ? ImmutableSet.copyOf(
+                  Iterables.transform(
+                      linkedDirectories(directoriesIndex, DigestUtil.toDigest(inputRootDigest)),
+                      execDir::resolve))
+              : ImmutableSet.of(); // does this work on windows with / separators?
 
-    log.log(Level.FINER, operationName + " stamping output directories");
-    boolean stamped = false;
-    try {
-      outputDirectory.stamp(execDir);
-      stamped = true;
-    } finally {
-      if (!stamped) {
-        destroyExecDir(execDir);
+      // When output_paths is used (REAPI >= 2.1), output directories are indistinguishable from
+      // output files. Exclude them from linking so they remain writable for the action.
+      if (command.getOutputPathsCount() != 0 && !linkedInputDirectories.isEmpty()) {
+        Set<Path> outputPaths =
+            ImmutableSet.copyOf(
+                CommandUtils.getResolvedOutputPaths(
+                    command, execDir.resolve(command.getWorkingDirectory())));
+        linkedInputDirectories =
+            Sets.difference(linkedInputDirectories, outputPaths).immutableCopy();
       }
+
+      log.log(Level.FINER, operationName + " walking execTree");
+      ExecTree execTree = new ExecTree(directoriesIndex);
+      LinkExecFileVisitor visitor =
+          new LinkExecFileVisitor(
+              workerExecutedMetadata,
+              execDir,
+              linkedInputDirectories,
+              directoriesIndex,
+              outputDirectory);
+      execTree.walk(execDir, inputRootDigest, visitor);
+      Iterable<ListenableFuture<Void>> fetchedFutures = visitor.futures();
+      boolean success = false;
+      try {
+        InterruptedException exception = null;
+        boolean wasInterrupted = false;
+        ImmutableList.Builder<Throwable> exceptions = ImmutableList.builder();
+        for (ListenableFuture<Void> fetchedFuture : fetchedFutures) {
+          if (exception != null || wasInterrupted) {
+            fetchedFuture.cancel(true);
+          } else {
+            try {
+              fetchedFuture.get();
+            } catch (CancellationException e) {
+              exceptions.add(e);
+            } catch (ExecutionException e) {
+              // just to ensure that no other code can react to interrupt status
+              exceptions.add(e.getCause());
+            } catch (InterruptedException e) {
+              fetchedFuture.cancel(true);
+              exception = e;
+            }
+          }
+          wasInterrupted = Thread.interrupted() || wasInterrupted;
+        }
+        if (wasInterrupted) {
+          Thread.currentThread().interrupt();
+          // unlikely, but worth guarding
+          if (exception == null) {
+            exception = new InterruptedException();
+          }
+        }
+        if (exception != null) {
+          throw exception;
+        }
+        checkExecErrors(execDir, exceptions.build());
+        success = true;
+      } finally {
+        if (!success) {
+          fileCache.decrementReferences(
+              visitor.inputFiles(), visitor.inputDirectories(), digestFunction);
+          Directories.remove(execDir, fileStore);
+        }
+      }
+
+      rootInputDigestFunction.put(execDir, digestFunction);
+      rootInputFiles.put(execDir, visitor.inputFiles());
+      rootInputDirectories.put(execDir, visitor.inputDirectories());
+
+      log.log(Level.FINER, operationName + " stamping output directories");
+      boolean stamped = false;
+      try {
+        outputDirectory.stamp(execDir);
+        stamped = true;
+      } finally {
+        if (!stamped) {
+          destroyExecDir(execDir);
+        }
+      }
+      if (owner != null) {
+        Directories.setAllOwner(execDir, owner);
+      }
+      return execDir;
+    } finally {
+      materializeTimer.observeDuration();
     }
-    if (owner != null) {
-      Directories.setAllOwner(execDir, owner);
-    }
-    return execDir;
   }
 
   @Override
