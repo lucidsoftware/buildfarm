@@ -91,6 +91,7 @@ import io.grpc.Deadline;
 import io.grpc.Status;
 import io.grpc.StatusException;
 import io.prometheus.client.Counter;
+import io.prometheus.client.Histogram;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -125,6 +126,29 @@ class ShardWorkerContext implements WorkerContext {
       Counter.build().name("completed_operations").help("Completed operations.").register();
   private static final Counter operationPollerCounter =
       Counter.build().name("operation_poller").help("Number of operations polled.").register();
+  private static final Histogram destroyExecRootSeconds =
+      Histogram.build()
+          .name("destroy_exec_root_seconds")
+          .labelNames("outcome")
+          .help("Wall time to destroy an action execution root.")
+          .buckets(
+              0.001,
+              0.005,
+              0.01,
+              0.025,
+              0.05,
+              0.1,
+              0.25,
+              0.5,
+              1,
+              2.5,
+              5,
+              10,
+              30,
+              60,
+              120,
+              300)
+          .register();
 
   private static BuildfarmConfigs configs = BuildfarmConfigs.getInstance();
 
@@ -865,7 +889,18 @@ class ShardWorkerContext implements WorkerContext {
   // output
   @Override
   public void destroyExecDir(Path execDir) throws IOException, InterruptedException {
-    execFileSystem.destroyExecDir(execDir);
+    long startedNanos = System.nanoTime();
+    String outcome = "success";
+    try {
+      execFileSystem.destroyExecDir(execDir);
+    } catch (IOException | InterruptedException e) {
+      outcome = "failure";
+      throw e;
+    } finally {
+      destroyExecRootSeconds
+          .labels(outcome)
+          .observe((System.nanoTime() - startedNanos) / 1_000_000_000.0);
+    }
   }
 
   @Override

@@ -21,9 +21,38 @@ import com.google.protobuf.Duration;
 import com.google.protobuf.Timestamp;
 import com.google.protobuf.util.Durations;
 import com.google.protobuf.util.Timestamps;
+import io.prometheus.client.Histogram;
 import java.util.Arrays;
 
 public class PutOperationStage extends PipelineStage.NullStage {
+  private static final Histogram operationPhaseSeconds =
+      Histogram.build()
+          .name("worker_operation_phase_seconds")
+          .labelNames("phase")
+          .help("Wall time spent in each worker operation lifecycle phase.")
+          .buckets(
+              0.001,
+              0.005,
+              0.01,
+              0.025,
+              0.05,
+              0.1,
+              0.25,
+              0.5,
+              1,
+              2.5,
+              5,
+              10,
+              30,
+              60,
+              120,
+              300,
+              600,
+              1200,
+              1800,
+              3600)
+          .register();
+
   private final InterruptingConsumer<Operation> onPut;
 
   private final AverageTimeCostOfLastPeriod[] averagesWithinDifferentPeriods;
@@ -45,18 +74,19 @@ public class PutOperationStage extends PipelineStage.NullStage {
     onPut.acceptInterruptibly(executionContext.operation);
     if (executionContext.operation.getDone()) {
       synchronized (this) {
+        ExecutedActionMetadata metadata;
+        if (executionContext.executeResponse.hasResult()) {
+          metadata = executionContext.executeResponse.getResult().getExecutionMetadata();
+        } else {
+          metadata =
+              executionContext
+                  .metadata
+                  .build()
+                  .getExecuteOperationMetadata()
+                  .getPartialExecutionMetadata();
+        }
+        observeOperationPhases(metadata);
         for (AverageTimeCostOfLastPeriod average : averagesWithinDifferentPeriods) {
-          ExecutedActionMetadata metadata;
-          if (executionContext.executeResponse.hasResult()) {
-            metadata = executionContext.executeResponse.getResult().getExecutionMetadata();
-          } else {
-            metadata =
-                executionContext
-                    .metadata
-                    .build()
-                    .getExecuteOperationMetadata()
-                    .getPartialExecutionMetadata();
-          }
           average.addOperation(metadata);
         }
       }
@@ -154,6 +184,46 @@ public class PutOperationStage extends PipelineStage.NullStage {
       return Timestamps.between(a, b);
     }
     return Duration.getDefaultInstance();
+  }
+
+  private static void observeOperationPhases(ExecutedActionMetadata metadata) {
+    observePhase(
+        "queued_to_match", metadata.getQueuedTimestamp(), metadata.getWorkerStartTimestamp());
+    observePhase(
+        "match_to_input_fetch",
+        metadata.getWorkerStartTimestamp(),
+        metadata.getInputFetchStartTimestamp());
+    observePhase(
+        "input_fetch",
+        metadata.getInputFetchStartTimestamp(),
+        metadata.getInputFetchCompletedTimestamp());
+    observePhase(
+        "input_fetch_to_execution",
+        metadata.getInputFetchCompletedTimestamp(),
+        metadata.getExecutionStartTimestamp());
+    observePhase(
+        "execution",
+        metadata.getExecutionStartTimestamp(),
+        metadata.getExecutionCompletedTimestamp());
+    observePhase(
+        "execution_to_output_upload",
+        metadata.getExecutionCompletedTimestamp(),
+        metadata.getOutputUploadStartTimestamp());
+    observePhase(
+        "output_upload",
+        metadata.getOutputUploadStartTimestamp(),
+        metadata.getOutputUploadCompletedTimestamp());
+  }
+
+  private static void observePhase(String phase, Timestamp start, Timestamp end) {
+    if (start.equals(Timestamp.getDefaultInstance())
+        || end.equals(Timestamp.getDefaultInstance())
+        || Timestamps.compare(start, end) >= 0) {
+      return;
+    }
+    operationPhaseSeconds
+        .labels(phase)
+        .observe(Durations.toNanos(Timestamps.between(start, end)) / 1_000_000_000.0);
   }
 
   // when operationCount == 1, an object represents one operation's time costs on each stage;

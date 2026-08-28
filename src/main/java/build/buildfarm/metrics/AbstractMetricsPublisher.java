@@ -62,11 +62,32 @@ public abstract class AbstractMetricsPublisher implements MetricsPublisher {
           .help("Operation execution exit code.")
           .register();
   private static final Histogram queuedTime =
-      Histogram.build().name("queued_time_s").help("Queued time in seconds.").register();
+      Histogram.build()
+          .name("queued_time_s")
+          .help("Queued time in seconds.")
+          .buckets(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 1200, 1800, 3600)
+          .register();
   private static final Histogram outputUploadTime =
       Histogram.build()
           .name("output_upload_time_s")
           .help("Output upload time in seconds.")
+          .buckets(
+              0.001,
+              0.005,
+              0.01,
+              0.025,
+              0.05,
+              0.1,
+              0.25,
+              0.5,
+              1,
+              2.5,
+              5,
+              10,
+              30,
+              60,
+              120,
+              300)
           .register();
 
   private final String clusterId;

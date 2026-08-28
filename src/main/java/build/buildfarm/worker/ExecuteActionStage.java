@@ -31,11 +31,50 @@ import lombok.extern.java.Log;
 @Log
 public class ExecuteActionStage extends PipelineStage {
   private static final Histogram executionTime =
-      Histogram.build().name("execution_time_ms").help("Execution time in ms.").register();
+      Histogram.build()
+          .name("execution_time_ms")
+          .help("Execution time in ms.")
+          .buckets(
+              100,
+              250,
+              500,
+              1000,
+              2500,
+              5000,
+              10000,
+              30000,
+              60000,
+              120000,
+              300000,
+              600000,
+              900000,
+              1200000,
+              1800000,
+              3600000)
+          .register();
   private static final Histogram executionStallTime =
       Histogram.build()
           .name("execution_stall_time_ms")
           .help("Execution stall time in ms.")
+          .buckets(
+              0.01,
+              0.025,
+              0.05,
+              0.1,
+              0.25,
+              0.5,
+              1,
+              2.5,
+              5,
+              10,
+              25,
+              50,
+              100,
+              250,
+              500,
+              1000,
+              5000,
+              30000)
           .register();
   private static final int IDLE_STAGE_CLOSED_MS = 10;
   private static final TimeUnit IDLE_STAGE_CLOSED_UNIT = TimeUnit.MILLISECONDS;

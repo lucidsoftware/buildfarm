@@ -28,11 +28,51 @@ public class InputFetchStage extends SuperscalarPipelineStage {
   private static final Gauge inputFetchSlotUsage =
       Gauge.build().name("input_fetch_slot_usage").help("Input fetch slot Usage.").register();
   private static final Histogram inputFetchTime =
-      Histogram.build().name("input_fetch_time_ms").help("Input fetch time in ms.").register();
+      Histogram.build()
+          .name("input_fetch_time_ms")
+          .help("Input fetch time in ms.")
+          .buckets(
+              1,
+              2.5,
+              5,
+              10,
+              25,
+              50,
+              100,
+              250,
+              500,
+              1000,
+              2500,
+              5000,
+              10000,
+              30000,
+              60000,
+              120000,
+              300000)
+          .register();
   private static final Histogram inputFetchStallTime =
       Histogram.build()
           .name("input_fetch_stall_time_ms")
           .help("Input fetch stall time in ms.")
+          .buckets(
+              0.01,
+              0.025,
+              0.05,
+              0.1,
+              0.25,
+              0.5,
+              1,
+              2.5,
+              5,
+              10,
+              25,
+              50,
+              100,
+              250,
+              500,
+              1000,
+              5000,
+              30000)
           .register();
   private final ConcurrentMap<String, InputFetcher> inputFetchers = Maps.newConcurrentMap();
 
