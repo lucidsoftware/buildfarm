@@ -16,13 +16,18 @@ package build.buildfarm.worker;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assume.assumeTrue;
 
 import build.bazel.remote.execution.v2.Digest;
+import build.bazel.remote.execution.v2.DigestFunction;
 import build.bazel.remote.execution.v2.Directory;
 import build.bazel.remote.execution.v2.FileNode;
 import com.google.protobuf.ByteString;
 import java.io.IOException;
 import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Map;
 import jnr.constants.platform.OpenFlags;
 import jnr.ffi.Pointer;
 import jnr.ffi.Runtime;
@@ -129,6 +134,127 @@ public class FuseCASTest {
     fuseCAS.createInputRoot("test", Digest.newBuilder().build());
     fuseCAS.destroyInputRoot("test");
     assertThat(fuseCAS.getattr("/test", createFileStat())).isEqualTo(-ErrorCodes.ENOENT());
+  }
+
+  @Test
+  public void indexedInputReadsExactLocalCasPath() throws Exception {
+    Path scratch = Files.createTempDirectory("fuse-cas-test-scratch");
+    Path localInput = Files.createTempFile("fuse-cas-test-input", null);
+    Files.write(localInput, content.toByteArray());
+    FuseCAS localFuse =
+        new FuseCAS(
+            null,
+            scratch,
+            (compressor, digest, offset) -> {
+              throw new AssertionError("indexed input performed a lazy CAS read");
+            });
+    build.buildfarm.v1test.Digest fileDigest =
+        build.buildfarm.v1test.Digest.newBuilder()
+            .setHash("file")
+            .setSize(content.size())
+            .setDigestFunction(DigestFunction.Value.SHA256)
+            .build();
+    build.buildfarm.v1test.Digest rootDigest =
+        build.buildfarm.v1test.Digest.newBuilder()
+            .setHash("root")
+            .setSize(1)
+            .setDigestFunction(DigestFunction.Value.SHA256)
+            .build();
+    Directory rootDirectory =
+        Directory.newBuilder()
+            .addFiles(
+                FileNode.newBuilder()
+                    .setName("file")
+                    .setDigest(build.buildfarm.common.DigestUtil.toDigest(fileDigest)))
+            .build();
+    localFuse.createInputRoot(
+        "test",
+        rootDigest,
+        Map.of(build.buildfarm.common.DigestUtil.toDigest(rootDigest), rootDirectory),
+        (digest, executable) -> localInput);
+
+    SystemFuseFileInfo fi = new SystemFuseFileInfo();
+    assertThat(localFuse.open("/test/file", fi)).isEqualTo(0);
+    u8[] array = Struct.arrayOf(Runtime.getSystemRuntime(), u8.class, content.size() + 1);
+    Pointer buffer = ((DelegatingMemoryIO) Struct.getMemory(array[0])).getDelegatedMemoryIO();
+    assertThat(localFuse.read("/test/file", buffer, content.size(), 0, fi))
+        .isEqualTo(content.size());
+    byte[] actual = new byte[content.size()];
+    buffer.get(0, actual, 0, actual.length);
+    assertThat(ByteString.copyFrom(actual)).isEqualTo(content);
+  }
+
+  @Test
+  public void mountedFilesystemProjectsLocalCasInputAndDiskOutput() throws Exception {
+    assumeTrue("requires /dev/fuse", Files.exists(Path.of("/dev/fuse")));
+    Path mount = Files.createTempDirectory("fuse-cas-test-mount");
+    Path scratch = Files.createTempDirectory("fuse-cas-test-scratch");
+    Path localInput = Files.createTempFile("fuse-cas-test-input", null);
+    Files.write(localInput, content.toByteArray());
+    FuseCAS mountedFuse =
+        new FuseCAS(
+            mount,
+            scratch,
+            (compressor, digest, offset) -> {
+              throw new AssertionError("mounted indexed input performed a lazy CAS read");
+            });
+    build.buildfarm.v1test.Digest fileDigest =
+        build.buildfarm.v1test.Digest.newBuilder()
+            .setHash("file")
+            .setSize(content.size())
+            .setDigestFunction(DigestFunction.Value.SHA256)
+            .build();
+    build.buildfarm.v1test.Digest rootDigest =
+        build.buildfarm.v1test.Digest.newBuilder()
+            .setHash("root")
+            .setSize(1)
+            .setDigestFunction(DigestFunction.Value.SHA256)
+            .build();
+    Directory rootDirectory =
+        Directory.newBuilder()
+            .addFiles(
+                FileNode.newBuilder()
+                    .setName("input")
+                    .setDigest(build.buildfarm.common.DigestUtil.toDigest(fileDigest)))
+            .build();
+    try {
+      mountedFuse.createInputRoot(
+          "operation",
+          rootDigest,
+          Map.of(build.buildfarm.common.DigestUtil.toDigest(rootDigest), rootDirectory),
+          (digest, executable) -> localInput);
+
+      assertThat(Files.readAllBytes(mount.resolve("operation/input")))
+          .isEqualTo(content.toByteArray());
+      Files.writeString(mount.resolve("operation/output"), "output");
+      assertThat(Files.readString(mount.resolve("operation/output"))).isEqualTo("output");
+    } finally {
+      mountedFuse.destroyInputRoot("operation");
+      mountedFuse.stop();
+    }
+  }
+
+  @Test
+  public void destroyingInputRootDeletesOutputBackingFiles() throws Exception {
+    Path scratch = Files.createTempDirectory("fuse-cas-test-scratch");
+    FuseCAS localFuse = new FuseCAS(null, scratch, (compressor, digest, offset) -> null);
+    build.buildfarm.v1test.Digest empty =
+        build.buildfarm.v1test.Digest.newBuilder()
+            .setDigestFunction(DigestFunction.Value.SHA256)
+            .build();
+    localFuse.createInputRoot("test", empty, Map.of(), (digest, executable) -> null);
+    SystemFuseFileInfo outputHandle = new SystemFuseFileInfo();
+    assertThat(localFuse.create("/test/output", 0644, outputHandle)).isEqualTo(0);
+    try (var outputs = Files.list(scratch)) {
+      assertThat(outputs.count()).isEqualTo(1);
+    }
+
+    localFuse.destroyInputRoot("test");
+    // POSIX keeps an unlinked file alive until its last open handle is released.
+    localFuse.release("/test/output", outputHandle);
+    try (var outputs = Files.list(scratch)) {
+      assertThat(outputs.count()).isEqualTo(0);
+    }
   }
 
   @Test
@@ -249,6 +375,29 @@ public class FuseCASTest {
     assertThat(fuseCAS.create("/foo", 0644, new SystemFuseFileInfo())).isEqualTo(0);
     assertThat(fuseCAS.unlink("/foo")).isEqualTo(0);
     assertThat(fuseCAS.getattr("/foo", createFileStat())).isEqualTo(-ErrorCodes.ENOENT());
+  }
+
+  @Test
+  public void hardLinkKeepsOutputUntilLastLinkIsRemoved() throws Exception {
+    Path scratch = Files.createTempDirectory("fuse-cas-test-scratch");
+    FuseCAS localFuse = new FuseCAS(null, scratch, (compressor, digest, offset) -> null);
+    SystemFuseFileInfo handle = new SystemFuseFileInfo();
+    assertThat(localFuse.create("/first", 0644, handle)).isEqualTo(0);
+    localFuse.release("/first", handle);
+
+    assertThat(localFuse.link("/first", "/second")).isEqualTo(0);
+    FileStat stat = createFileStat();
+    assertThat(localFuse.getattr("/second", stat)).isEqualTo(0);
+    assertThat(stat.st_nlink.longValue()).isEqualTo(2);
+    assertThat(localFuse.unlink("/first")).isEqualTo(0);
+    try (var outputs = Files.list(scratch)) {
+      assertThat(outputs.count()).isEqualTo(1);
+    }
+
+    assertThat(localFuse.unlink("/second")).isEqualTo(0);
+    try (var outputs = Files.list(scratch)) {
+      assertThat(outputs.count()).isEqualTo(0);
+    }
   }
 
   @Test

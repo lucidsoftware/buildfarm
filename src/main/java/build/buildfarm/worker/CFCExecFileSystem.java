@@ -297,7 +297,7 @@ public class CFCExecFileSystem implements ExecFileSystem {
   }
 
   @VisibleForTesting
-  static OutputDirectory createOutputDirectory(Command command) {
+  public static OutputDirectory createOutputDirectory(Command command) {
     Iterable<String> files;
     Iterable<String> dirs;
     if (command.getOutputPathsCount() != 0) {

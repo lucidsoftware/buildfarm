@@ -15,27 +15,38 @@
 package build.buildfarm.worker;
 
 import build.bazel.remote.execution.v2.Compressor;
+import build.bazel.remote.execution.v2.DigestFunction;
 import build.bazel.remote.execution.v2.Directory;
 import build.bazel.remote.execution.v2.DirectoryNode;
 import build.bazel.remote.execution.v2.FileNode;
+import build.bazel.remote.execution.v2.SymlinkNode;
 import build.buildfarm.common.DigestUtil;
 import build.buildfarm.common.InputStreamFactory;
 import build.buildfarm.common.Watchdog;
 import build.buildfarm.v1test.Digest;
-import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Duration;
 import com.google.protobuf.InvalidProtocolBufferException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.FileStore;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
-import java.util.function.Supplier;
 import java.util.logging.Level;
 import jnr.constants.platform.Access;
 import jnr.constants.platform.OpenFlags;
@@ -52,11 +63,19 @@ import ru.serce.jnrfuse.FuseFillDir;
 import ru.serce.jnrfuse.FuseStubFS;
 import ru.serce.jnrfuse.struct.FileStat;
 import ru.serce.jnrfuse.struct.FuseFileInfo;
+import ru.serce.jnrfuse.struct.Statvfs;
 import ru.serce.jnrfuse.struct.Timespec;
 
 @Log
 public class FuseCAS extends FuseStubFS {
+  @FunctionalInterface
+  interface LegacyInputStreamFactory {
+    InputStream newInput(build.bazel.remote.execution.v2.Digest digest, long offset)
+        throws IOException;
+  }
+
   private final Path mountPath;
+  private final Path scratchPath;
   private final InputStreamFactory inputStreamFactory;
   private final DirectoryEntry root;
   private final AtomicInteger fileHandleCounter = new AtomicInteger(1);
@@ -76,16 +95,26 @@ public class FuseCAS extends FuseStubFS {
 
     boolean isExecutable();
 
-    int size();
+    long size();
+
+    default int linkCount() {
+      return 1;
+    }
   }
 
   static class FileEntry implements Entry {
     final Digest digest;
     final boolean executable;
+    final Path path;
 
     FileEntry(Digest digest, boolean executable) {
+      this(digest, executable, null);
+    }
+
+    FileEntry(Digest digest, boolean executable, Path path) {
       this.digest = digest;
       this.executable = executable;
+      this.path = path;
     }
 
     @Override
@@ -109,61 +138,21 @@ public class FuseCAS extends FuseStubFS {
     }
 
     @Override
-    public int size() {
-      return (int) digest.getSize();
+    public long size() {
+      return digest.getSize();
     }
   }
 
   static class WriteFileEntry implements Entry {
     boolean executable;
-    ByteString content;
+    final Path path;
+    private int openHandles = 0;
+    private int links = 1;
+    private boolean deletePending = false;
 
-    WriteFileEntry(boolean executable) {
+    WriteFileEntry(boolean executable, Path path) {
       this.executable = executable;
-      content = ByteString.EMPTY;
-    }
-
-    public void concat(ByteString value) {
-      content = content.concat(value);
-    }
-
-    @SuppressWarnings("ConstantConditions")
-    public synchronized void write(ByteString value, long offset) {
-      int size = value.size();
-      int contentSize = content.size();
-      int index = (int) offset;
-      if (index == contentSize) {
-        if (size > 0) {
-          if (contentSize == 0) {
-            content = value;
-          } else {
-            concat(value);
-          }
-        }
-      } else {
-        /* eliminating EMPTY adds here - saw crashes to that effect */
-        ByteString newContent = null;
-        if (index > 0) { // pre
-          if (index < contentSize) {
-            newContent = content.substring(0, index);
-          } else {
-            newContent = content;
-
-            if (index != contentSize) { // pad
-              ByteString pad = ByteString.copyFrom(ByteBuffer.allocate(index - contentSize));
-              newContent = newContent.concat(pad);
-            }
-          }
-        }
-
-        newContent = newContent == null ? value : newContent.concat(value);
-
-        if (index + size < contentSize) { // post
-          newContent = newContent.concat(content.substring(index + size));
-        }
-
-        content = newContent;
-      }
+      this.path = path;
     }
 
     @Override
@@ -187,8 +176,50 @@ public class FuseCAS extends FuseStubFS {
     }
 
     @Override
-    public int size() {
-      return content.size();
+    public long size() {
+      try {
+        return Files.size(path);
+      } catch (IOException e) {
+        return 0;
+      }
+    }
+
+    synchronized void opened() {
+      openHandles++;
+    }
+
+    synchronized void released() {
+      if (openHandles > 0) {
+        openHandles--;
+      }
+      deleteIfUnused();
+    }
+
+    synchronized void linked() {
+      links++;
+    }
+
+    synchronized void unlinked() {
+      if (links > 0) {
+        links--;
+      }
+      deletePending = links == 0;
+      deleteIfUnused();
+    }
+
+    @Override
+    public synchronized int linkCount() {
+      return links;
+    }
+
+    private void deleteIfUnused() {
+      if (deletePending && openHandles == 0) {
+        try {
+          Files.deleteIfExists(path);
+        } catch (IOException e) {
+          log.log(Level.WARNING, "could not delete FUSE output backing file " + path, e);
+        }
+      }
     }
   }
 
@@ -196,11 +227,11 @@ public class FuseCAS extends FuseStubFS {
     private final Map<String, Entry> children;
 
     LocalDirectoryEntry() {
-      this.children = new HashMap<>();
+      this.children = new ConcurrentHashMap<>();
     }
 
     LocalDirectoryEntry(Map<String, Entry> children) {
-      this.children = new HashMap<>(children);
+      this.children = new ConcurrentHashMap<>(children);
     }
 
     @Override
@@ -236,7 +267,7 @@ public class FuseCAS extends FuseStubFS {
     }
 
     @Override
-    public int size() {
+    public long size() {
       return 0;
     }
 
@@ -315,11 +346,9 @@ public class FuseCAS extends FuseStubFS {
 
   static class SymlinkEntry implements Entry {
     final String target;
-    final Supplier<Entry> resolve;
 
-    SymlinkEntry(String target, Supplier<Entry> resolve) {
+    SymlinkEntry(String target) {
       this.target = target;
-      this.resolve = resolve;
     }
 
     @Override
@@ -329,41 +358,63 @@ public class FuseCAS extends FuseStubFS {
 
     @Override
     public boolean isDirectory() {
-      return resolve.get().isDirectory();
+      return false;
     }
 
     @Override
     public boolean isWritable() {
-      return resolve.get().isWritable();
+      return false;
     }
 
     @Override
     public boolean isExecutable() {
-      return resolve.get().isExecutable();
+      return false;
     }
 
     @Override
-    public int size() {
-      return resolve.get().size();
+    public long size() {
+      return target.getBytes(StandardCharsets.UTF_8).length;
     }
   }
 
   public FuseCAS(Path mountPath, InputStreamFactory inputStreamFactory) {
+    this(
+        mountPath,
+        mountPath == null
+            ? Path.of(System.getProperty("java.io.tmpdir"), "buildfarm-fuse-" + UUID.randomUUID())
+            : mountPath.resolveSibling("fuse-scratch"),
+        inputStreamFactory);
+  }
+
+  FuseCAS(Path mountPath, LegacyInputStreamFactory inputStreamFactory) {
+    this(
+        mountPath,
+        (compressor, digest, offset) ->
+            inputStreamFactory.newInput(DigestUtil.toDigest(digest), offset));
+  }
+
+  public FuseCAS(Path mountPath, Path scratchPath, InputStreamFactory inputStreamFactory) {
     this.mountPath = mountPath;
+    this.scratchPath = scratchPath;
     this.inputStreamFactory = inputStreamFactory;
     root = new LocalDirectoryEntry();
   }
 
-  public void stop() {
-    if (mounts > 0) {
-      umount();
-      mounts = 0;
+  public synchronized void stop() {
+    if (unmounter != null) {
+      unmounter.stop();
+      unmounter = null;
     }
+    if (mounted) {
+      umount();
+      mounted = false;
+    }
+    mounts = 0;
   }
 
   @FunctionalInterface
   interface DirectoryEntryPathConsumer {
-    void accept(DirectoryEntry entry, String path);
+    void accept(DirectoryEntry entry, String path) throws IOException;
   }
 
   private static void resolveTopdir(
@@ -391,35 +442,47 @@ public class FuseCAS extends FuseStubFS {
   }
 
   private synchronized void incMounts() throws IOException {
-    if (mountPath != null && mounts++ == 0) {
-      if (unmounter != null) {
-        unmounter.stop();
-      }
-      if (!mounted) {
-        log.log(Level.INFO, "Mounting FuseCAS");
-        String[] fuseOpts = {"-o", "max_write=131072", "-o", "big_writes"};
-        try {
-          mount(mountPath, /* blocking= */ false, /* debug= */ false, /* fuseOpts= */ fuseOpts);
-        } catch (FuseException e) {
-          throw new IOException(e);
-        }
-        mounted = true;
-      }
+    if (mounts > 0 || mountPath == null) {
+      mounts++;
+      return;
     }
+    if (unmounter != null) {
+      unmounter.stop();
+      unmounter = null;
+    }
+    if (!mounted) {
+      log.log(Level.INFO, "Mounting FuseCAS");
+      String[] fuseOpts = {"-o", "max_write=131072", "-o", "big_writes"};
+      try {
+        mount(mountPath, /* blocking= */ false, /* debug= */ false, /* fuseOpts= */ fuseOpts);
+      } catch (FuseException e) {
+        throw new IOException(e);
+      }
+      mounted = true;
+    }
+    mounts = 1;
   }
 
   private synchronized void decMounts() {
+    if (mounts == 0) {
+      return;
+    }
     if (--mounts == 0 && mountPath != null) {
       log.log(Level.INFO, "Scheduling FuseCAS unmount in 10s");
       unmounter =
-          new Watchdog(
-              Duration.newBuilder().setSeconds(10).setNanos(0).build(),
-              () -> {
-                log.log(Level.INFO, "Unmounting FuseCAS");
-                umount();
-                mounted = false;
-              });
-      new Thread(unmounter).start();
+          new Watchdog(Duration.newBuilder().setSeconds(10).setNanos(0).build(), this::unmountIdle);
+      Thread unmountThread = new Thread(unmounter, "fuse-cas-unmounter");
+      unmountThread.setDaemon(true);
+      unmountThread.start();
+    }
+  }
+
+  private synchronized void unmountIdle() {
+    if (mounts == 0 && mounted) {
+      log.log(Level.INFO, "Unmounting FuseCAS");
+      umount();
+      mounted = false;
+      unmounter = null;
     }
   }
 
@@ -449,6 +512,9 @@ public class FuseCAS extends FuseStubFS {
                       DigestUtil.fromDigest(
                           directoryNode.getDigest(), digest.getDigestFunction()))));
         }
+        for (SymlinkNode symlinkNode : directory.getSymlinksList()) {
+          builder.put(symlinkNode.getName(), new SymlinkEntry(symlinkNode.getTarget()));
+        }
 
         children = builder.build();
         childrenCache.put(digest, children);
@@ -466,18 +532,135 @@ public class FuseCAS extends FuseStubFS {
   public void createInputRoot(String topdir, Digest inputRoot)
       throws IOException, InterruptedException {
     incMounts();
-    resolveTopdir(
-        topdir,
-        root,
-        (currentDir, base) -> {
-          // FIXME duplicates?
-          currentDir.putChild(base, new CASDirectoryEntry(fetchChildrenFunction(inputRoot)));
-        });
+    boolean success = false;
+    try {
+      resolveTopdir(
+          topdir,
+          root,
+          (currentDir, base) -> {
+            if (currentDir.hasChild(base)) {
+              throw new IOException("input root already exists: " + topdir);
+            }
+            currentDir.putChild(base, new CASDirectoryEntry(fetchChildrenFunction(inputRoot)));
+          });
+      success = true;
+    } finally {
+      if (!success) {
+        decMounts();
+      }
+    }
+  }
+
+  void createInputRoot(String topdir, build.bazel.remote.execution.v2.Digest inputRoot)
+      throws IOException, InterruptedException {
+    createInputRoot(topdir, DigestUtil.fromDigest(inputRoot, DigestFunction.Value.SHA256));
+  }
+
+  /**
+   * Installs an input tree whose files have already been placed and referenced in the local CAS.
+   * The resolver must return the exact local path for a digest/executable pair. Directory parsing
+   * and blob fetching are therefore never performed from a FUSE callback.
+   */
+  public void createInputRoot(
+      String topdir,
+      Digest inputRoot,
+      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex,
+      BiFunction<Digest, Boolean, Path> resolver)
+      throws IOException, InterruptedException {
+    Map<String, Entry> children =
+        indexedChildren(inputRoot, directoriesIndex, resolver, new HashSet<>());
+    incMounts();
+    boolean success = false;
+    try {
+      resolveTopdir(
+          topdir,
+          root,
+          (currentDir, base) -> {
+            if (currentDir.hasChild(base)) {
+              throw new IOException("input root already exists: " + topdir);
+            }
+            currentDir.putChild(base, new LocalDirectoryEntry(children));
+          });
+      success = true;
+    } finally {
+      if (!success) {
+        decMounts();
+      }
+    }
+  }
+
+  private Map<String, Entry> indexedChildren(
+      Digest digest,
+      Map<build.bazel.remote.execution.v2.Digest, Directory> directoriesIndex,
+      BiFunction<Digest, Boolean, Path> resolver,
+      Set<build.bazel.remote.execution.v2.Digest> ancestors)
+      throws IOException {
+    build.bazel.remote.execution.v2.Digest reapiDigest = DigestUtil.toDigest(digest);
+    Directory directory =
+        digest.getSize() == 0 ? Directory.getDefaultInstance() : directoriesIndex.get(reapiDigest);
+    if (directory == null) {
+      throw new IOException("directory missing from input index: " + DigestUtil.toString(digest));
+    }
+    if (!ancestors.add(reapiDigest)) {
+      throw new IOException("directory cycle in input index: " + DigestUtil.toString(digest));
+    }
+    try {
+      Map<String, Entry> children = new HashMap<>();
+      for (FileNode file : directory.getFilesList()) {
+        Digest fileDigest = DigestUtil.fromDigest(file.getDigest(), digest.getDigestFunction());
+        Path localPath =
+            fileDigest.getSize() == 0 ? null : resolver.apply(fileDigest, file.getIsExecutable());
+        if (fileDigest.getSize() != 0 && localPath == null) {
+          throw new IOException(
+              "input is not available in local CAS: " + DigestUtil.toString(fileDigest));
+        }
+        children.put(file.getName(), new FileEntry(fileDigest, file.getIsExecutable(), localPath));
+      }
+      for (DirectoryNode child : directory.getDirectoriesList()) {
+        Digest childDigest = DigestUtil.fromDigest(child.getDigest(), digest.getDigestFunction());
+        children.put(
+            child.getName(),
+            new LocalDirectoryEntry(
+                indexedChildren(childDigest, directoriesIndex, resolver, ancestors)));
+      }
+      for (SymlinkNode symlink : directory.getSymlinksList()) {
+        children.put(symlink.getName(), new SymlinkEntry(symlink.getTarget()));
+      }
+      return children;
+    } finally {
+      ancestors.remove(reapiDigest);
+    }
   }
 
   public void destroyInputRoot(String topdir) throws IOException, InterruptedException {
-    resolveTopdir(topdir, root, DirectoryEntry::removeChild);
-    decMounts();
+    AtomicBoolean removed = new AtomicBoolean(false);
+    resolveTopdir(
+        topdir,
+        root,
+        (parent, name) -> {
+          Entry entry = parent.getChild(name);
+          if (entry != null) {
+            parent.removeChild(name);
+            cleanupEntry(entry);
+            removed.set(true);
+          }
+        });
+    if (removed.get()) {
+      decMounts();
+    }
+  }
+
+  private static void cleanupEntry(Entry entry) {
+    if (entry == null) {
+      return;
+    }
+    if (entry instanceof WriteFileEntry writeFile) {
+      writeFile.unlinked();
+    } else if (entry instanceof LocalDirectoryEntry directory) {
+      for (Entry child : directory.getChildren().values()) {
+        cleanupEntry(child);
+      }
+    }
   }
 
   private DirectoryEntry containingDirectoryForCreate(String path) {
@@ -561,9 +744,14 @@ public class FuseCAS extends FuseStubFS {
     } else if (entry.isDirectory()) {
       stat.st_mode.set(FileStat.S_IFDIR | 0755);
     } else {
-      int mode = entry.isExecutable() ? 0555 : 0444;
+      int mode;
+      if (entry.isWritable()) {
+        mode = entry.isExecutable() ? 0755 : 0644;
+      } else {
+        mode = entry.isExecutable() ? 0555 : 0444;
+      }
       stat.st_mode.set(FileStat.S_IFREG | mode);
-      stat.st_nlink.set(1); // should fix this for number of digests pointing to it
+      stat.st_nlink.set(entry.linkCount());
     }
     long size = entry.size();
     long blksize = stat.st_blksize.get();
@@ -586,11 +774,11 @@ public class FuseCAS extends FuseStubFS {
     }
 
     SymlinkEntry symlinkEntry = (SymlinkEntry) entry;
-    byte[] target = symlinkEntry.target.getBytes();
-    int putsize = (int) (size <= target.length ? size : target.length);
+    byte[] target = symlinkEntry.target.getBytes(StandardCharsets.UTF_8);
+    int putsize = (int) Math.min(Math.max(0, size - 1), target.length);
     buf.put(0, target, 0, putsize);
-    if (size > target.length) {
-      buf.putByte(target.length, (byte) 0);
+    if (size > 0) {
+      buf.putByte(putsize, (byte) 0);
     }
     return 0;
   }
@@ -604,13 +792,19 @@ public class FuseCAS extends FuseStubFS {
     }
 
     String base = basename(newpath);
-    dirEntry.putChild(base, new SymlinkEntry(oldpath, () -> resolve(oldpath)));
+    if (dirEntry.hasChild(base)) {
+      return -ErrorCodes.EEXIST();
+    }
+    dirEntry.putChild(base, new SymlinkEntry(oldpath));
 
     return 0;
   }
 
   @Override
   public int rename(String oldpath, String newpath) {
+    if (oldpath.equals(newpath)) {
+      return 0;
+    }
     DirectoryEntry oldDirEntry = containingDirectoryForCreate(oldpath);
     DirectoryEntry newDirEntry = containingDirectoryForCreate(newpath);
 
@@ -625,12 +819,37 @@ public class FuseCAS extends FuseStubFS {
     if (entry == null) {
       return -ErrorCodes.ENOENT();
     }
-    if (!entry.isWritable()) {
-      return -ErrorCodes.EPERM();
+    Entry replaced = newDirEntry.getChild(newBase);
+    if (replaced != null && replaced != entry) {
+      cleanupEntry(replaced);
     }
     newDirEntry.putChild(newBase, entry);
     oldDirEntry.removeChild(oldBase);
 
+    return 0;
+  }
+
+  @Override
+  public int link(String oldpath, String newpath) {
+    Entry entry = resolve(oldpath);
+    if (entry == null) {
+      return -ErrorCodes.ENOENT();
+    }
+    if (entry.isDirectory()) {
+      return -ErrorCodes.EPERM();
+    }
+    DirectoryEntry newParent = containingDirectoryForCreate(newpath);
+    if (newParent == null) {
+      return -ErrorCodes.ENOENT();
+    }
+    String newBase = basename(newpath);
+    if (newParent.hasChild(newBase)) {
+      return -ErrorCodes.EEXIST();
+    }
+    if (entry instanceof WriteFileEntry writeFile) {
+      writeFile.linked();
+    }
+    newParent.putChild(newBase, entry);
     return 0;
   }
 
@@ -662,17 +881,16 @@ public class FuseCAS extends FuseStubFS {
     }
 
     WriteFileEntry writeFileEntry = (WriteFileEntry) entry;
-
-    int contentSize = Math.min((int) size, writeFileEntry.content.size());
-    int padSize = (int) (size - contentSize);
-    ByteString content =
-        contentSize == 0 ? ByteString.EMPTY : writeFileEntry.content.substring(0, contentSize);
-    if (padSize > 0) {
-      content = content.concat(ByteString.copyFrom(ByteBuffer.allocate(padSize)));
+    try (FileChannel channel = FileChannel.open(writeFileEntry.path, StandardOpenOption.WRITE)) {
+      long oldSize = channel.size();
+      channel.truncate(size);
+      if (size > oldSize) {
+        channel.write(ByteBuffer.wrap(new byte[] {0}), size - 1);
+      }
+      return 0;
+    } catch (IOException e) {
+      return -ErrorCodes.EIO();
     }
-    writeFileEntry.content = content;
-
-    return 0;
   }
 
   @Override
@@ -726,11 +944,11 @@ public class FuseCAS extends FuseStubFS {
       return -ErrorCodes.ENOENT();
     }
 
-    if (mode == Access.X_OK.intValue()) {
+    if ((mode & Access.X_OK.intValue()) != 0) {
       return entry.isExecutable() ? 0 : -ErrorCodes.EACCES();
     }
 
-    if (mode == Access.W_OK.intValue()) {
+    if ((mode & Access.W_OK.intValue()) != 0) {
       return entry.isWritable() ? 0 : -ErrorCodes.EACCES();
     }
 
@@ -757,6 +975,29 @@ public class FuseCAS extends FuseStubFS {
     }
 
     dirEntry.removeChild(base);
+    cleanupEntry(entry);
+    return 0;
+  }
+
+  @Override
+  public int rmdir(String path) {
+    DirectoryEntry parent = containingDirectoryForCreate(path);
+    if (parent == null) {
+      return -ErrorCodes.ENOENT();
+    }
+    String base = basename(path);
+    Entry entry = parent.getChild(base);
+    if (entry == null) {
+      return -ErrorCodes.ENOENT();
+    }
+    if (!entry.isDirectory()) {
+      return -ErrorCodes.ENOTDIR();
+    }
+    DirectoryEntry directory = (DirectoryEntry) entry;
+    if (!directory.getChildren().isEmpty()) {
+      return -ErrorCodes.ENOTEMPTY();
+    }
+    parent.removeChild(base);
     return 0;
   }
 
@@ -767,8 +1008,23 @@ public class FuseCAS extends FuseStubFS {
     return -ErrorCodes.EOPNOTSUPP();
   }
 
+  @Override
+  public int setxattr(String path, String name, Pointer value, @size_t long size, int flags) {
+    return -ErrorCodes.EOPNOTSUPP();
+  }
+
+  @Override
+  public int listxattr(String path, Pointer list, @size_t long size) {
+    return -ErrorCodes.EOPNOTSUPP();
+  }
+
+  @Override
+  public int removexattr(String path, String name) {
+    return -ErrorCodes.EOPNOTSUPP();
+  }
+
   @SuppressWarnings("OctalInteger")
-  private Entry createImpl(String path, FuseFileInfo fi) {
+  private Entry createImpl(String path, long mode) {
     // assume no intersection for now
     DirectoryEntry dirEntry = containingDirectoryForCreate(path);
 
@@ -776,8 +1032,20 @@ public class FuseCAS extends FuseStubFS {
       return null;
     }
 
-    Entry entry = new WriteFileEntry((fi.flags.intValue() & 0111) != 0);
-    dirEntry.putChild(basename(path), entry);
+    if (scratchPath == null) {
+      return null;
+    }
+    final Path output;
+    try {
+      Files.createDirectories(scratchPath);
+      output = Files.createTempFile(scratchPath, "output-", null);
+    } catch (IOException e) {
+      return null;
+    }
+    Entry entry = new WriteFileEntry((mode & 0111) != 0, output);
+    String base = basename(path);
+    cleanupEntry(dirEntry.getChild(base));
+    dirEntry.putChild(base, entry);
 
     return entry;
   }
@@ -788,12 +1056,26 @@ public class FuseCAS extends FuseStubFS {
       fh = fileHandleCounter.getAndIncrement();
     } while (fileHandleEntries.containsKey(fh));
     fileHandleEntries.put(fh, e);
+    if (e instanceof WriteFileEntry writeFile) {
+      writeFile.opened();
+    }
     return fh;
   }
 
   @Override
+  public int mknod(String path, @mode_t long mode, long device) {
+    if (resolve(path) != null) {
+      return -ErrorCodes.EEXIST();
+    }
+    return createImpl(path, mode) == null ? -ErrorCodes.ENOENT() : 0;
+  }
+
+  @Override
   public int create(String path, @mode_t long mode, FuseFileInfo fi) {
-    Entry entry = createImpl(path, fi);
+    if (resolve(path) != null) {
+      return -ErrorCodes.EEXIST();
+    }
+    Entry entry = createImpl(path, mode);
 
     if (entry == null) {
       return -ErrorCodes.ENOENT();
@@ -806,13 +1088,22 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int open(String path, FuseFileInfo fi) {
-    // FIXME check for WRONLY/RDWR/TRUNC/DIRECTORY
-    Entry entry;
-    if ((fi.flags.intValue() & OpenFlags.O_CREAT.intValue()) == OpenFlags.O_CREAT.intValue()
-        && (fi.flags.intValue() & OpenFlags.O_TRUNC.intValue()) == OpenFlags.O_TRUNC.intValue()) {
-      entry = createImpl(path, fi);
-    } else {
-      entry = resolve(path);
+    int flags = fi.flags.intValue();
+    boolean create = (flags & OpenFlags.O_CREAT.intValue()) != 0;
+    boolean exclusive = (flags & OpenFlags.O_EXCL.intValue()) != 0;
+    boolean truncate = (flags & OpenFlags.O_TRUNC.intValue()) != 0;
+    Entry entry = resolve(path);
+    if (entry != null && create && exclusive) {
+      return -ErrorCodes.EEXIST();
+    }
+    if (entry == null && create) {
+      // open(2) does not carry a mode through this callback; newly created files use 0666.
+      entry = createImpl(path, 0666);
+    } else if (entry != null && truncate) {
+      if (entry.isDirectory()) {
+        return -ErrorCodes.EISDIR();
+      }
+      entry = createImpl(path, 0666);
     }
 
     if (entry == null) {
@@ -826,7 +1117,10 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int release(String path, FuseFileInfo fi) {
-    fileHandleEntries.remove(fi.fh.intValue());
+    Entry released = fileHandleEntries.remove(fi.fh.intValue());
+    if (released instanceof WriteFileEntry writeFile) {
+      writeFile.released();
+    }
 
     /*
     // Maybe do this, maybe not
@@ -859,18 +1153,13 @@ public class FuseCAS extends FuseStubFS {
 
     WriteFileEntry writeFileEntry = (WriteFileEntry) entry;
     int size = (int) bufSize;
-
     byte[] bytes = new byte[size];
-
-    // need to consider the offset as well...
-
     buf.get(0, bytes, 0, size);
-
-    writeFileEntry.write(ByteString.copyFrom(bytes), offset);
-
-    // FIXME flush? release? filesystem? block store?
-
-    return size;
+    try (FileChannel channel = FileChannel.open(writeFileEntry.path, StandardOpenOption.WRITE)) {
+      return channel.write(ByteBuffer.wrap(bytes), offset);
+    } catch (IOException e) {
+      return -ErrorCodes.EIO();
+    }
   }
 
   @Override
@@ -878,6 +1167,45 @@ public class FuseCAS extends FuseStubFS {
     // noop
 
     return 0;
+  }
+
+  @Override
+  public int fsync(String path, int isdatasync, FuseFileInfo fi) {
+    Entry entry = fileHandleEntries.get(fi.fh.intValue());
+    if (entry == null) {
+      return -ErrorCodes.ENOENT();
+    }
+    if (!(entry instanceof WriteFileEntry writeFile)) {
+      return 0;
+    }
+    try (FileChannel channel = FileChannel.open(writeFile.path, StandardOpenOption.WRITE)) {
+      channel.force(isdatasync == 0);
+      return 0;
+    } catch (IOException e) {
+      return -ErrorCodes.EIO();
+    }
+  }
+
+  @Override
+  public int statfs(String path, Statvfs stat) {
+    try {
+      FileStore fileStore = Files.getFileStore(scratchPath);
+      long blockSize = 4096;
+      long blocks = fileStore.getTotalSpace() / blockSize;
+      long available = fileStore.getUsableSpace() / blockSize;
+      stat.f_bsize.set(blockSize);
+      stat.f_frsize.set(blockSize);
+      stat.f_blocks.set(blocks);
+      stat.f_bfree.set(available);
+      stat.f_bavail.set(available);
+      stat.f_files.set(blocks);
+      stat.f_ffree.set(available);
+      stat.f_favail.set(available);
+      stat.f_namemax.set(255);
+      return 0;
+    } catch (IOException e) {
+      return -ErrorCodes.EIO();
+    }
   }
 
   @Override
@@ -892,39 +1220,33 @@ public class FuseCAS extends FuseStubFS {
       return -ErrorCodes.EISDIR();
     }
 
-    ByteString content;
-    if (entry.isWritable()) {
-      WriteFileEntry writeFileEntry = (WriteFileEntry) entry;
-
-      content = writeFileEntry.content;
-    } else {
+    Path localPath = entry.isWritable() ? ((WriteFileEntry) entry).path : ((FileEntry) entry).path;
+    if (localPath == null) {
       FileEntry fileEntry = (FileEntry) entry;
-
-      try {
-        content =
-            ByteString.readFrom(
-                inputStreamFactory.newInput(Compressor.Value.IDENTITY, fileEntry.digest, 0));
+      if (fileEntry.digest.getSize() == 0) {
+        return 0;
+      }
+      // Compatibility for the standalone mount tool. Worker inputs always have a local path.
+      try (InputStream in =
+          inputStreamFactory.newInput(Compressor.Value.IDENTITY, fileEntry.digest, offset)) {
+        byte[] bytes = in.readNBytes((int) size);
+        buf.put(0, bytes, 0, bytes.length);
+        return bytes.length;
       } catch (IOException e) {
-        if (e.getCause() != null && e.getCause() instanceof InterruptedException) {
-          return -ErrorCodes.EINTR();
-        }
         return -ErrorCodes.EIO();
       }
-
-      Preconditions.checkState(fileEntry.digest.getSize() == content.size());
     }
-
-    int length = content.size();
-    if (offset < length) {
-      if (offset + size > length) {
-        size = length - offset;
+    try (FileChannel channel = FileChannel.open(localPath, StandardOpenOption.READ)) {
+      byte[] bytes = new byte[(int) size];
+      int read = channel.read(ByteBuffer.wrap(bytes), offset);
+      if (read < 0) {
+        return 0;
       }
-      byte[] bytes = content.substring((int) offset, (int) (offset + size)).toByteArray();
-      buf.put(0, bytes, 0, bytes.length);
-    } else {
-      size = 0;
+      buf.put(0, bytes, 0, read);
+      return read;
+    } catch (IOException e) {
+      return -ErrorCodes.EIO();
     }
-    return (int) size;
   }
 
   @Override
@@ -973,6 +1295,10 @@ public class FuseCAS extends FuseStubFS {
 
     Entry entry = resolve(path);
 
+    if (entry == null) {
+      return -ErrorCodes.ENOENT();
+    }
+
     if (entry.isDirectory()) {
       return -ErrorCodes.EISDIR();
     }
@@ -981,10 +1307,6 @@ public class FuseCAS extends FuseStubFS {
       return -ErrorCodes.EPERM();
     }
 
-    int size = (int) length;
-    WriteFileEntry writeFileEntry = (WriteFileEntry) entry;
-    writeFileEntry.write(ByteString.copyFrom(ByteBuffer.allocate(size)), off);
-
-    return 0;
+    return truncate(path, off + length);
   }
 }

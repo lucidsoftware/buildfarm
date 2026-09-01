@@ -32,6 +32,11 @@ import lombok.extern.java.Log;
 @Data
 @Log
 public class Worker {
+  public enum ExecFileSystemType {
+    CFC,
+    FUSE
+  }
+
   private int port = 8981;
   private boolean grpcChannelz = false;
   private GrpcMetrics grpcMetrics = new GrpcMetrics();
@@ -47,6 +52,7 @@ public class Worker {
   private int inputFetchStageWidth = 0;
   private int inputFetchDeadline = 60;
   private int reportResultStageWidth = 1;
+  private ExecFileSystemType execFileSystemType = ExecFileSystemType.CFC;
   private boolean linkExecFileSystem = true;
   private boolean linkInputDirectories = true;
   private List<String> linkedInputDirectories = Arrays.asList("^(?!external$).*$");

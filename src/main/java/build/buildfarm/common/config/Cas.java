@@ -11,12 +11,13 @@ public class Cas {
     FILESYSTEM,
     GRPC,
     MEMORY,
+    /** Legacy alias for FILESYSTEM plus worker.execFileSystemType=FUSE. */
     FUSE
   }
 
   private TYPE type = TYPE.FILESYSTEM;
 
-  // MEMORY/FILESYSTEM
+  // MEMORY/FILESYSTEM/FUSE
   private String path = "cache";
   private int hexBucketLevels = 0;
   private long maxSizeBytes = 0;

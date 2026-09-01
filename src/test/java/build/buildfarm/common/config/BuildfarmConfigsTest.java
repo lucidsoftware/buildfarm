@@ -484,4 +484,15 @@ public class BuildfarmConfigsTest {
     assertThrows(
         ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
   }
+
+  @Test
+  public void loadConfigs_withFuseExecFileSystem_shouldLoadSuccessfully() throws IOException {
+    Path configFile = tempDir.resolve("fuse.yaml");
+    Files.writeString(configFile, "worker:\n  execFileSystemType: FUSE\n");
+
+    BuildfarmConfigs configs = BuildfarmConfigs.loadConfigs(configFile);
+
+    assertEquals(Worker.ExecFileSystemType.FUSE, configs.getWorker().getExecFileSystemType());
+    assertEquals(Cas.TYPE.FILESYSTEM, configs.getWorker().getStorages().getFirst().getType());
+  }
 }
