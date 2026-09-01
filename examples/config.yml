@@ -134,6 +134,8 @@ worker:
   inputFetchStageWidth: 1
   inputFetchDeadline: 60
   reportResultStageWidth: 1
+  # FUSE projects eagerly staged local-CAS inputs without materializing an execroot tree.
+  execFileSystemType: CFC
   linkExecFileSystem: true
   linkInputDirectories: true
   linkedInputDirectories:

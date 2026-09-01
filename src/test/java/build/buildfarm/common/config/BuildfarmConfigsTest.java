@@ -1,5 +1,6 @@
 package build.buildfarm.common.config;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
 
@@ -73,5 +74,16 @@ public class BuildfarmConfigsTest {
     assertNotNull(configs);
     assertNotNull(configs.getServer());
     assertNotNull(configs.getBackplane());
+  }
+
+  @Test
+  public void loadConfigs_withFuseExecFileSystem_shouldLoadSuccessfully() throws IOException {
+    Path configFile = tempDir.resolve("fuse.yaml");
+    Files.writeString(configFile, "worker:\n  execFileSystemType: FUSE\n");
+
+    BuildfarmConfigs configs = BuildfarmConfigs.loadConfigs(configFile);
+
+    assertEquals(Worker.ExecFileSystemType.FUSE, configs.getWorker().getExecFileSystemType());
+    assertEquals(Cas.TYPE.FILESYSTEM, configs.getWorker().getStorages().getFirst().getType());
   }
 }

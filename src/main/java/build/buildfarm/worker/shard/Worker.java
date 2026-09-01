@@ -19,7 +19,6 @@ import static build.buildfarm.common.Claim.Stage.REPORT_RESULT_STAGE;
 import static build.buildfarm.common.config.Backplane.BACKPLANE_TYPE.SHARD;
 import static build.buildfarm.common.io.Utils.formatIOError;
 import static build.buildfarm.common.io.Utils.getUser;
-import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static java.util.concurrent.Executors.newSingleThreadExecutor;
@@ -30,14 +29,11 @@ import static java.util.logging.Level.SEVERE;
 import build.bazel.remote.execution.v2.Compressor;
 import build.buildfarm.backplane.Backplane;
 import build.buildfarm.cas.ContentAddressableStorage;
-import build.buildfarm.cas.ContentAddressableStorage.Blob;
 import build.buildfarm.cas.MemoryCAS;
 import build.buildfarm.cas.cfc.CASFileCache;
 import build.buildfarm.cas.cfc.DirectoryEntryCFC;
 import build.buildfarm.cas.cfc.LegacyDirectoryCFC;
 import build.buildfarm.common.BuildfarmExecutors;
-import build.buildfarm.common.DigestUtil;
-import build.buildfarm.common.DigestUtil.HashFunction;
 import build.buildfarm.common.Dispenser;
 import build.buildfarm.common.EmptyInputStreamFactory;
 import build.buildfarm.common.FailoverInputStreamFactory;
@@ -48,6 +44,7 @@ import build.buildfarm.common.ZstdDecompressingOutputStream.ZstdFixedBufferPool;
 import build.buildfarm.common.config.BuildfarmConfigs;
 import build.buildfarm.common.config.Cas;
 import build.buildfarm.common.config.GrpcMetrics;
+import build.buildfarm.common.config.Worker.ExecFileSystemType;
 import build.buildfarm.common.function.InterruptingConsumer;
 import build.buildfarm.common.grpc.Retrier;
 import build.buildfarm.common.grpc.Retrier.Backoff;
@@ -93,7 +90,6 @@ import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.longrunning.Operation;
-import com.google.protobuf.ByteString;
 import com.google.protobuf.Duration;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
@@ -274,43 +270,20 @@ public final class Worker extends LoggingMain {
 
   @SuppressWarnings("SynchronizationOnLocalVariableOrMethodParameter")
   private ExecFileSystem createFuseExecFileSystem(
-      InputStreamFactory remoteInputStreamFactory, ContentAddressableStorage storage) {
-    InputStreamFactory storageInputStreamFactory =
-        (compressor, digest, offset) -> {
-          checkArgument(compressor == Compressor.Value.IDENTITY);
-          return storage.get(digest).getData().substring((int) offset).newInput();
-        };
-
-    InputStreamFactory localPopulatingInputStreamFactory =
-        (compressor, blobDigest, offset) -> {
-          // FIXME use write
-          ByteString content =
-              ByteString.readFrom(
-                  remoteInputStreamFactory.newInput(compressor, blobDigest, offset));
-
-          // needs some treatment for compressor
-          if (offset == 0) {
-            // extra computations
-            Blob blob =
-                new Blob(content, new DigestUtil(HashFunction.get(blobDigest.getDigestFunction())));
-            // here's hoping that our digest matches...
-            try {
-              storage.put(blob);
-            } catch (InterruptedException e) {
-              throw new IOException(e);
-            }
-          }
-
-          return content.newInput();
-        };
+      CASFileCache storage,
+      ExecutorService fetchService,
+      ExecutorService removeDirectoryService,
+      ExecutorService accessRecorder) {
+    Path mountPath = root.resolve("execroots");
+    Path scratchPath = root.resolve("fuse-scratch");
     return new FuseExecFileSystem(
-        root,
-        new FuseCAS(
-            root,
-            new EmptyInputStreamFactory(
-                new FailoverInputStreamFactory(
-                    storageInputStreamFactory, localPopulatingInputStreamFactory))),
-        storage);
+        mountPath,
+        scratchPath,
+        new FuseCAS(mountPath, scratchPath, storage),
+        storage,
+        fetchService,
+        removeDirectoryService,
+        accessRecorder);
   }
 
   private @Nullable UserPrincipal getOwner(String name, FileSystem fileSystem)
@@ -336,7 +309,17 @@ public final class Worker extends LoggingMain {
       List<String> ownerNames)
       throws ConfigurationException {
     checkState(storage != null, "no exec fs cas specified");
-    if (storage instanceof CASFileCache cfc) {
+    boolean fuseExecFileSystem =
+        configs.getWorker().getExecFileSystemType() == ExecFileSystemType.FUSE
+            || configs.getWorker().getStorages().getFirst().getType() == Cas.TYPE.FUSE;
+    if (fuseExecFileSystem) {
+      checkState(storage instanceof CASFileCache, "FUSE execroots require a filesystem CAS");
+      checkState(
+          ownerNames.isEmpty() && Strings.isNullOrEmpty(ownerName),
+          "FUSE execroots do not support execOwner/execOwners");
+      return createFuseExecFileSystem(
+          (CASFileCache) storage, fetchService, removeDirectoryService, accessRecorder);
+    } else if (storage instanceof CASFileCache cfc) {
       FileSystem fileSystem = cfc.getRoot().getFileSystem();
       PoolResource execOwnerIndexResource = null;
       ImmutableMap<String, UserPrincipal> owners = ImmutableMap.of();
@@ -368,10 +351,8 @@ public final class Worker extends LoggingMain {
 
       return createCFCExecFileSystem(
           removeDirectoryService, accessRecorder, fetchService, cfc, owners);
-    } else {
-      // FIXME not the only fuse backing capacity...
-      return createFuseExecFileSystem(remoteInputStreamFactory, storage);
     }
+    throw new ConfigurationException("execution requires a filesystem CAS");
   }
 
   private CASFileCache createStorages(
@@ -413,12 +394,14 @@ public final class Worker extends LoggingMain {
       default:
         throw new IllegalArgumentException("Invalid cas type specified");
       case MEMORY:
-      case FUSE: // FIXME have FUSE refer to a name for storage backing, and topo
         return new MemoryCAS(cas.getMaxSizeBytes(), this::onStoragePut, delegate);
       case GRPC:
         checkState(delegate == null, "grpc cas cannot delegate");
         return createGrpcCAS(cas);
+      case FUSE:
       case FILESYSTEM:
+        // FUSE is retained as a compatibility alias. New configurations should select the
+        // presentation with worker.execFileSystemType and keep this storage type FILESYSTEM.
         return createCASFileCache(
             root.resolve(cas.getValidPath(root)),
             cas,
