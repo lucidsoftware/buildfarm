@@ -353,17 +353,31 @@ public class Executor {
     log.log(Level.FINER, format("Executor: Operation %s Executing command", executionName));
 
     Code statusCode;
-    WorkFilesContext persistentWorkerFilesContext = getPersistentWorkerFilesContext();
+    boolean observationOnly =
+        BuildfarmConfigs.getInstance().getWorker().getPersistentWorkers().isObservationOnly();
+    WorkFilesContext candidate;
+    try {
+      candidate = getPersistentWorkerFilesContext();
+    } catch (RuntimeException error) {
+      if (!observationOnly) {
+        throw error;
+      }
+      log.warning("PW observation eligibility failed: " + error.getClass().getSimpleName());
+      candidate = null;
+    }
+    WorkFilesContext persistentWorkerFilesContext = candidate;
     try {
       statusCode =
-          executeWithPoolFallback(
-              timeout,
-              (usePersistentWorker, remaining) ->
-                  executeAttempt(
-                      limits,
-                      policies,
-                      remaining,
-                      usePersistentWorker ? persistentWorkerFilesContext : null));
+          observationOnly
+              ? executeObserved(limits, policies, timeout, persistentWorkerFilesContext)
+              : executeWithPoolFallback(
+                  timeout,
+                  (usePersistentWorker, remaining) ->
+                      executeAttempt(
+                          limits,
+                          policies,
+                          remaining,
+                          usePersistentWorker ? persistentWorkerFilesContext : null));
     } catch (IOException e) {
       log.log(Level.SEVERE, format("error executing %s", executionName), e);
       executionContext.poller.pause();
@@ -472,6 +486,69 @@ public class Executor {
     }
   }
 
+  @VisibleForTesting
+  Code executeObserved(
+      ResourceLimits limits,
+      Iterable<ExecutionPolicy> policies,
+      Duration timeout,
+      @Nullable WorkFilesContext files)
+      throws IOException, InterruptedException {
+    double sampleRate =
+        BuildfarmConfigs.getInstance()
+            .getWorker()
+            .getPersistentWorkers()
+            .getObservationSampleRate();
+    PersistentWorkerObservation observation = null;
+    if (files != null
+        && PersistentWorkerObservation.shouldSample(
+            executionContext.operation.getName(), sampleRate)) {
+      long started = System.nanoTime();
+      try {
+        observation =
+            new PersistentWorkerObservation(executionContext, workerContext.getName(), sampleRate);
+        try (PreparedCommand prepared = prepareCommand(policies, true)) {
+          ImmutableMap.Builder<String, String> environment = ImmutableMap.builder();
+          Map<String, String> values = new HashMap<>();
+          for (EnvironmentVariable variable :
+              executionContext.command.getEnvironmentVariablesList()) {
+            values.put(variable.getName(), variable.getValue());
+          }
+          values.putAll(limits.extraEnvironmentVariables);
+          environment.putAll(values);
+          var candidate =
+              PersistentExecutor.prepareWorker(
+                  files,
+                  executionContext.operation.getName(),
+                  prepared.arguments(),
+                  environment.build(),
+                  PersistentExecutor.defaultWorkRootsDir,
+                  workerContext.persistentWorkerResources(executionContext.command));
+          observation.key(candidate.key());
+        }
+      } catch (Exception error) {
+        if (observation != null) {
+          observation.keyError(error);
+        }
+      }
+      if (observation != null) {
+        observation.start(System.nanoTime() - started);
+      }
+    }
+    String status = "ERROR";
+    try {
+      Code result = executeAttempt(limits, policies, timeout, null);
+      status = result.name();
+      return result;
+    } catch (InterruptedException e) {
+      status = "INTERRUPTED";
+      throw e;
+    } finally {
+      if (observation != null) {
+        observation.finish(status, executionContext.executeResponse.getResult().getExitCode());
+      }
+    }
+  }
+
   @FunctionalInterface
   interface ExecutionAttempt {
     Code run(boolean usePersistentWorker, Duration timeout)
@@ -505,69 +582,16 @@ public class Executor {
       @Nullable WorkFilesContext persistentWorkerFilesContext)
       throws IOException, InterruptedException {
     String executionName = executionContext.operation.getName();
-    Command command = executionContext.command;
-    Path workingDirectory = executionContext.execDir;
-    if (!command.getWorkingDirectory().isEmpty()) {
-      workingDirectory = workingDirectory.resolve(command.getWorkingDirectory());
-    }
-
-    // similar to the policy selection here
-    Map<String, Interpolator> interpolations =
-        createInterpolations(
-            executionContext.claim, executionContext.queueEntry.getPlatform().getPropertiesList());
-
-    ImmutableList.Builder<String> arguments = ImmutableList.builder();
-
-    // Apply custom PRIORITIZED execution policies BEFORE built-in wrappers
-    for (ExecutionPolicy policy : policies) {
-      if (policy.isPrioritized() && policy.getExecutionWrapper() != null) {
-        arguments.addAll(transformWrapper(policy.getExecutionWrapper(), interpolations));
-      }
-    }
-
-    UserPrincipal execOwner = null;
-    if (executionContext.claim.get(UserPrincipalLease.RESOURCE_NAME)
-        instanceof UserPrincipalLease ownerLease) {
-      execOwner = ownerLease.owner();
-    }
-
     Code statusCode;
-    boolean usePersistentWorker = persistentWorkerFilesContext != null;
-    try (IOResource resource =
-        workerContext.limitExecution(
-            executionName,
-            execOwner,
-            arguments,
-            executionContext.command,
-            workingDirectory,
-            usePersistentWorker)) {
-      // Apply all other custom execution policies AFTER built-in wrappers
-      for (ExecutionPolicy policy : policies) {
-        if (!policy.isPrioritized() && policy.getExecutionWrapper() != null) {
-          arguments.addAll(transformWrapper(policy.getExecutionWrapper(), interpolations));
-        }
-      }
-
-      // Windows requires that relative command programs are absolutized
-      Iterator<String> argumentItr = command.getArgumentsList().iterator();
-      boolean absolutizeExe =
-          BuildfarmConfigs.getInstance().getWorker().isAbsolutizeCommandProgram()
-              && argumentItr.hasNext()
-              && Files.exists(workingDirectory.resolve(command.getArguments(0)));
-      if (absolutizeExe) {
-        Path exe =
-            workingDirectory.resolve(
-                argumentItr.next()); // Get first element, this is the executable
-        arguments.add(exe.toAbsolutePath().normalize().toString());
-      }
-      argumentItr.forEachRemaining(arguments::add);
-
+    try (PreparedCommand prepared =
+        prepareCommand(policies, persistentWorkerFilesContext != null)) {
+      IOResource resource = prepared.resource();
       statusCode =
           executeCommand(
               executionName,
-              workingDirectory,
-              arguments.build(),
-              command.getEnvironmentVariablesList(),
+              prepared.workingDirectory(),
+              prepared.arguments(),
+              executionContext.command.getEnvironmentVariablesList(),
               limits,
               resource,
               persistentWorkerFilesContext,
@@ -597,6 +621,84 @@ public class Executor {
       }
     }
     return statusCode;
+  }
+
+  private record PreparedCommand(
+      ImmutableList<String> arguments, Path workingDirectory, IOResource resource)
+      implements AutoCloseable {
+    public void close() throws IOException {
+      resource.close();
+    }
+  }
+
+  private PreparedCommand prepareCommand(
+      Iterable<ExecutionPolicy> policies, boolean usePersistentWorker) throws IOException {
+    String executionName = executionContext.operation.getName();
+    Command command = executionContext.command;
+    Path workingDirectory = executionContext.execDir;
+    if (!command.getWorkingDirectory().isEmpty()) {
+      workingDirectory = workingDirectory.resolve(command.getWorkingDirectory());
+    }
+
+    // similar to the policy selection here
+    Map<String, Interpolator> interpolations =
+        createInterpolations(
+            executionContext.claim, executionContext.queueEntry.getPlatform().getPropertiesList());
+
+    ImmutableList.Builder<String> arguments = ImmutableList.builder();
+
+    // Apply custom PRIORITIZED execution policies BEFORE built-in wrappers
+    for (ExecutionPolicy policy : policies) {
+      if (policy.isPrioritized() && policy.getExecutionWrapper() != null) {
+        arguments.addAll(transformWrapper(policy.getExecutionWrapper(), interpolations));
+      }
+    }
+
+    UserPrincipal execOwner = null;
+    if (executionContext.claim.get(UserPrincipalLease.RESOURCE_NAME)
+        instanceof UserPrincipalLease ownerLease) {
+      execOwner = ownerLease.owner();
+    }
+
+    IOResource resource =
+        workerContext.limitExecution(
+            executionName,
+            execOwner,
+            arguments,
+            executionContext.command,
+            workingDirectory,
+            usePersistentWorker);
+    try {
+      // Apply all other custom execution policies AFTER built-in wrappers
+      for (ExecutionPolicy policy : policies) {
+        if (!policy.isPrioritized() && policy.getExecutionWrapper() != null) {
+          arguments.addAll(transformWrapper(policy.getExecutionWrapper(), interpolations));
+        }
+      }
+
+      // Windows requires that relative command programs are absolutized
+      Iterator<String> argumentItr = command.getArgumentsList().iterator();
+      boolean absolutizeExe =
+          BuildfarmConfigs.getInstance().getWorker().isAbsolutizeCommandProgram()
+              && argumentItr.hasNext()
+              && Files.exists(workingDirectory.resolve(command.getArguments(0)));
+      if (absolutizeExe) {
+        Path exe =
+            workingDirectory.resolve(
+                argumentItr.next()); // Get first element, this is the executable
+        arguments.add(exe.toAbsolutePath().normalize().toString());
+      }
+      argumentItr.forEachRemaining(arguments::add);
+
+      return new PreparedCommand(arguments.build(), workingDirectory, resource);
+    } catch (RuntimeException | Error e) {
+      try {
+        resource.close();
+      } catch (IOException cleanup) {
+        e.addSuppressed(cleanup);
+      }
+      throw e;
+    }
   }
 
   /**

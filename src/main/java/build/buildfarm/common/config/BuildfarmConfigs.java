@@ -234,6 +234,12 @@ public final class BuildfarmConfigs {
     if (settings == null) {
       throw new ConfigurationException("persistentWorkers must be configured");
     }
+    if (!Double.isFinite(settings.getObservationSampleRate())
+        || settings.getObservationSampleRate() < 0
+        || settings.getObservationSampleRate() > 1) {
+      throw new ConfigurationException(
+          "persistentWorkers.observationSampleRate must be between zero and one");
+    }
     if (settings.getPoolWaitTimeoutMillis() < 0) {
       throw new ConfigurationException(
           "persistentWorkers.poolWaitTimeoutMillis must not be negative");

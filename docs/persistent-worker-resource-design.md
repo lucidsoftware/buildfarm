@@ -89,6 +89,86 @@ the execution directory is preserved when termination cannot be confirmed.
 Shutdown drains the execution pipeline and closes the PW pool before dismantling the shared
 cgroup hierarchy. Existing native process cleanup stays on its per-action path.
 
+## Observation-only key tracing
+
+Enable this on a controlled cohort of execution workers:
+
+```yaml
+worker:
+  persistentWorkerActionMnemonicAllowlist:
+    - ScalaCompile
+    - ScalaCheckDeps
+  persistentWorkers:
+    observationOnly: true
+    observationSampleRate: 1.0
+```
+
+Clients must use `--experimental_remote_mark_tool_inputs`. The existing mnemonic and marked
+executable checks still determine which actions have a traceable PW key. Missing markings
+produce `unmarked_executable` eligibility counts, not invented compatibility keys. Tracing
+covers executed actions, not remote cache hits or requests never dispatched to these workers.
+
+Observation mode always executes actions through the ordinary native/container path with its
+normal resource handling, including unsampled actions and key-preparation failures. It does
+not obtain a PW, initialize the pool, copy tools into PW directories, or create PW cgroups.
+The candidate key uses the same command preparation, environment overrides, tool hashes, and
+resource profile as real PW execution. Its PW launch wrappers are prepared separately from
+the actual native wrappers, so per-operation native cgroup paths do not fragment the key.
+The mode defaults off and is read from worker configuration at startup.
+
+The logger `build.buildfarm.worker.PersistentWorkerObservation` emits INFO messages prefixed
+`PW_OBSERVATION ` followed by a single JSON object. Preserve these INFO messages in your log
+collection. There is one `start` and one `finish` record per sampled eligible action during
+normal operation; process termination can leave unmatched starts. No per-key Prometheus
+series or unbounded in-process key registry is added.
+
+Both records include:
+
+- `schema_version` (currently 1), `event`, UTC `timestamp`, `worker`, `worker_session`,
+  `operation`, unique `attempt`, `invocation`, `mnemonic`, `host_architecture`, and `sample_rate`.
+- `action_architecture` when the command has the `cpu-architecture` platform property.
+- `queued_at`, `worker_started_at`, and `execution_stage_started_at` when present in action
+  metadata. These are the existing execution metadata timestamps; worker start is not a new
+  measurement of queue insertion or CPU reservation.
+- `key`: a SHA-256 fingerprint of all current WorkerKey equality fields. Environment keys
+  are sorted before hashing. Raw arguments, environment values, tool paths, and key objects
+  are not logged by the observation logger.
+- `tools_hash`, `environment_hash`, `launch_hash`, `resource_profile_hash`, and `work_root_hash`
+  to help distinguish tool changes from configuration fragmentation.
+- `key_status` (`computed` or `error`) and `observation_preparation_ms`. On preparation failure,
+  `key` is absent and `error_type` contains only the exception class, not its message.
+
+Finish records also include `status`, `exit_code`, and `native_attempt_ms`. Native attempt time
+includes native launch/resource preparation and cleanup; it is not compiler-only CPU time.
+`status=OK` is a successful executor status; check `exit_code` for action success. Trace emission
+is best effort: a logging failure does not fail an action. Retain logs externally to analyze
+across worker restarts. Observation has CPU/logging overhead, recorded in part by preparation
+latency; use observation-disabled runs for final performance comparisons.
+
+Use `(worker_session, attempt)` to join starts and finishes, and group by `(worker, key)`
+to estimate reuse gaps and overlapping demand. An operation retry gets a new attempt ID.
+Compare component hashes before grouping across workers with different work-root or cgroup
+layouts: the exact compatibility fingerprint intentionally includes those configuration fields.
+
+At sample rate 1 every eligible action is traced. Lower rates sample deterministically by
+operation identity and still execute all actions normally. Sampling misses intervening requests:
+do not treat sampled interarrival gaps or peak concurrency as the true workload. Prefer full
+capture on a small representative cohort when sizing idle timeouts and per-key pool limits.
+
+For plain-text worker logs, extract the JSON messages with:
+
+```sh
+sed -n 's/^.*PW_OBSERVATION //p' worker.log > pw-observations.jsonl
+jq -r 'select(.event == "finish" and .key_status == "computed") |
+  [.worker, .operation, .key, .mnemonic, .native_attempt_ms, .exit_code] | @csv' \
+  pw-observations.jsonl
+```
+
+If the deployment wraps log messages in JSON, extract the message field first. PW request,
+process-start, and pool metrics should not increase from these observed actions; eligibility
+metrics still report candidate decisions. Setting `observationOnly: false` allows actual PWs
+for eligible marked actions, so it is an execution-mode change, not merely a logging switch.
+
 ## Validation
 
 Local tests cover stable resource profiles, failed launches, reuse across operations,

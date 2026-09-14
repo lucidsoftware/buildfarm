@@ -173,6 +173,9 @@ worker:
   persistentWorkerActionMnemonicAllowlist:
   - '*'
   persistentWorkers:
+    # Trace compatible keys while executing every action normally (no PW pool).
+    observationOnly: false
+    observationSampleRate: 1.0
     # Fall back to native execution after this pool wait; zero means no waiting.
     poolWaitTimeoutMillis: 1000
     maxWorkersPerKey: 6

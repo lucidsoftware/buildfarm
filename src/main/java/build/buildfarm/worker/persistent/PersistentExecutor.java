@@ -155,56 +155,14 @@ public class PersistentExecutor {
       WorkerResources.Profile resourceProfile,
       RequestCtx.Execution execution)
       throws IOException, InterruptedException {
-    // Pull out persistent worker start command from the overall action request
-
-    log.log(Level.FINE, "executeCommandOnPersistentWorker[" + operationName + "]");
-    String persistentWorkerInitCmd = generatePersistentWorkerCommand(argsList);
-    ImmutableList<String> initCmd = parseInitCmd(persistentWorkerInitCmd, argsList);
-
-    String executionName = getExecutionName(argsList);
-    if (executionName.isEmpty()) {
-      log.log(Level.SEVERE, "Invalid Argument: " + argsList);
-      return Code.INVALID_ARGUMENT;
-    }
-
-    // TODO revisit why this was necessary in the first place
-    // (@wiwa) I believe the reason has to do with JavaBuilder workers not relying on env vars,
-    // as compared to rules_scala, only reading info from the argslist of each command.
-    // That would mean the Java worker keys should be invariant to the env vars we see.
-    ImmutableMap<String, String> env;
-    if (executionName.equals(JAVAC_EXEC_NAME)) {
-      env = ImmutableMap.of();
-    } else {
-      env = envVars;
-    }
-
-    int requestArgsIdx = initCmd.size();
-    ImmutableList<String> workerExecCmd = initCmd;
-    ImmutableList<String> workerInitArgs =
-        ImmutableList.<String>builder().add(PERSISTENT_WORKER_FLAG).build();
-    ImmutableList<String> requestArgs = argsList.subList(requestArgsIdx, argsList.size());
-
-    // Make Key
-
-    WorkerInputs workerFiles = WorkerInputs.from(context, requestArgs);
+    PreparedWorker prepared =
+        prepareWorker(context, operationName, argsList, envVars, workRootsDir, resourceProfile);
+    WorkerKey key = prepared.key();
+    WorkerInputs workerFiles = prepared.inputs();
+    ImmutableList<String> requestArgs = prepared.requestArgs();
+    ImmutableList<String> workerExecCmd = prepared.workerExecCmd();
+    ImmutableList<String> workerInitArgs = prepared.workerInitArgs();
     ProtoCoordinator requestCoordinator = getCoordinator();
-
-    Path binary = Path.of(workerExecCmd.getFirst());
-    if (!workerFiles.containsTool(binary) && !binary.isAbsolute()) {
-      throw new IllegalArgumentException(
-          "Binary wasn't a tool input nor an absolute path: " + binary);
-    }
-
-    WorkerKey key =
-        Keymaker.make(
-                context.opRoot,
-                workRootsDir,
-                workerExecCmd,
-                workerInitArgs,
-                env,
-                executionName,
-                workerFiles)
-            .withResourceProfile(resourceProfile);
 
     long persistentWorkerRequestStarted = PersistentWorkerMetrics.startTimer();
     long toolSetupStarted = PersistentWorkerMetrics.startTimer();
@@ -293,6 +251,75 @@ public class PersistentExecutor {
         .setStdoutRaw(response.getOutputBytes())
         .setStderrRaw(ByteString.copyFrom(stdErr, StandardCharsets.UTF_8));
     return requestCtx.timedOut() ? Code.DEADLINE_EXCEEDED : Code.OK;
+  }
+
+  /**
+   * Pure key preparation shared by observation and execution; does not create a pool or process.
+   */
+  public record PreparedWorker(
+      WorkerKey key,
+      WorkerInputs inputs,
+      ImmutableList<String> requestArgs,
+      ImmutableList<String> workerExecCmd,
+      ImmutableList<String> workerInitArgs) {}
+
+  public static PreparedWorker prepareWorker(
+      WorkFilesContext context,
+      String operationName,
+      ImmutableList<String> argsList,
+      ImmutableMap<String, String> envVars,
+      Path workRootsDir,
+      WorkerResources.Profile resourceProfile) {
+    // Pull out persistent worker start command from the overall action request
+
+    log.log(Level.FINE, "executeCommandOnPersistentWorker[" + operationName + "]");
+    String persistentWorkerInitCmd = generatePersistentWorkerCommand(argsList);
+    ImmutableList<String> initCmd = parseInitCmd(persistentWorkerInitCmd, argsList);
+
+    String executionName = getExecutionName(argsList);
+    if (executionName.isEmpty()) {
+      throw new IllegalArgumentException("Missing persistent worker executable name");
+    }
+
+    // TODO revisit why this was necessary in the first place
+    // (@wiwa) I believe the reason has to do with JavaBuilder workers not relying on env vars,
+    // as compared to rules_scala, only reading info from the argslist of each command.
+    // That would mean the Java worker keys should be invariant to the env vars we see.
+    ImmutableMap<String, String> env;
+    if (executionName.equals(JAVAC_EXEC_NAME)) {
+      env = ImmutableMap.of();
+    } else {
+      env = envVars;
+    }
+
+    int requestArgsIdx = initCmd.size();
+    ImmutableList<String> workerExecCmd = initCmd;
+    ImmutableList<String> workerInitArgs =
+        ImmutableList.<String>builder().add(PERSISTENT_WORKER_FLAG).build();
+    ImmutableList<String> requestArgs = argsList.subList(requestArgsIdx, argsList.size());
+
+    // Make Key
+
+    WorkerInputs workerFiles = WorkerInputs.from(context, requestArgs);
+
+    Path binary = Path.of(workerExecCmd.getFirst());
+    if (!workerFiles.containsTool(binary) && !binary.isAbsolute()) {
+      throw new IllegalArgumentException(
+          "Binary wasn't a tool input nor an absolute path: " + binary);
+    }
+
+    WorkerKey key =
+        Keymaker.make(
+                context.opRoot,
+                workRootsDir,
+                workerExecCmd,
+                workerInitArgs,
+                env,
+                executionName,
+                workerFiles)
+            .withResourceProfile(resourceProfile);
+
+    return new PreparedWorker(key, workerFiles, requestArgs, workerExecCmd, workerInitArgs);
   }
 
   private static ImmutableList<String> parseInitCmd(String cmdStr, ImmutableList<String> argsList) {

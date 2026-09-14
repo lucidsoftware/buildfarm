@@ -25,6 +25,9 @@ public class PersistentWorkers {
     ENABLED
   }
 
+  private boolean observationOnly = false;
+  private double observationSampleRate = 1.0;
+
   // Zero immediately falls back when the compatible pool is full.
   private long poolWaitTimeoutMillis = 1000;
   private int maxWorkersPerKey = 6;

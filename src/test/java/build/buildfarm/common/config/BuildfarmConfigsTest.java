@@ -84,6 +84,8 @@ public class BuildfarmConfigsTest {
     String yamlContent =
         "worker:\n"
             + "  persistentWorkers:\n"
+            + "    observationOnly: true\n"
+            + "    observationSampleRate: 0.25\n"
             + "    poolWaitTimeoutMillis: 250\n"
             + "    maxWorkersPerKey: 4\n"
             + "    maxWorkersTotal: 40\n"
@@ -96,6 +98,8 @@ public class BuildfarmConfigsTest {
 
     BuildfarmConfigs configs = BuildfarmConfigs.loadConfigs(configFile);
     PersistentWorkers settings = configs.getWorker().getPersistentWorkers();
+    assertEquals(true, settings.isObservationOnly());
+    assertEquals(0.25, settings.getObservationSampleRate(), 0.0);
     assertEquals(250L, settings.getPoolWaitTimeoutMillis());
     assertEquals(4, settings.getMaxWorkersPerKey());
     assertEquals(40, settings.getMaxWorkersTotal());
@@ -122,5 +126,15 @@ public class BuildfarmConfigsTest {
     settings.setPoolWaitTimeoutMillis(-1);
     assertThrows(
         ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
+  }
+
+  @Test
+  public void validatePersistentWorkers_rejectsInvalidObservationSampling() {
+    PersistentWorkers settings = new PersistentWorkers();
+    for (double rate : new double[] {-0.1, 1.1, Double.NaN, Double.POSITIVE_INFINITY}) {
+      settings.setObservationSampleRate(rate);
+      assertThrows(
+          ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
+    }
   }
 }

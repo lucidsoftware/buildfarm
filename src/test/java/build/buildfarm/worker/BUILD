@@ -35,6 +35,7 @@ java_test(
         "@buildfarm_maven//:com_github_jnr_jnr_ffi",
         "@buildfarm_maven//:com_github_serceman_jnr_fuse",
         "@buildfarm_maven//:com_google_guava_guava",
+        "@buildfarm_maven//:com_google_code_gson_gson",
         "@buildfarm_maven//:com_google_jimfs_jimfs",
         "@buildfarm_maven//:com_google_protobuf_protobuf_java",
         "@buildfarm_maven//:com_google_protobuf_protobuf_java_util",
