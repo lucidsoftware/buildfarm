@@ -26,7 +26,7 @@ import java.util.function.Consumer;
 import java.util.logging.Logger;
 import persistent.bazel.client.WorkerKey;
 
-/** Bounded, per-action log tracing; never retains keys globally or publishes per-key metrics. */
+/** Per-action observations feeding aggregate metrics and optional structured logs. */
 final class PersistentWorkerObservation {
   private static final Gson JSON = new Gson();
   private static final String SESSION = UUID.randomUUID().toString();
@@ -66,7 +66,16 @@ final class PersistentWorkerObservation {
   }
 
   PersistentWorkerObservation(ExecutionContext context, String worker, double sampleRate) {
-    this(context, worker, sampleRate, message -> logger.info("PW_OBSERVATION " + message));
+    this(
+        context,
+        worker,
+        sampleRate,
+        build.buildfarm.common.config.BuildfarmConfigs.getInstance()
+                .getWorker()
+                .getPersistentWorkers()
+                .isObservationLogEvents()
+            ? message -> logger.info("PW_OBSERVATION " + message)
+            : null);
   }
 
   PersistentWorkerObservation(
@@ -120,14 +129,21 @@ final class PersistentWorkerObservation {
   void start(long preparationNanos) {
     fields.addProperty("observation_preparation_ms", preparationNanos / 1_000_000.0);
     started = System.nanoTime();
+    PersistentWorkerObservationMetrics.instance()
+        .start(fields.has("key") ? fields.get("key").getAsString() : null);
     emit("start", null, null);
   }
 
   void finish(String status, int exitCode) {
+    PersistentWorkerObservationMetrics.instance()
+        .finish(status, exitCode, (System.nanoTime() - started) / 1_000_000_000.0);
     emit("finish", status, exitCode);
   }
 
   private void emit(String event, String status, Integer exitCode) {
+    if (sink == null) {
+      return;
+    }
     try {
       JsonObject record = fields.deepCopy();
       record.addProperty("event", event);

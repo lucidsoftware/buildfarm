@@ -169,6 +169,71 @@ process-start, and pool metrics should not increase from these observed actions;
 metrics still report candidate decisions. Setting `observationOnly: false` allows actual PWs
 for eligible marked actions, so it is an execution-mode change, not merely a logging switch.
 
+## Aggregate observation metrics
+
+Observation mode also exports Prometheus metrics without action/key labels. For metrics without
+JSON log events, configure:
+
+```yaml
+worker:
+  persistentWorkers:
+    observationOnly: true
+    observationSampleRate: 1.0
+    observationLogEvents: false
+    observationWindowSeconds: 900
+    observationMaxKeys: 10000
+```
+
+The window is measured using a monotonic clock. The tracker retains only SHA-256 key fingerprints
+and their last sampled start times, bounded by `observationMaxKeys`. The collector expires entries
+on scrapes as well as observations, so counts decline even when no new work arrives. Existing
+keys refresh their timestamps; when capacity is full, new keys are not stored. No background
+thread or timer is required. Configuration changes require a worker restart.
+
+| Metric | Meaning |
+| --- | --- |
+| `persistent_worker_observation_distinct_keys` | Distinct sampled candidate keys started on this worker within the rolling window. |
+| `persistent_worker_observation_tracking_incomplete` | 1 if any keys could not be tracked due to capacity within that window; distinct count is then a lower bound. |
+| `persistent_worker_observation_actions_total{outcome}` | Sampled observations classified as `new_key`, `seen_key`, `capacity_exceeded`, or `key_error`. |
+| `persistent_worker_observation_in_flight` | Sampled candidate native attempts currently running, including native preparation/cleanup. |
+| `persistent_worker_observation_key_arrival_gap_seconds` | Histogram of time between sampled starts for a retained key within the window. This is not completion-to-next-start idle time. |
+| `persistent_worker_observation_native_seconds{outcome}` | Histogram of native attempt durations, classified as `success`, `action_failure`, or `execution_error`. |
+| `persistent_worker_observation_window_seconds` | Configured window length. |
+| `persistent_worker_observation_key_capacity` | Configured maximum tracked keys. |
+
+`new_key` means absent from the current tracker, not necessarily never seen during worker lifetime.
+Repeated arrivals beyond the window are new observations and do not populate the arrival-gap
+histogram. The gap histogram is therefore window-truncated and cannot establish longer idle
+retention requirements without using a longer window. `capacity_exceeded` counts affected actions,
+not distinct omitted keys. Its rolling incompleteness indicator clears after an entire window
+without overflow. All values reset on restart. With sampling below 1, counts and gaps describe
+only sampled actions even when tracking is complete; use 1 for sizing analysis.
+
+Metrics initialize when observation mode first handles an action, even if no eligible action
+has arrived. Candidate metrics remain zero/absent for missing tool markers; use the existing
+eligibility counters to diagnose that. JSON logging can be disabled independently of these metrics.
+
+Useful raw-value queries (retain the target's `instance` label):
+
+```promql
+{__name__=~"persistent_worker_observation_distinct_keys|persistent_worker_observation_in_flight"}
+```
+
+```promql
+persistent_worker_observation_actions_total
+```
+
+```promql
+persistent_worker_observation_native_seconds_sum
+/
+persistent_worker_observation_native_seconds_count
+```
+
+The third query is cumulative average seconds by outcome since restart. Display
+`persistent_worker_observation_tracking_incomplete` separately as a completeness check.
+Do not sum distinct-key gauges and interpret them as fleet-wide unique keys: a compatible key
+can appear on several workers. These metrics characterize each worker's reuse opportunity.
+
 ## Validation
 
 Local tests cover stable resource profiles, failed launches, reuse across operations,

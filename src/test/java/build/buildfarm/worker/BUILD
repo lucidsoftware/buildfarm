@@ -41,6 +41,7 @@ java_test(
         "@buildfarm_maven//:com_google_protobuf_protobuf_java_util",
         "@buildfarm_maven//:com_google_truth_truth",
         "@buildfarm_maven//:io_grpc_grpc_api",
+        "@buildfarm_maven//:io_prometheus_simpleclient",
         "@buildfarm_maven//:io_grpc_grpc_context",
         "@buildfarm_maven//:io_grpc_grpc_core",
         "@buildfarm_maven//:io_grpc_grpc_protobuf",

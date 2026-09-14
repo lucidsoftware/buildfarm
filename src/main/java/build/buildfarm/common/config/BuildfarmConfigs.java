@@ -234,6 +234,12 @@ public final class BuildfarmConfigs {
     if (settings == null) {
       throw new ConfigurationException("persistentWorkers must be configured");
     }
+    if (settings.getObservationWindowSeconds() <= 0
+        || settings.getObservationWindowSeconds() > Long.MAX_VALUE / 1_000_000_000L
+        || settings.getObservationMaxKeys() <= 0) {
+      throw new ConfigurationException(
+          "Observation window and key capacity must be positive and bounded");
+    }
     if (!Double.isFinite(settings.getObservationSampleRate())
         || settings.getObservationSampleRate() < 0
         || settings.getObservationSampleRate() > 1) {

@@ -86,6 +86,9 @@ public class BuildfarmConfigsTest {
             + "  persistentWorkers:\n"
             + "    observationOnly: true\n"
             + "    observationSampleRate: 0.25\n"
+            + "    observationLogEvents: false\n"
+            + "    observationWindowSeconds: 60\n"
+            + "    observationMaxKeys: 100\n"
             + "    poolWaitTimeoutMillis: 250\n"
             + "    maxWorkersPerKey: 4\n"
             + "    maxWorkersTotal: 40\n"
@@ -100,6 +103,9 @@ public class BuildfarmConfigsTest {
     PersistentWorkers settings = configs.getWorker().getPersistentWorkers();
     assertEquals(true, settings.isObservationOnly());
     assertEquals(0.25, settings.getObservationSampleRate(), 0.0);
+    assertEquals(false, settings.isObservationLogEvents());
+    assertEquals(60L, settings.getObservationWindowSeconds());
+    assertEquals(100, settings.getObservationMaxKeys());
     assertEquals(250L, settings.getPoolWaitTimeoutMillis());
     assertEquals(4, settings.getMaxWorkersPerKey());
     assertEquals(40, settings.getMaxWorkersTotal());
@@ -136,5 +142,20 @@ public class BuildfarmConfigsTest {
       assertThrows(
           ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
     }
+  }
+
+  @Test
+  public void validatePersistentWorkers_rejectsUnboundedKeyTracking() {
+    PersistentWorkers settings = new PersistentWorkers();
+    settings.setObservationMaxKeys(0);
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
+    settings.setObservationMaxKeys(10);
+    settings.setObservationWindowSeconds(Long.MAX_VALUE);
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
+    settings.setObservationWindowSeconds(0);
+    assertThrows(
+        ConfigurationException.class, () -> BuildfarmConfigs.validatePersistentWorkers(settings));
   }
 }

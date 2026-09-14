@@ -493,6 +493,7 @@ public class Executor {
       Duration timeout,
       @Nullable WorkFilesContext files)
       throws IOException, InterruptedException {
+    PersistentWorkerObservationMetrics.instance();
     double sampleRate =
         BuildfarmConfigs.getInstance()
             .getWorker()
