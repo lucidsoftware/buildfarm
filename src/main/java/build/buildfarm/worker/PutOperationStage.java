@@ -31,26 +31,8 @@ public class PutOperationStage extends PipelineStage.NullStage {
           .labelNames("phase")
           .help("Wall time spent in each worker operation lifecycle phase.")
           .buckets(
-              0.001,
-              0.005,
-              0.01,
-              0.025,
-              0.05,
-              0.1,
-              0.25,
-              0.5,
-              1,
-              2.5,
-              5,
-              10,
-              30,
-              60,
-              120,
-              300,
-              600,
-              1200,
-              1800,
-              3600)
+              0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600,
+              1200, 1800, 3600)
           .register();
 
   private final InterruptingConsumer<Operation> onPut;
@@ -73,19 +55,10 @@ public class PutOperationStage extends PipelineStage.NullStage {
   public void put(ExecutionContext executionContext) throws InterruptedException {
     onPut.acceptInterruptibly(executionContext.operation);
     if (executionContext.operation.getDone()) {
+      ExecutedActionMetadata metadata = WorkerPerformanceMetrics.metadata(executionContext);
+      WorkerPerformanceMetrics.recordAction(executionContext, metadata);
+      observeOperationPhases(metadata);
       synchronized (this) {
-        ExecutedActionMetadata metadata;
-        if (executionContext.executeResponse.hasResult()) {
-          metadata = executionContext.executeResponse.getResult().getExecutionMetadata();
-        } else {
-          metadata =
-              executionContext
-                  .metadata
-                  .build()
-                  .getExecuteOperationMetadata()
-                  .getPartialExecutionMetadata();
-        }
-        observeOperationPhases(metadata);
         for (AverageTimeCostOfLastPeriod average : averagesWithinDifferentPeriods) {
           average.addOperation(metadata);
         }

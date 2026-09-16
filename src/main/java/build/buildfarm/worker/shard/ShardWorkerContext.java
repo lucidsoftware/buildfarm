@@ -67,6 +67,7 @@ import build.buildfarm.worker.MatchListener;
 import build.buildfarm.worker.RetryingMatchListener;
 import build.buildfarm.worker.UserPrincipalLease;
 import build.buildfarm.worker.WorkerContext;
+import build.buildfarm.worker.WorkerPerformanceMetrics;
 import build.buildfarm.worker.cgroup.Cpu;
 import build.buildfarm.worker.cgroup.Group;
 import build.buildfarm.worker.cgroup.Mem;
@@ -131,23 +132,7 @@ class ShardWorkerContext implements WorkerContext {
           .name("destroy_exec_root_seconds")
           .labelNames("outcome")
           .help("Wall time to destroy an action execution root.")
-          .buckets(
-              0.001,
-              0.005,
-              0.01,
-              0.025,
-              0.05,
-              0.1,
-              0.25,
-              0.5,
-              1,
-              2.5,
-              5,
-              10,
-              30,
-              60,
-              120,
-              300)
+          .buckets(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300)
           .register();
 
   private static BuildfarmConfigs configs = BuildfarmConfigs.getInstance();
@@ -881,8 +866,24 @@ class ShardWorkerContext implements WorkerContext {
       @Nullable UserPrincipal owner,
       WorkerExecutedMetadata.Builder workerExecutedMetadata)
       throws IOException, InterruptedException {
-    return execFileSystem.createExecDir(
-        operationName, directoriesIndex, inputRootDigest, command, owner, workerExecutedMetadata);
+    long startedNanos = System.nanoTime();
+    String outcome = "failure";
+    try {
+      Path execDir =
+          execFileSystem.createExecDir(
+              operationName,
+              directoriesIndex,
+              inputRootDigest,
+              command,
+              owner,
+              workerExecutedMetadata);
+      outcome = "success";
+      return execDir;
+    } finally {
+      long elapsedNanos = System.nanoTime() - startedNanos;
+      workerExecutedMetadata.putUsage("execroot_prepare_nanos", elapsedNanos);
+      WorkerPerformanceMetrics.observePrepare(outcome, elapsedNanos);
+    }
   }
 
   // might want to split for removeDirectory and decrement references to avoid removing for streamed
@@ -890,16 +891,14 @@ class ShardWorkerContext implements WorkerContext {
   @Override
   public void destroyExecDir(Path execDir) throws IOException, InterruptedException {
     long startedNanos = System.nanoTime();
-    String outcome = "success";
+    String outcome = "failure";
     try {
       execFileSystem.destroyExecDir(execDir);
-    } catch (IOException | InterruptedException e) {
-      outcome = "failure";
-      throw e;
+      outcome = "success";
     } finally {
-      destroyExecRootSeconds
-          .labels(outcome)
-          .observe((System.nanoTime() - startedNanos) / 1_000_000_000.0);
+      long elapsedNanos = System.nanoTime() - startedNanos;
+      destroyExecRootSeconds.labels(outcome).observe(elapsedNanos / 1_000_000_000.0);
+      WorkerPerformanceMetrics.recordCleanup(execDir, outcome, elapsedNanos);
     }
   }
 
