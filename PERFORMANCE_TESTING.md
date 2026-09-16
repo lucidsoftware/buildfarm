@@ -19,7 +19,7 @@ bazel build //src/main/java/build/buildfarm:buildfarm-shard-worker
 
 Use your normal worker configuration on the before branch. On the after branch, set
 `worker.execFileSystemType: FUSE` and retain `FILESYSTEM` CAS storage. The after branch still eagerly
-stages input blobs in local CAS. FUSE requires the host's FUSE setup and does not support
+stages input blobs in local CAS. FUSE requires the host's FUSE setup, including `libfuse.so.2` (FUSE 3 alone is insufficient), and does not support
 `execOwner`/`execOwners`. The baseline does not recognize `execFileSystemType`; do not add it there.
 
 Add a Prometheus scrape target label `variant="before"` or `variant="fuse"` to distinguish cohorts.
@@ -140,3 +140,24 @@ saturated concurrency. Include metadata-heavy, large-input, output-heavy, and CP
 Separate first-mount runs from steady state (FUSE unmounts after 10 idle seconds). Pair stage metrics
 with client build duration, host/action/worker CPU and memory, disk I/O, and JVM GC. A smaller
 InputFetch alone is not evidence of a net gain.
+
+## Validation
+
+Both branch worker binaries were built with the build command above. Both worker and shard test
+suites passed. On the FUSE branch, tests also ran with `--config=fuse`, including the mounted
+filesystem smoke test, callback exception/delegation tests, and metrics accounting tests.
+
+```sh
+# Before branch
+bazel test //src/test/java/build/buildfarm/worker:tests \
+  //src/test/java/build/buildfarm/worker/shard:tests --test_output=errors
+
+# FUSE branch, on a host providing libfuse.so.2 and /dev/fuse
+bazel test //src/test/java/build/buildfarm/worker:tests \
+  //src/test/java/build/buildfarm/worker/shard:tests --config=fuse --test_output=errors
+```
+
+For validation on the development host, `libfuse2t64` was downloaded and extracted under `/tmp`
+and its library directory passed via `--test_env=LD_LIBRARY_PATH=...`; no system package was
+installed. The mounted smoke test is conditional on `/dev/fuse` and does not replace running
+representative builds under load. No before/after performance results have been collected yet.
