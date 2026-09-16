@@ -106,7 +106,44 @@ Gauge for the number of execution slots used on each worker
 
 **execution_time_ms**
 
-Histogram for the execution time on a worker (in milliseconds)
+Histogram for elapsed execution-stage time on a worker (in milliseconds), labeled
+by `mnemonic` from action request metadata. Missing mnemonics use `unknown`.
+The timer includes setup, cleanup, and downstream handoff waiting; it is not CPU
+time. Existing timing boundaries and buckets are unchanged. Sum across mnemonics
+to recover aggregate values.
+
+**action_cpu_seconds_total**
+
+Counter for measured CPU seconds consumed by native actions, labeled by `mnemonic`
+(with `unknown` for missing metadata). Each action contributes the difference
+between its final and starting cgroup `cpu.usage_usec` samples, divided by
+1,000,000. Usage is summed across cores, so a multithreaded action can consume more
+CPU seconds than elapsed seconds. Failed, timed-out, and canceled native actions
+contribute when samples are available. For timeouts, the final sample is taken at
+the timeout boundary, before resource cleanup.
+
+CPU accounting must be available on the worker (the current implementation samples
+cgroups when core limiting is enabled). Persistent-worker and Docker execution
+paths do not contribute. Missing, negative, or reset samples are omitted, rather
+than reported as zero consumption. Observations are recorded when execution ends,
+so active actions have not yet contributed their usage.
+
+To rank mnemonics by measured CPU consumption over an hour:
+
+```promql
+topk(10, sum by (mnemonic) (increase(action_cpu_seconds_total[1h])))
+```
+
+To rank mnemonics by elapsed execution-stage seconds over the same interval:
+
+```promql
+topk(10, sum by (mnemonic) (increase(execution_time_ms_sum[1h])) / 1000)
+```
+
+Only these two metrics have the mnemonic dimension. Each worker creates label
+values as observed: approximately 90 counter label sets for 90 mnemonics, while
+the histogram additionally exports buckets, sum, and count per mnemonic. Backend
+creation-timestamp series, if collected, add to that total.
 
 **execution_stall_time_ms**
 
