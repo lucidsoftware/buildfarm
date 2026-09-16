@@ -5,11 +5,17 @@
 | Variant | Branch | Base |
 | --- | --- | --- |
 | Before, no FUSE | `bfreestone-perf-before-fuse` | `origin/lucid` at `71af06e93c15d0dc6ab06239697781dc68e9d417` |
-| After, FUSE | `bfreestone-perf-with-fuse` | `bfreestone-fuse` at `06cb9cef252e8fb58aa5ce9a33b74c80c9f290f0` |
+| After, FUSE | `bfreestone-perf-with-fuse` | `bfreestone-perf-before-fuse` at `6da6cc66b47e3311f95ce44d248cf95ec38e01aa` |
 
-These deliberately retain the requested bases. Lucid also contains CAS and persistent-worker
-changes absent from the FUSE base: this measures the two builds, not the isolated effect of FUSE.
-The FUSE branch includes Lucid's lifecycle histogram commit before the shared instrumentation.
+Both variants now share the exact Lucid base and shared performance instrumentation. The after
+branch adds the FUSE implementation cherry-picked from `06cb9cef`, its callback metrics, and
+conflict resolutions retaining Lucid's configuration docs and tests. CAS and persistent-worker
+implementations are identical across the two branches. The original `bfreestone-fuse` branch is
+unchanged and remains separate for upstream work.
+
+The previous version of `bfreestone-perf-with-fuse` (`994981f4`) used the older upstream-based
+FUSE branch as its base. Use the rebuilt branch for comparable runs; the testing guide in the
+unchanged before branch describes that earlier arrangement.
 
 Build either branch with:
 
@@ -72,8 +78,8 @@ Logging is enabled for these experiment branches. Disable records (keeping Prome
 with JVM option `-Dbuildfarm.performance.logActions=false`, or suppress that logger. Compare with
 logging disabled on both cohorts if log overhead is material. Raw records are necessary for paired
 per-action analysis: Prometheus aggregates observations and does not retain individual actions.
-`fetched_bytes` is backend accounting, not an exact network-byte measurement; the two bases have
-different directory/blob accounting paths.
+`fetched_bytes` is backend accounting, not an exact network-byte measurement; CFC and FUSE have
+different directory/blob accounting paths even with the same CAS implementation.
 
 ## FUSE-only metrics
 
@@ -144,7 +150,8 @@ InputFetch alone is not evidence of a net gain.
 ## Validation
 
 Both branch worker binaries were built with the build command above. Both worker and shard test
-suites passed. On the FUSE branch, tests also ran with `--config=fuse`, including the mounted
+suites passed. After rebuilding FUSE on the shared Lucid baseline, its worker, shard,
+configuration, and persistent-worker suites passed with `--config=fuse`, including the mounted
 filesystem smoke test, callback exception/delegation tests, and metrics accounting tests.
 
 ```sh
@@ -154,7 +161,9 @@ bazel test //src/test/java/build/buildfarm/worker:tests \
 
 # FUSE branch, on a host providing libfuse.so.2 and /dev/fuse
 bazel test //src/test/java/build/buildfarm/worker:tests \
-  //src/test/java/build/buildfarm/worker/shard:tests --config=fuse --test_output=errors
+  //src/test/java/build/buildfarm/worker/shard:tests \
+  //src/test/java/build/buildfarm/common/config:tests \
+  //src/test/java/build/buildfarm/worker/persistent:tests --config=fuse --test_output=errors
 ```
 
 For validation on the development host, `libfuse2t64` was downloaded and extracted under `/tmp`
