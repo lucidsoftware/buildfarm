@@ -33,6 +33,7 @@ java_test(
         "@buildfarm_maven//:com_google_guava_guava",
         "@buildfarm_maven//:com_google_jimfs_jimfs",
         "@buildfarm_maven//:com_google_protobuf_protobuf_java",
+        "@buildfarm_maven//:com_google_protobuf_protobuf_java_util",
         "@buildfarm_maven//:com_google_truth_truth",
         "@buildfarm_maven//:io_grpc_grpc_api",
         "@buildfarm_maven//:io_grpc_grpc_context",

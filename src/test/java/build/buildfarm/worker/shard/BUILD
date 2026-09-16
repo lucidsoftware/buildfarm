@@ -24,6 +24,7 @@ java_test(
         "@buildfarm_maven//:io_grpc_grpc_api",
         "@buildfarm_maven//:io_grpc_grpc_core",
         "@buildfarm_maven//:io_grpc_grpc_services",
+        "@buildfarm_maven//:io_prometheus_simpleclient",
         "@buildfarm_maven//:org_mockito_mockito_core",
     ],
 )

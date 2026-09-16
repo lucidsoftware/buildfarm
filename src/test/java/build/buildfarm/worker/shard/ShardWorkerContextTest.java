@@ -17,7 +17,9 @@ package build.buildfarm.worker.shard;
 import static build.buildfarm.common.Claim.Stage.REPORT_RESULT_STAGE;
 import static build.buildfarm.common.config.Server.INSTANCE_TYPE.SHARD;
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
 import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -52,6 +54,8 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.jimfs.Jimfs;
 import com.google.protobuf.Duration;
+import io.prometheus.client.CollectorRegistry;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -128,6 +132,39 @@ public class ShardWorkerContextTest {
         /* ignoreMarketExecutionMnemonics= */ ImmutableSet.of(),
         resourceSet,
         writer);
+  }
+
+  @Test
+  public void cleanupMetricsCountSuccessfulAndFailedCallsWithoutSwallowingFailures()
+      throws Exception {
+    WorkerContext context = createTestContext();
+    Path path = Path.of("/execroot/test");
+    double successes = cleanupCount("success");
+    double failures = cleanupCount("failure");
+    context.destroyExecDir(path);
+    assertThat(cleanupCount("success") - successes).isEqualTo(1.0);
+
+    IOException ioFailure = new IOException("cleanup failed");
+    doThrow(ioFailure).when(execFileSystem).destroyExecDir(path);
+    assertThat(assertThrows(IOException.class, () -> context.destroyExecDir(path)))
+        .isSameInstanceAs(ioFailure);
+    InterruptedException interrupted = new InterruptedException("cancelled");
+    doThrow(interrupted).when(execFileSystem).destroyExecDir(path);
+    assertThat(assertThrows(InterruptedException.class, () -> context.destroyExecDir(path)))
+        .isSameInstanceAs(interrupted);
+    IllegalStateException unchecked = new IllegalStateException("failed");
+    doThrow(unchecked).when(execFileSystem).destroyExecDir(path);
+    assertThat(assertThrows(IllegalStateException.class, () -> context.destroyExecDir(path)))
+        .isSameInstanceAs(unchecked);
+    assertThat(cleanupCount("failure") - failures).isEqualTo(3.0);
+    assertThat(cleanupCount("success") - successes).isEqualTo(1.0);
+  }
+
+  private static double cleanupCount(String outcome) {
+    Double count =
+        CollectorRegistry.defaultRegistry.getSampleValue(
+            "destroy_exec_root_seconds_count", new String[] {"outcome"}, new String[] {outcome});
+    return count == null ? 0 : count;
   }
 
   @SuppressWarnings("unchecked")
