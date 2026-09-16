@@ -530,7 +530,12 @@ public class Executor {
         // Now that the execution has finished we can return any of the claims against local
         // resources.
         executionContext.claim.release(EXECUTE_ACTION_STAGE);
-        owner.releaseExecutor(executionName, stopwatch.elapsed(MICROSECONDS), stallUSecs, exitCode);
+        owner.releaseExecutor(
+            executionName,
+            executionContext.metadata.getRequestMetadata().getActionMnemonic(),
+            stopwatch.elapsed(MICROSECONDS),
+            stallUSecs,
+            exitCode);
       } finally {
         if (wasInterrupted) {
           Thread.currentThread().interrupt();
@@ -874,7 +879,8 @@ public class Executor {
     }
   }
 
-  private Code executeNativeProcess(
+  @VisibleForTesting
+  Code executeNativeProcess(
       String executionName,
       ProcessBuilder processBuilder,
       IOResource resource,
@@ -885,6 +891,10 @@ public class Executor {
     CPULease cpuLease = (CPULease) executionContext.claim.get(CPULease.RESOURCE_NAME);
     shares = cpuLease.amount();
     resource.setCpu(shares * 100);
+
+    ActionCpuTime cpuTime =
+        new ActionCpuTime(
+            executionContext.metadata.getRequestMetadata().getActionMnemonic(), resource.sample());
 
     Process process;
     try {
@@ -952,6 +962,7 @@ public class Executor {
         }
         executionContext.workerExecutedMetadata.putAllUsage(resource.sample());
       }
+      cpuTime.record(executionContext.workerExecutedMetadata.getUsageMap());
     }
 
     // ensure resource release on process completion or timeout

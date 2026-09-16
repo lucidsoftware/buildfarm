@@ -38,6 +38,7 @@ java_test(
         "@buildfarm_maven//:io_grpc_grpc_context",
         "@buildfarm_maven//:io_grpc_grpc_core",
         "@buildfarm_maven//:io_grpc_grpc_protobuf",
+        "@buildfarm_maven//:io_prometheus_simpleclient",
         "@buildfarm_maven//:org_mockito_mockito_core",
         "@buildfarm_maven//:org_projectlombok_lombok",
         "@googleapis//google/rpc:rpc_java_proto",
