@@ -23,6 +23,7 @@ import build.bazel.remote.execution.v2.DigestFunction;
 import build.bazel.remote.execution.v2.Directory;
 import build.bazel.remote.execution.v2.FileNode;
 import com.google.protobuf.ByteString;
+import io.prometheus.client.CollectorRegistry;
 import java.io.IOException;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
@@ -72,6 +73,37 @@ public class FuseCASTest {
               }
               throw new UnsupportedOperationException();
             });
+  }
+
+  @Test
+  public void delegatedTruncateCountsOnlyTheOriginalCallback() {
+    // Force collector initialization before reading the counters.
+    assertThat(FuseCallbackMetrics.TRUNCATE).isNotNull();
+    double before = callbackCount("truncate", "enoent");
+    double ftruncateBefore = callbackCount("ftruncate", "enoent");
+    assertThat(fuseCAS.ftruncate("/missing", 0, new SystemFuseFileInfo()))
+        .isEqualTo(-ErrorCodes.ENOENT());
+    assertThat(callbackCount("ftruncate", "enoent") - ftruncateBefore).isEqualTo(1.0);
+    assertThat(callbackCount("truncate", "enoent")).isEqualTo(before);
+  }
+
+  @Test
+  public void callbackExceptionIsRethrownAndObserved() {
+    assertThat(FuseCallbackMetrics.GETATTR).isNotNull();
+    double before = callbackCount("getattr", "exception");
+    assertThrows(NullPointerException.class, () -> fuseCAS.getattr("/", null));
+    assertThat(callbackCount("getattr", "exception") - before).isEqualTo(1.0);
+    assertThat(
+            CollectorRegistry.defaultRegistry.getSampleValue(
+                "fuse_callbacks_in_flight", new String[] {"operation"}, new String[] {"getattr"}))
+        .isEqualTo(0.0);
+  }
+
+  private static double callbackCount(String operation, String result) {
+    return CollectorRegistry.defaultRegistry.getSampleValue(
+        "fuse_callbacks_total",
+        new String[] {"operation", "result"},
+        new String[] {operation, result});
   }
 
   private FileStat createFileStat() {

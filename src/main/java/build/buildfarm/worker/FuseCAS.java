@@ -727,9 +727,20 @@ public class FuseCAS extends FuseStubFS {
     return path.substring(path.lastIndexOf('/') + 1);
   }
 
-  @SuppressWarnings("OctalInteger")
   @Override
   public int getattr(String path, FileStat stat) {
+    long startedNanos = FuseCallbackMetrics.GETATTR.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = getattrImpl(path, stat);
+      return result;
+    } finally {
+      FuseCallbackMetrics.GETATTR.finish(startedNanos, result, 0);
+    }
+  }
+
+  @SuppressWarnings("OctalInteger")
+  private int getattrImpl(String path, FileStat stat) {
     Entry entry = resolve(path);
 
     if (entry == null) {
@@ -763,6 +774,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int readlink(String path, Pointer buf, @size_t long size) {
+    long startedNanos = FuseCallbackMetrics.READLINK.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = readlinkImpl(path, buf, size);
+      return result;
+    } finally {
+      FuseCallbackMetrics.READLINK.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int readlinkImpl(String path, Pointer buf, @size_t long size) {
     Entry entry = resolve(path);
 
     if (entry == null) {
@@ -785,6 +807,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int symlink(String oldpath, String newpath) {
+    long startedNanos = FuseCallbackMetrics.SYMLINK.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = symlinkImpl(oldpath, newpath);
+      return result;
+    } finally {
+      FuseCallbackMetrics.SYMLINK.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int symlinkImpl(String oldpath, String newpath) {
     DirectoryEntry dirEntry = containingDirectoryForCreate(newpath);
 
     if (dirEntry == null) {
@@ -802,6 +835,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int rename(String oldpath, String newpath) {
+    long startedNanos = FuseCallbackMetrics.RENAME.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = renameImpl(oldpath, newpath);
+      return result;
+    } finally {
+      FuseCallbackMetrics.RENAME.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int renameImpl(String oldpath, String newpath) {
     if (oldpath.equals(newpath)) {
       return 0;
     }
@@ -831,6 +875,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int link(String oldpath, String newpath) {
+    long startedNanos = FuseCallbackMetrics.LINK.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = linkImpl(oldpath, newpath);
+      return result;
+    } finally {
+      FuseCallbackMetrics.LINK.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int linkImpl(String oldpath, String newpath) {
     Entry entry = resolve(oldpath);
     if (entry == null) {
       return -ErrorCodes.ENOENT();
@@ -855,6 +910,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int chown(String path, @uid_t long uid, @gid_t long gid) {
+    long startedNanos = FuseCallbackMetrics.CHOWN.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = chownImpl(path, uid, gid);
+      return result;
+    } finally {
+      FuseCallbackMetrics.CHOWN.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int chownImpl(String path, @uid_t long uid, @gid_t long gid) {
     Entry entry = resolve(path);
 
     if (entry == null) {
@@ -870,6 +936,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int truncate(String path, @off_t long size) {
+    long startedNanos = FuseCallbackMetrics.TRUNCATE.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = truncateImpl(path, size);
+      return result;
+    } finally {
+      FuseCallbackMetrics.TRUNCATE.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int truncateImpl(String path, @off_t long size) {
     Entry entry = resolve(path);
 
     if (entry == null) {
@@ -895,14 +972,36 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int ftruncate(String path, @off_t long size, FuseFileInfo fi) {
+    long startedNanos = FuseCallbackMetrics.FTRUNCATE.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = ftruncateImpl(path, size, fi);
+      return result;
+    } finally {
+      FuseCallbackMetrics.FTRUNCATE.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int ftruncateImpl(String path, @off_t long size, FuseFileInfo fi) {
     // FIXME we can do better on all of this by avoiding lookups
     // and actually using the FuseFileInfo
 
-    return truncate(path, size);
+    return truncateImpl(path, size);
   }
 
   @Override
   public int chmod(String path, @mode_t long mode) {
+    long startedNanos = FuseCallbackMetrics.CHMOD.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = chmodImpl(path, mode);
+      return result;
+    } finally {
+      FuseCallbackMetrics.CHMOD.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int chmodImpl(String path, @mode_t long mode) {
     Entry entry = resolve(path);
 
     if (entry == null) {
@@ -922,6 +1021,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int utimens(String path, Timespec[] timespec) {
+    long startedNanos = FuseCallbackMetrics.UTIMENS.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = utimensImpl(path, timespec);
+      return result;
+    } finally {
+      FuseCallbackMetrics.UTIMENS.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int utimensImpl(String path, Timespec[] timespec) {
     Entry entry = resolve(path);
 
     if (entry == null) {
@@ -937,6 +1047,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int access(String path, int mode) {
+    long startedNanos = FuseCallbackMetrics.ACCESS.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = accessImpl(path, mode);
+      return result;
+    } finally {
+      FuseCallbackMetrics.ACCESS.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int accessImpl(String path, int mode) {
     Entry entry = resolve(path);
 
     // FIXME complicated?  Access.F_OK
@@ -957,6 +1078,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int unlink(String path) {
+    long startedNanos = FuseCallbackMetrics.UNLINK.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = unlinkImpl(path);
+      return result;
+    } finally {
+      FuseCallbackMetrics.UNLINK.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int unlinkImpl(String path) {
     DirectoryEntry dirEntry = containingDirectoryForCreate(path);
 
     if (dirEntry == null) {
@@ -981,6 +1113,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int rmdir(String path) {
+    long startedNanos = FuseCallbackMetrics.RMDIR.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = rmdirImpl(path);
+      return result;
+    } finally {
+      FuseCallbackMetrics.RMDIR.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int rmdirImpl(String path) {
     DirectoryEntry parent = containingDirectoryForCreate(path);
     if (parent == null) {
       return -ErrorCodes.ENOENT();
@@ -1003,6 +1146,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int getxattr(String path, String name, Pointer value, @size_t long size) {
+    long startedNanos = FuseCallbackMetrics.GETXATTR.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = getxattrImpl(path, name, value, size);
+      return result;
+    } finally {
+      FuseCallbackMetrics.GETXATTR.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int getxattrImpl(String path, String name, Pointer value, @size_t long size) {
     // log.log(Level.INFO, "GETXATTR: " + name);
     // seen security.capability so far...
     return -ErrorCodes.EOPNOTSUPP();
@@ -1010,16 +1164,49 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int setxattr(String path, String name, Pointer value, @size_t long size, int flags) {
+    long startedNanos = FuseCallbackMetrics.SETXATTR.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = setxattrImpl(path, name, value, size, flags);
+      return result;
+    } finally {
+      FuseCallbackMetrics.SETXATTR.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int setxattrImpl(String path, String name, Pointer value, @size_t long size, int flags) {
     return -ErrorCodes.EOPNOTSUPP();
   }
 
   @Override
   public int listxattr(String path, Pointer list, @size_t long size) {
+    long startedNanos = FuseCallbackMetrics.LISTXATTR.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = listxattrImpl(path, list, size);
+      return result;
+    } finally {
+      FuseCallbackMetrics.LISTXATTR.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int listxattrImpl(String path, Pointer list, @size_t long size) {
     return -ErrorCodes.EOPNOTSUPP();
   }
 
   @Override
   public int removexattr(String path, String name) {
+    long startedNanos = FuseCallbackMetrics.REMOVEXATTR.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = removexattrImpl(path, name);
+      return result;
+    } finally {
+      FuseCallbackMetrics.REMOVEXATTR.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int removexattrImpl(String path, String name) {
     return -ErrorCodes.EOPNOTSUPP();
   }
 
@@ -1064,6 +1251,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int mknod(String path, @mode_t long mode, long device) {
+    long startedNanos = FuseCallbackMetrics.MKNOD.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = mknodImpl(path, mode, device);
+      return result;
+    } finally {
+      FuseCallbackMetrics.MKNOD.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int mknodImpl(String path, @mode_t long mode, long device) {
     if (resolve(path) != null) {
       return -ErrorCodes.EEXIST();
     }
@@ -1072,6 +1270,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int create(String path, @mode_t long mode, FuseFileInfo fi) {
+    long startedNanos = FuseCallbackMetrics.CREATE.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = createImpl(path, mode, fi);
+      return result;
+    } finally {
+      FuseCallbackMetrics.CREATE.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int createImpl(String path, @mode_t long mode, FuseFileInfo fi) {
     if (resolve(path) != null) {
       return -ErrorCodes.EEXIST();
     }
@@ -1088,6 +1297,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int open(String path, FuseFileInfo fi) {
+    long startedNanos = FuseCallbackMetrics.OPEN.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = openImpl(path, fi);
+      return result;
+    } finally {
+      FuseCallbackMetrics.OPEN.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int openImpl(String path, FuseFileInfo fi) {
     int flags = fi.flags.intValue();
     boolean create = (flags & OpenFlags.O_CREAT.intValue()) != 0;
     boolean exclusive = (flags & OpenFlags.O_EXCL.intValue()) != 0;
@@ -1117,6 +1337,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int release(String path, FuseFileInfo fi) {
+    long startedNanos = FuseCallbackMetrics.RELEASE.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = releaseImpl(path, fi);
+      return result;
+    } finally {
+      FuseCallbackMetrics.RELEASE.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int releaseImpl(String path, FuseFileInfo fi) {
     Entry released = fileHandleEntries.remove(fi.fh.intValue());
     if (released instanceof WriteFileEntry writeFile) {
       writeFile.released();
@@ -1142,6 +1373,18 @@ public class FuseCAS extends FuseStubFS {
   @Override
   public int write(
       String path, Pointer buf, @size_t long bufSize, @off_t long offset, FuseFileInfo fi) {
+    long startedNanos = FuseCallbackMetrics.WRITE.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = writeImpl(path, buf, bufSize, offset, fi);
+      return result;
+    } finally {
+      FuseCallbackMetrics.WRITE.finish(startedNanos, result, bufSize);
+    }
+  }
+
+  private int writeImpl(
+      String path, Pointer buf, @size_t long bufSize, @off_t long offset, FuseFileInfo fi) {
     Entry entry = fileHandleEntries.get(fi.fh.intValue());
     if (entry == null) {
       return -ErrorCodes.ENOENT();
@@ -1164,6 +1407,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int flush(String path, FuseFileInfo fi) {
+    long startedNanos = FuseCallbackMetrics.FLUSH.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = flushImpl(path, fi);
+      return result;
+    } finally {
+      FuseCallbackMetrics.FLUSH.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int flushImpl(String path, FuseFileInfo fi) {
     // noop
 
     return 0;
@@ -1171,6 +1425,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int fsync(String path, int isdatasync, FuseFileInfo fi) {
+    long startedNanos = FuseCallbackMetrics.FSYNC.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = fsyncImpl(path, isdatasync, fi);
+      return result;
+    } finally {
+      FuseCallbackMetrics.FSYNC.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int fsyncImpl(String path, int isdatasync, FuseFileInfo fi) {
     Entry entry = fileHandleEntries.get(fi.fh.intValue());
     if (entry == null) {
       return -ErrorCodes.ENOENT();
@@ -1188,6 +1453,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int statfs(String path, Statvfs stat) {
+    long startedNanos = FuseCallbackMetrics.STATFS.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = statfsImpl(path, stat);
+      return result;
+    } finally {
+      FuseCallbackMetrics.STATFS.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int statfsImpl(String path, Statvfs stat) {
     try {
       FileStore fileStore = Files.getFileStore(scratchPath);
       long blockSize = 4096;
@@ -1210,6 +1486,18 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int read(
+      String path, Pointer buf, @size_t long size, @off_t long offset, FuseFileInfo fi) {
+    long startedNanos = FuseCallbackMetrics.READ.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = readImpl(path, buf, size, offset, fi);
+      return result;
+    } finally {
+      FuseCallbackMetrics.READ.finish(startedNanos, result, size);
+    }
+  }
+
+  private int readImpl(
       String path, Pointer buf, @size_t long size, @off_t long offset, FuseFileInfo fi) {
     Entry entry = fileHandleEntries.get(fi.fh.intValue());
     if (entry == null) {
@@ -1251,6 +1539,17 @@ public class FuseCAS extends FuseStubFS {
 
   @Override
   public int mkdir(String path, @mode_t long mode) {
+    long startedNanos = FuseCallbackMetrics.MKDIR.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = mkdirImpl(path, mode);
+      return result;
+    } finally {
+      FuseCallbackMetrics.MKDIR.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int mkdirImpl(String path, @mode_t long mode) {
     // FIXME mode validation
 
     DirectoryEntry dirEntry = containingDirectoryForCreate(path);
@@ -1273,6 +1572,18 @@ public class FuseCAS extends FuseStubFS {
   @Override
   public int readdir(
       String path, Pointer buf, FuseFillDir filter, @off_t long offset, FuseFileInfo fi) {
+    long startedNanos = FuseCallbackMetrics.READDIR.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = readdirImpl(path, buf, filter, offset, fi);
+      return result;
+    } finally {
+      FuseCallbackMetrics.READDIR.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int readdirImpl(
+      String path, Pointer buf, FuseFillDir filter, @off_t long offset, FuseFileInfo fi) {
     DirectoryEntry dirEntry = directoryForPath(path);
 
     if (dirEntry == null) {
@@ -1288,6 +1599,18 @@ public class FuseCAS extends FuseStubFS {
   @SuppressWarnings("ConstantConditions")
   @Override
   public int fallocate(
+      String path, int mode, @off_t long off, @off_t long length, FuseFileInfo fi) {
+    long startedNanos = FuseCallbackMetrics.FALLOCATE.start();
+    int result = FuseCallbackMetrics.EXCEPTION;
+    try {
+      result = fallocateImpl(path, mode, off, length, fi);
+      return result;
+    } finally {
+      FuseCallbackMetrics.FALLOCATE.finish(startedNanos, result, 0);
+    }
+  }
+
+  private int fallocateImpl(
       String path, int mode, @off_t long off, @off_t long length, FuseFileInfo fi) {
     if (mode != 0) {
       return -ErrorCodes.EOPNOTSUPP();
@@ -1307,6 +1630,6 @@ public class FuseCAS extends FuseStubFS {
       return -ErrorCodes.EPERM();
     }
 
-    return truncate(path, off + length);
+    return truncateImpl(path, off + length);
   }
 }
