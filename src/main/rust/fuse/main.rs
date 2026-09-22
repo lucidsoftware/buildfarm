@@ -571,9 +571,10 @@ impl Filesystem for BuildfarmFuse {
             Ok(fh) => {
                 if self.passthrough.load(Ordering::Relaxed) {
                     if let Ok(backing) = self.open_passthrough(ino.0, fh, &reply) {
+                        // KEEP_CACHE with passthrough makes reads return EIO on Linux 7.0.
                         reply.opened_passthrough(
                             FileHandle(fh),
-                            FopenFlags::FOPEN_KEEP_CACHE,
+                            FopenFlags::empty(),
                             &backing,
                         );
                         return;
