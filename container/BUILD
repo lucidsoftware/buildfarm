@@ -103,6 +103,25 @@ pkg_files(
     tags = ["container"],
 )
 
+pkg_files(
+    name = "buildfarm-fuse.binary",
+    srcs = ["//src/main/rust/fuse:buildfarm-fuse"],
+    attributes = pkg_attributes(
+        mode = "0555",
+    ),
+    renames = {
+        "//src/main/rust/fuse:buildfarm-fuse": "buildfarm-fuse",
+    },
+    tags = ["container"],
+)
+
+pkg_tar(
+    name = "layer_buildfarm_fuse",
+    srcs = [":buildfarm-fuse.binary"],
+    package_dir = DEFAULT_PACKAGE_DIR,
+    tags = ["container"],
+)
+
 pkg_tar(
     name = "layer_tini",
     srcs = select({
@@ -197,6 +216,7 @@ oci_image(
         ":layer_logging_config",
         ":layer_minimal_config",
         ":execution_wrappers",
+        ":layer_buildfarm_fuse",
         ":telemetry_tools",
         ":layer_buildfarm_worker",
     ],

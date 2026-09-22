@@ -53,6 +53,31 @@ single_version_override(
 bazel_dep(name = "rules_license", version = "1.0.0")
 bazel_dep(name = "rules_oci", version = "2.3.0")
 bazel_dep(name = "rules_pkg", version = "1.2.0")
+bazel_dep(name = "rules_rust", version = "0.74.0")
+
+rust_crates = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+rust_crates.spec(
+    default_features = False,
+    package = "fuser",
+    version = "0.18.0",
+)
+rust_crates.spec(
+    package = "libc",
+    version = "0.2",
+)
+rust_crates.annotation(
+    crate = "fuser",
+    gen_build_script = "off",
+    rustc_flags = [
+        "--cfg=fuser_mount_impl=\"pure-rust\"",
+        "-Copt-level=3",
+    ],
+)
+rust_crates.from_specs(
+    cargo_lockfile = "//:Cargo.Bazel.lock",
+    lockfile = "//:rust_crates_lock.json",
+)
+use_repo(rust_crates, "crates")
 
 # Test dependencies
 bazel_dep(
@@ -83,6 +108,8 @@ register_toolchains(
     "@zig_sdk//toolchain:linux_arm64_gnu.2.31",
 )
 
+register_toolchains("//toolchains/rust_arm:toolchain")
+
 maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
 maven.install(
     name = "buildfarm_maven",
@@ -107,7 +134,6 @@ maven.install(
         "com.github.luben:zstd-jni:1.5.7-7",
         "com.github.oshi:oshi-core:6.11.0",
         "com.github.pcj:google-options:1.0.0",
-        "com.github.serceman:jnr-fuse:0.5.8",
         "com.google.api.grpc:proto-google-common-protos:2.61.1",
         "com.google.auth:google-auth-library-credentials",  # Version is specified via the BOM below
         "com.google.auth:google-auth-library-oauth2-http",  # Version is specified via the BOM below

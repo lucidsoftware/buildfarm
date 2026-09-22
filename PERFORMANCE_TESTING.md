@@ -8,8 +8,8 @@
 | After, FUSE | `bfreestone-perf-with-fuse` | `bfreestone-perf-before-fuse` at `6da6cc66b47e3311f95ce44d248cf95ec38e01aa` |
 
 Both variants now share the exact Lucid base and shared performance instrumentation. The after
-branch adds the FUSE implementation cherry-picked from `06cb9cef`, its callback metrics, and
-conflict resolutions retaining Lucid's configuration docs and tests. CAS and persistent-worker
+branch adds the FUSE implementation cherry-picked from `06cb9cef`, now with its callback data
+plane replaced by a native Rust process. CAS and persistent-worker
 implementations are identical across the two branches. The original `bfreestone-fuse` branch is
 unchanged and remains separate for upstream work.
 
@@ -25,7 +25,8 @@ bazel build //src/main/java/build/buildfarm:buildfarm-shard-worker
 
 Use your normal worker configuration on the before branch. On the after branch, set
 `worker.execFileSystemType: FUSE` and retain `FILESYSTEM` CAS storage. The after branch still eagerly
-stages input blobs in local CAS. FUSE requires the host's FUSE setup, including `libfuse.so.2` (FUSE 3 alone is insufficient), and does not support
+stages input blobs in local CAS. FUSE requires `/dev/fuse` and permission to mount it, but the Rust
+implementation talks to the kernel directly and has no `libfuse` runtime dependency. It does not support
 `execOwner`/`execOwners`. The baseline does not recognize `execFileSystemType`; do not add it there.
 
 Add a Prometheus scrape target label `variant="before"` or `variant="fuse"` to distinguish cohorts.
@@ -81,26 +82,13 @@ per-action analysis: Prometheus aggregates observations and does not retain indi
 `fetched_bytes` is backend accounting, not an exact network-byte measurement; CFC and FUSE have
 different directory/blob accounting paths even with the same CAS implementation.
 
-## FUSE-only metrics
+## FUSE data plane
 
-All 29 callbacks overridden by `FuseCAS` are instrumented. Inherited default/unimplemented FUSE
-callbacks are not instrumented. Metrics appear when the callback instrumentation first initializes.
-
-| Metric | Meaning |
-| --- | --- |
-| `fuse_callbacks_total{operation,result}` | Completed callbacks; result is `ok`, `enoent`, `unsupported`, `permission`, `io_error`, `other_error`, or `exception`. `ok` includes EOF and successful short I/O. |
-| `fuse_callback_seconds{operation}` | Java callback duration, with microsecond-to-30-second buckets. Includes failed callbacks. |
-| `fuse_callbacks_in_flight{operation}` | Concurrent callbacks currently inside Java. |
-| `fuse_io_requested_bytes_total{operation}` | Requested read/write bytes, including failed calls. |
-| `fuse_io_bytes_total{operation}` | Bytes actually returned from successful read/write callbacks. |
-| `fuse_io_request_bytes{operation}` | Read/write request-size distribution, through 1 MiB. |
-
-These aggregate across actions and across input, scratch, and output-upload access. They do not
-measure network transfer or unique bytes, and do not count reads satisfied entirely by kernel
-caches. Callback duration excludes kernel/dispatch queue time. Concurrent durations overlap, so
-summing them is not action wall time. Delegated `ftruncate`/`fallocate` helper calls do not generate
-extra `truncate` callback counts. No per-path tracing or per-callback logging is performed.
-Pre-bound Prometheus children avoid hot-path label lookup; timing/counter overhead still exists.
+FUSE callbacks execute concurrently in the native Rust process; the JVM only sends root lifecycle
+manifests over a control pipe. The filesystem keeps one mount for the worker lifetime, uses persistent
+file handles, requests 1 MiB reads/writes and readahead, and negotiates Linux FUSE passthrough when the
+kernel supports it. Callback-level Prometheus instrumentation was deliberately removed from the hot
+path. Use the shared action and exec-root metrics above for the before/after comparison.
 
 ## Initial dashboard queries
 
@@ -128,22 +116,11 @@ histogram_quantile(0.95,
 )
 ```
 
-FUSE callback rate and mean latency (including errors):
-
-```promql
-sum by (operation, result) (rate(fuse_callbacks_total{variant="fuse"}[5m]))
-```
-
-```promql
-sum by (operation) (rate(fuse_callback_seconds_sum{variant="fuse"}[5m]))
-/
-sum by (operation) (rate(fuse_callback_seconds_count{variant="fuse"}[5m]))
-```
-
 Compare identical action sets and worker counts/resources. Force remote execution instead of
 accepting action-cache results. Separate cold/warm CAS and OS page-cache conditions; test low and
 saturated concurrency. Include metadata-heavy, large-input, output-heavy, and CPU-heavy workloads.
-Separate first-mount runs from steady state (FUSE unmounts after 10 idle seconds). Pair stage metrics
+Separate first-mount runs from steady state. The native filesystem mounts on the first FUSE root and
+stays mounted for the worker lifetime. Pair stage metrics
 with client build duration, host/action/worker CPU and memory, disk I/O, and JVM GC. A smaller
 InputFetch alone is not evidence of a net gain.
 
@@ -151,22 +128,20 @@ InputFetch alone is not evidence of a net gain.
 
 Both branch worker binaries were built with the build command above. Both worker and shard test
 suites passed. After rebuilding FUSE on the shared Lucid baseline, its worker, shard,
-configuration, and persistent-worker suites passed with `--config=fuse`, including the mounted
-filesystem smoke test, callback exception/delegation tests, and metrics accounting tests.
+configuration, and persistent-worker suites passed with `--config=fuse`. The Rust state tests and
+Java control-protocol tests cover the native implementation boundary.
 
 ```sh
 # Before branch
 bazel test //src/test/java/build/buildfarm/worker:tests \
   //src/test/java/build/buildfarm/worker/shard:tests --test_output=errors
 
-# FUSE branch, on a host providing libfuse.so.2 and /dev/fuse
+# FUSE branch; mounted integration requires /dev/fuse
 bazel test //src/test/java/build/buildfarm/worker:tests \
   //src/test/java/build/buildfarm/worker/shard:tests \
   //src/test/java/build/buildfarm/common/config:tests \
   //src/test/java/build/buildfarm/worker/persistent:tests --config=fuse --test_output=errors
 ```
 
-For validation on the development host, `libfuse2t64` was downloaded and extracted under `/tmp`
-and its library directory passed via `--test_env=LD_LIBRARY_PATH=...`; no system package was
-installed. The mounted smoke test is conditional on `/dev/fuse` and does not replace running
-representative builds under load. No before/after performance results have been collected yet.
+The mounted smoke test is conditional on `/dev/fuse` and does not replace running representative
+builds under load. No before/after performance results have been collected yet.

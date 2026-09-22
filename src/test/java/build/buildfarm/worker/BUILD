@@ -15,7 +15,10 @@ java_test(
         ":fuse": ["FuseCASTest.java"],
         "//conditions:default": [],
     }),
-    data = ["//examples:example_configs"],
+    data = [
+        "//examples:example_configs",
+        "//src/main/rust/fuse:buildfarm-fuse",
+    ],
     plugins = ["//src/main/java/build/buildfarm/common:lombok"],
     test_class = "build.buildfarm.AllTests",
     deps = [
@@ -29,7 +32,6 @@ java_test(
         "//src/test/java/build/buildfarm:test_runner",
         "@buildfarm_maven//:com_github_jnr_jnr_constants",
         "@buildfarm_maven//:com_github_jnr_jnr_ffi",
-        "@buildfarm_maven//:com_github_serceman_jnr_fuse",
         "@buildfarm_maven//:com_google_guava_guava",
         "@buildfarm_maven//:com_google_jimfs_jimfs",
         "@buildfarm_maven//:com_google_protobuf_protobuf_java",
