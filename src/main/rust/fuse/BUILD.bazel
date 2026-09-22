@@ -1,0 +1,22 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_binary(
+    name = "buildfarm-fuse",
+    srcs = ["main.rs"],
+    edition = "2021",
+    rustc_flags = [
+        "-Ccodegen-units=1",
+        "-Copt-level=3",
+    ],
+    deps = [
+        "@crates//:fuser",
+        "@crates//:libc",
+    ],
+)
+
+rust_test(
+    name = "tests",
+    crate = ":buildfarm-fuse",
+)

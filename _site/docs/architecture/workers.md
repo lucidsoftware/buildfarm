@@ -61,9 +61,9 @@ Workers use ExecFileSystems to present content to actions, and manage their exis
 
 This means that an action's entire input directory must be available on a filesystem from a unique location per operation - the _Operation Action Input Root_, or just _Root_. Each input file within the Root must contain the content of the inputs, its requested executability via FileNode, and each directory must contain at the outset, child input files and directories. The filesystem is free to handle unspecified outputs as it sees fit, but the directory hierarchy of output files from the Root must be created before execution, and writable during it. When execution and observation of the outputs is completed, the exec filesystem will be asked to destroy the Root and release any associated resources from its retention.
 
-Choosing a `filesystem` `storage` type in the worker config as the first `storage` entry will select the _CASFileCache_ _CFCExecFileSystem_. Choosing any other `storage` type will create a _FuseCAS_ _FuseExecFilesystem_.
-
-***We strongly recommend the use of `filesystem` `storage` as the ExecFileSystem-selecting `storage` entry, the _FuseCAS_ is experimental and may not function reliably over long hauls/with substantial load***
+`exec_file_system_type` selects the execution filesystem independently of the configured storage.
+`CFC` is the default. `FUSE` requires a filesystem-backed first storage entry, `/dev/fuse`, and
+permission for the worker process to mount it. FUSE does not support `exec_owner`/`exec_owners`.
 
 ## CASFileCache/CFCExecFilesystem
 
@@ -76,6 +76,11 @@ There are plans to improve CASFileCache that will be reflected in improved perfo
 
 ## Fuse
 
-A fuse implementation to provide Roots exists and is specifiable as well. This was an experiment to discover the capacity of a fuse to represent Roots transparently with a ContentAddressableStorage backing, and has not been fully vetted to provide the same reliability as the CFCExecFilesystem. This system is capable of blinking entire trees into existence with ease, as well as supporting write-throughs for outputs suitable for general purpose execution. Some problems with this type were initially observed and never completely resolved, including guaranteed resource release on Root destruction. This implementation is also only built to be backed by its own Memory CAS, with no general purpose CAS support added due to the difficulty of supporting a transaction model for an input tree to enforce the contract of availability. It remains unoptimized yet functional, but difficulties with integrating libfuse 3 into the bazel build, as well as time constraints, have kept it from being scaled and expanded as the rest of Buildfarm has grown.
-
-There are plans to revisit this implementation and bring it back into viability with a CASFileCache-like backing.
+The FUSE execution filesystem represents complete action roots without creating a hard link for every
+input. Inputs remain immutable files in the local CAS; output and scratch files use ordinary backing
+files. A native Rust process owns the mount and all kernel callbacks, while Java sends compact root
+manifests when actions enter and leave the worker. The process is mounted once and shared across action
+roots for the worker lifetime. It uses concurrent request handling and persistent file handles, and on
+supporting Linux kernels it negotiates FUSE passthrough so file data I/O can bypass the userspace
+callback path. The implementation uses the kernel FUSE protocol directly and does not require a
+`libfuse` package in the worker image.

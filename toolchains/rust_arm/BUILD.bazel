@@ -1,0 +1,61 @@
+load("@rules_rust//rust:toolchain.bzl", "rust_toolchain")
+load(":linker.bzl", "arm_cc_info", "rust_arm_linker")
+
+package(default_visibility = ["//visibility:public"])
+
+_TOOLS = "@@rules_rust++rust+rust_linux_x86_64__aarch64-unknown-linux-gnu__stable_tools//:"
+
+arm_cc_info(name = "arm_cc")
+
+rust_arm_linker(
+    name = "linker",
+    arm = ":arm_cc",
+)
+
+# The standard Rust aarch64 GNU target passes --fix-cortex-a53-843419, which
+# Zig's compiler driver rejects. This otherwise-identical target specification
+# omits that linker argument.
+rust_toolchain(
+    name = "implementation",
+    binary_ext = "",
+    cargo = _TOOLS + "cargo",
+    cargo_clippy = _TOOLS + "cargo_clippy_bin",
+    channel = "stable",
+    clippy_driver = _TOOLS + "clippy_driver_bin",
+    default_edition = "2021",
+    dylib_ext = ".so",
+    exec_triple = "x86_64-unknown-linux-gnu",
+    linker = ":linker",
+    linker_preference = "rust",
+    linker_type = "indirect",
+    llvm_cov = _TOOLS + "llvm_cov_bin",
+    llvm_lib = _TOOLS + "llvm_lib",
+    llvm_profdata = _TOOLS + "llvm_profdata_bin",
+    rust_doc = _TOOLS + "rustdoc",
+    rust_objcopy = _TOOLS + "rust-objcopy",
+    rust_std = _TOOLS + "rust_std-aarch64-unknown-linux-gnu",
+    rustc = _TOOLS + "rustc",
+    rustc_lib = _TOOLS + "rustc_lib",
+    rustfmt = _TOOLS + "rustfmt_bin",
+    staticlib_ext = ".a",
+    stdlib_linkflags = [
+        "-ldl",
+        "-lpthread",
+    ],
+    target_triple = "aarch64-unknown-linux-gnu",
+    version = "1.98.0",
+)
+
+toolchain(
+    name = "toolchain",
+    exec_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    target_compatible_with = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+    toolchain = ":implementation",
+    toolchain_type = "@rules_rust//rust:toolchain",
+)

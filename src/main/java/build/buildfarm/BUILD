@@ -33,6 +33,7 @@ java_binary(
         "//examples:example_configs",
         "//examples:example_properties",
     ],
+    data = ["//src/main/rust/fuse:buildfarm-fuse"],
     jvm_flags = ensure_accurate_metadata() + add_opens_sun_nio_fs(),
     main_class = "build.buildfarm.worker.shard.Worker",
     visibility = ["//visibility:public"],

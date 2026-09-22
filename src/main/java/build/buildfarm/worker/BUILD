@@ -26,7 +26,6 @@ java_library(
         "@buildfarm_maven//:com_github_jnr_jnr_ffi",
         "@buildfarm_maven//:com_github_jnr_jnr_posix",
         "@buildfarm_maven//:com_github_pcj_google_options",
-        "@buildfarm_maven//:com_github_serceman_jnr_fuse",
         "@buildfarm_maven//:com_google_code_findbugs_jsr305",
         "@buildfarm_maven//:com_google_code_gson_gson",
         "@buildfarm_maven//:com_google_guava_guava",
