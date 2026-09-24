@@ -115,6 +115,7 @@ public class Executor {
   private int exitCode = INCOMPLETE_EXIT_CODE;
   private boolean wasErrored = false;
   private boolean polling = false;
+  private boolean usedPersistentWorker = false;
   private int shareLimit = 0;
   private volatile int shares = 0;
   private Order order = Order.COMPLETE;
@@ -533,6 +534,7 @@ public class Executor {
         owner.releaseExecutor(
             executionName,
             executionContext.metadata.getRequestMetadata().getActionMnemonic(),
+            usedPersistentWorker,
             stopwatch.elapsed(MICROSECONDS),
             stallUSecs,
             exitCode);
@@ -651,6 +653,7 @@ public class Executor {
               "usePersistentWorker (mnemonic=%s)",
               executionContext.metadata.getRequestMetadata().getActionMnemonic()));
 
+      usedPersistentWorker = true;
       return PersistentExecutor.runOnPersistentWorker(
           persistentWorkerFilesContext,
           executionName,

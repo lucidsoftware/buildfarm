@@ -107,10 +107,20 @@ Gauge for the number of execution slots used on each worker
 **execution_time_ms**
 
 Histogram for elapsed execution-stage time on a worker (in milliseconds), labeled
-by `mnemonic` from action request metadata. Missing mnemonics use `unknown`.
+by `mnemonic` from action request metadata and `persistent_worker` (`true` or
+`false`) for the execution path used. Missing mnemonics use `unknown`.
 The timer includes setup, cleanup, and downstream handoff waiting; it is not CPU
-time. Existing timing boundaries and buckets are unchanged. Sum across mnemonics
+time. Existing timing boundaries and buckets are unchanged. Sum across labels
 to recover aggregate values.
+
+To compare mean execution-stage seconds per action by mnemonic and execution path
+over an hour:
+
+```promql
+sum by (mnemonic, persistent_worker) (increase(execution_time_ms_sum[1h]))
+  / sum by (mnemonic, persistent_worker) (increase(execution_time_ms_count[1h]))
+  / 1000
+```
 
 **action_cpu_seconds_total**
 
@@ -142,8 +152,8 @@ topk(10, sum by (mnemonic) (increase(execution_time_ms_sum[1h])) / 1000)
 
 Only these two metrics have the mnemonic dimension. Each worker creates label
 values as observed: approximately 90 counter label sets for 90 mnemonics, while
-the histogram additionally exports buckets, sum, and count per mnemonic. Backend
-creation-timestamp series, if collected, add to that total.
+the histogram exports buckets, sum, and count for each observed mnemonic and
+execution path. Backend creation-timestamp series, if collected, add to that total.
 
 **execution_stall_time_ms**
 
