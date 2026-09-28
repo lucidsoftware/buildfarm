@@ -70,6 +70,7 @@ import build.buildfarm.worker.WorkerContext;
 import build.buildfarm.worker.cgroup.Cpu;
 import build.buildfarm.worker.cgroup.Group;
 import build.buildfarm.worker.cgroup.Mem;
+import build.buildfarm.worker.cgroup.PersistentWorkerCgroup;
 import build.buildfarm.worker.resources.LocalResourceSet;
 import build.buildfarm.worker.resources.ResourceDecider;
 import build.buildfarm.worker.resources.ResourceLimits;
@@ -111,6 +112,7 @@ import java.util.concurrent.Executor;
 import java.util.logging.Level;
 import lombok.extern.java.Log;
 import org.jspecify.annotations.Nullable;
+import persistent.bazel.client.WorkerResources;
 
 @Log
 class ShardWorkerContext implements WorkerContext {
@@ -1026,7 +1028,7 @@ class ShardWorkerContext implements WorkerContext {
       boolean runsOnPersistentWorker) {
     ResourceLimits limits = commandExecutionSettings(command);
     IOResource resource;
-    if (shouldLimitCoreUsage()) {
+    if (!runsOnPersistentWorker && shouldLimitCoreUsage()) {
       resource = limitSpecifiedExecution(limits, operationName, owner, arguments, workingDirectory);
     } else {
       resource =
@@ -1072,6 +1074,18 @@ class ShardWorkerContext implements WorkerContext {
       arguments.add(configs.getExecutionWrappers().getAsNobody());
     }
     return resource;
+  }
+
+  @Override
+  public WorkerResources.Profile persistentWorkerResources(Command command) {
+    ResourceLimits limits = commandExecutionSettings(command);
+    if (!limits.cgroups || (!shouldLimitCoreUsage() && !limits.mem.limit)) {
+      return WorkerResources.Profile.NONE;
+    }
+    return PersistentWorkerCgroup.profile(
+        executionsGroup.getChild("persistent-workers"),
+        getCgroups(),
+        limits.mem.limit ? limits.mem.claimed : 0);
   }
 
   private String getCgroups() {

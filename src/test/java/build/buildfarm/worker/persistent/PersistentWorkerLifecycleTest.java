@@ -17,11 +17,15 @@ package build.buildfarm.worker.persistent;
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 import persistent.bazel.client.PersistentWorker;
+import persistent.bazel.client.WorkerResources;
 
 @RunWith(JUnit4.class)
 public class PersistentWorkerLifecycleTest {
@@ -97,5 +101,28 @@ public class PersistentWorkerLifecycleTest {
     lifecycle.terminated(worker);
 
     assertThat(lifecycle.snapshot(worker)).isEmpty();
+  }
+
+  @Test
+  public void oldResourceLeaseCannotChangeOrFreezeNewRequest() throws Exception {
+    PersistentWorkerLifecycle lifecycle = new PersistentWorkerLifecycle();
+    PersistentWorker worker = mock(PersistentWorker.class);
+    WorkerResources delegate = mock(WorkerResources.class);
+    when(worker.getResources()).thenReturn(delegate);
+    lifecycle.register(worker);
+    var first = lifecycle.lease(worker, "first");
+    WorkerResources old = lifecycle.resourcesFor(first);
+    old.setCpu(100000);
+    lifecycle.release(first);
+    var second = lifecycle.lease(worker, "second");
+    lifecycle.resourcesFor(second).setCpu(200000);
+    assertThrows(IllegalStateException.class, () -> old.setCpu(50000));
+    assertThrows(IllegalStateException.class, old::resume);
+    assertThrows(IllegalStateException.class, old::idle);
+    verify(delegate).setCpu(100000);
+    verify(delegate).setCpu(200000);
+    verify(delegate, never()).setCpu(50000);
+    verify(delegate, never()).idle();
+    verify(delegate, never()).resume();
   }
 }

@@ -57,6 +57,29 @@ public class CommonsPool<K, V> extends CommonsObjPool<K, V> {
     }
   }
 
+  /** Bound only pool contention; creation/validation failures must not trigger native fallback. */
+  public V obtain(K key, Duration maxWait) throws IOException, InterruptedException {
+    try {
+      return super.borrowObject(key, maxWait);
+    } catch (NoSuchElementException e) {
+      // Commons Pool also uses this exception for failed validation (even without a cause).
+      // Only its two exhaustion cases are safe to retry through native execution.
+      String message = e.getMessage();
+      if (e.getCause() == null
+          && !isClosed()
+          && message != null
+          && (message.startsWith("Timeout waiting for idle object")
+              || message.startsWith("Pool exhausted"))) {
+        throw new PoolExhaustedException(e);
+      }
+      throw new IOException("Unable to create or validate a persistent worker", e);
+    } catch (IOException | InterruptedException e) {
+      throw e;
+    } catch (Exception e) {
+      throw new IOException("Unable to obtain a persistent worker", e);
+    }
+  }
+
   @Override
   public void invalidateObject(K key, V obj) throws IOException, InterruptedException {
     try {
@@ -93,7 +116,9 @@ public class CommonsPool<K, V> extends CommonsObjPool<K, V> {
 
     // Always test the liveliness of worker processes.
     config.setTestOnBorrow(true);
-    config.setTestOnCreate(true);
+    // Validate at borrow instead: Commons Pool turns failed create-time validation into
+    // apparent exhaustion, which would incorrectly allow native fallback after a launch failure.
+    config.setTestOnCreate(false);
     config.setTestOnReturn(true);
 
     // A negative interval disables eviction; otherwise inspect every idle object on each run.

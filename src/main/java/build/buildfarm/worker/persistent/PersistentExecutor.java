@@ -38,6 +38,8 @@ import java.util.Map;
 import java.util.logging.Level;
 import lombok.extern.java.Log;
 import persistent.bazel.client.WorkerKey;
+import persistent.bazel.client.WorkerResources;
+import persistent.common.PoolExhaustedException;
 
 /**
  * Executes an Action like Executor/DockerExecutor, writing to ActionResult.
@@ -128,6 +130,31 @@ public class PersistentExecutor {
       Path workRootsDir,
       ActionResult.Builder resultBuilder)
       throws IOException, InterruptedException {
+    return runOnPersistentWorker(
+        context,
+        operationName,
+        argsList,
+        envVars,
+        limits,
+        timeout,
+        workRootsDir,
+        resultBuilder,
+        WorkerResources.Profile.NONE,
+        (resources, work) -> work.call());
+  }
+
+  public static Code runOnPersistentWorker(
+      WorkFilesContext context,
+      String operationName,
+      ImmutableList<String> argsList,
+      ImmutableMap<String, String> envVars,
+      ResourceLimits limits,
+      Duration timeout,
+      Path workRootsDir,
+      ActionResult.Builder resultBuilder,
+      WorkerResources.Profile resourceProfile,
+      RequestCtx.Execution execution)
+      throws IOException, InterruptedException {
     // Pull out persistent worker start command from the overall action request
 
     log.log(Level.FINE, "executeCommandOnPersistentWorker[" + operationName + "]");
@@ -170,13 +197,14 @@ public class PersistentExecutor {
 
     WorkerKey key =
         Keymaker.make(
-            context.opRoot,
-            workRootsDir,
-            workerExecCmd,
-            workerInitArgs,
-            env,
-            executionName,
-            workerFiles);
+                context.opRoot,
+                workRootsDir,
+                workerExecCmd,
+                workerInitArgs,
+                env,
+                executionName,
+                workerFiles)
+            .withResourceProfile(resourceProfile);
 
     long persistentWorkerRequestStarted = PersistentWorkerMetrics.startTimer();
     long toolSetupStarted = PersistentWorkerMetrics.startTimer();
@@ -216,6 +244,7 @@ public class PersistentExecutor {
 
     RequestCtx requestCtx =
         new RequestCtx(request, context, workerFiles, timeout, persistentWorkerRequestStarted);
+    requestCtx.execution = execution;
 
     // Run request
     // Required file operations (in/out) are the responsibility of the coordinator
@@ -228,6 +257,9 @@ public class PersistentExecutor {
 
       response = fullResponse.response;
       stdErr = fullResponse.errorString;
+    } catch (PoolExhaustedException e) {
+      // No request was submitted: the executor can safely rebuild the native execution path.
+      throw e;
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       throw e;
@@ -260,7 +292,7 @@ public class PersistentExecutor {
         .setExitCode(exitCode)
         .setStdoutRaw(response.getOutputBytes())
         .setStderrRaw(ByteString.copyFrom(stdErr, StandardCharsets.UTF_8));
-    return Code.OK;
+    return requestCtx.timedOut() ? Code.DEADLINE_EXCEEDED : Code.OK;
   }
 
   private static ImmutableList<String> parseInitCmd(String cmdStr, ImmutableList<String> argsList) {

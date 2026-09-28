@@ -18,8 +18,10 @@ import static build.buildfarm.common.Claim.Stage.REPORT_RESULT_STAGE;
 import static build.buildfarm.common.config.Server.INSTANCE_TYPE.SHARD;
 import static com.google.common.truth.Truth.assertThat;
 import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
@@ -260,5 +262,37 @@ public class ShardWorkerContextTest {
     verify(listener, times(2)).onWaitStart();
     verify(listener, times(2)).onWaitEnd();
     verifyNoMoreInteractions(listener);
+  }
+
+  @Test
+  public void persistentActionDoesNotOwnAnOperationCgroup() throws Exception {
+    ShardWorkerContext context = spy((ShardWorkerContext) createTestContext());
+    build.buildfarm.worker.resources.ResourceLimits limits =
+        new build.buildfarm.worker.resources.ResourceLimits();
+    limits.cgroups = true;
+    limits.cpu.limit = true;
+    limits.cpu.max = 2;
+    limits.mem.limit = true;
+    limits.mem.claimed = 1048576;
+    doReturn(true).when(context).shouldLimitCoreUsage();
+    doReturn(limits).when(context).commandExecutionSettings(any());
+    ImmutableList.Builder<String> arguments = ImmutableList.builder();
+    try (WorkerContext.IOResource action =
+        context.limitExecution(
+            "operation-a",
+            null,
+            arguments,
+            Command.getDefaultInstance(),
+            Path.of("/tmp/action-a"),
+            true)) {
+      assertThat(action.isReferenced()).isFalse();
+      assertThat(arguments.build()).isEmpty();
+      var first = context.persistentWorkerResources(Command.getDefaultInstance());
+      var second = context.persistentWorkerResources(Command.getDefaultInstance());
+      assertThat(first.identity()).isEqualTo(second.identity());
+      limits.mem.claimed = 2097152;
+      assertThat(context.persistentWorkerResources(Command.getDefaultInstance()).identity())
+          .isNotEqualTo(first.identity());
+    }
   }
 }

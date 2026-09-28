@@ -52,6 +52,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.devtools.build.lib.shell.Protos.ExecutionStatistics;
+import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
 import com.google.longrunning.Operation;
 import com.google.protobuf.Any;
 import com.google.protobuf.ByteString;
@@ -73,11 +74,17 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import javax.annotation.Nullable;
 import lombok.extern.java.Log;
+import persistent.bazel.client.WorkerResources;
+import persistent.common.PoolExhaustedException;
 
 @Log
 public class Executor {
@@ -95,6 +102,12 @@ public class Executor {
           .name("persistent_worker_eligibility_total")
           .labelNames("outcome")
           .help("Persistent-worker eligibility decisions by bounded outcome.")
+          .register();
+
+  private static final Counter persistentWorkerFallbacks =
+      Counter.build()
+          .name("persistent_worker_fallbacks_total")
+          .help("Actions switched to native execution because the persistent worker pool was full.")
           .register();
 
   static {
@@ -341,97 +354,18 @@ public class Executor {
     String executionName = executionContext.operation.getName();
     log.log(Level.FINER, format("Executor: Operation %s Executing command", executionName));
 
-    Command command = executionContext.command;
-    Path workingDirectory = executionContext.execDir;
-    if (!command.getWorkingDirectory().isEmpty()) {
-      workingDirectory = workingDirectory.resolve(command.getWorkingDirectory());
-    }
-
-    // similar to the policy selection here
-    Map<String, Interpolator> interpolations =
-        createInterpolations(
-            executionContext.claim, executionContext.queueEntry.getPlatform().getPropertiesList());
-
-    ImmutableList.Builder<String> arguments = ImmutableList.builder();
-
-    // Apply custom PRIORITIZED execution policies BEFORE built-in wrappers
-    for (ExecutionPolicy policy : policies) {
-      if (policy.isPrioritized() && policy.getExecutionWrapper() != null) {
-        arguments.addAll(transformWrapper(policy.getExecutionWrapper(), interpolations));
-      }
-    }
-
-    UserPrincipal execOwner = null;
-    if (executionContext.claim.get(UserPrincipalLease.RESOURCE_NAME)
-        instanceof UserPrincipalLease ownerLease) {
-      execOwner = ownerLease.owner();
-    }
-
     Code statusCode;
     WorkFilesContext persistentWorkerFilesContext = getPersistentWorkerFilesContext();
-    boolean usePersistentWorker = persistentWorkerFilesContext != null;
-    try (IOResource resource =
-        workerContext.limitExecution(
-            executionName,
-            execOwner,
-            arguments,
-            executionContext.command,
-            workingDirectory,
-            usePersistentWorker)) {
-      // Apply all other custom execution policies AFTER built-in wrappers
-      for (ExecutionPolicy policy : policies) {
-        if (!policy.isPrioritized() && policy.getExecutionWrapper() != null) {
-          arguments.addAll(transformWrapper(policy.getExecutionWrapper(), interpolations));
-        }
-      }
-
-      // Windows requires that relative command programs are absolutized
-      Iterator<String> argumentItr = command.getArgumentsList().iterator();
-      boolean absolutizeExe =
-          BuildfarmConfigs.getInstance().getWorker().isAbsolutizeCommandProgram()
-              && argumentItr.hasNext()
-              && Files.exists(workingDirectory.resolve(command.getArguments(0)));
-      if (absolutizeExe) {
-        Path exe =
-            workingDirectory.resolve(
-                argumentItr.next()); // Get first element, this is the executable
-        arguments.add(exe.toAbsolutePath().normalize().toString());
-      }
-      argumentItr.forEachRemaining(arguments::add);
-
+    try {
       statusCode =
-          executeCommand(
-              executionName,
-              workingDirectory,
-              arguments.build(),
-              command.getEnvironmentVariablesList(),
-              limits,
-              resource,
-              persistentWorkerFilesContext,
+          executeWithPoolFallback(
               timeout,
-              // executingMetadata.getStdoutStreamName(),
-              // executingMetadata.getStderrStreamName(),
-              executionContext.executeResponse.getResultBuilder());
-
-      // From Bazel Test Encyclopedia:
-      // If the main process of a test exits, but some of its children are still running,
-      // the test runner should consider the run complete and count it as a success or failure
-      // based on the exit code observed from the main process. The test runner may kill any stray
-      // processes. Tests should not leak processes in this fashion.
-      // Based on configuration, we will decide whether remaining resources should be an error.
-      if (workerContext.shouldErrorOperationOnRemainingResources()
-          && resource.isReferenced()
-          && statusCode == Code.OK) {
-        // there should no longer be any references to the resource. Any references will be
-        // killed upon close, but we must error the operation due to improper execution
-        // per the gRPC spec: 'The operation was attempted past the valid range.' Seems
-        // appropriate
-        statusCode = Code.OUT_OF_RANGE;
-        executionContext
-            .executeResponse
-            .getStatusBuilder()
-            .setMessage("command resources were referenced after execution completed");
-      }
+              (usePersistentWorker, remaining) ->
+                  executeAttempt(
+                      limits,
+                      policies,
+                      remaining,
+                      usePersistentWorker ? persistentWorkerFilesContext : null));
     } catch (IOException e) {
       log.log(Level.SEVERE, format("error executing %s", executionName), e);
       executionContext.poller.pause();
@@ -546,6 +480,134 @@ public class Executor {
     }
   }
 
+  @FunctionalInterface
+  interface ExecutionAttempt {
+    Code run(boolean usePersistentWorker, Duration timeout)
+        throws IOException, InterruptedException;
+  }
+
+  @VisibleForTesting
+  static Code executeWithPoolFallback(Duration timeout, ExecutionAttempt attempt)
+      throws IOException, InterruptedException {
+    long started = System.nanoTime();
+    try {
+      return attempt.run(true, timeout);
+    } catch (PoolExhaustedException e) {
+      if (Thread.currentThread().isInterrupted()) {
+        throw new InterruptedException("Interrupted while waiting for a persistent worker");
+      }
+      long remaining = Durations.toNanos(timeout) - (System.nanoTime() - started);
+      if (remaining <= 0) {
+        return Code.DEADLINE_EXCEEDED;
+      }
+      persistentWorkerFallbacks.inc();
+      return attempt.run(false, Durations.fromNanos(remaining));
+    }
+  }
+
+  @VisibleForTesting
+  Code executeAttempt(
+      ResourceLimits limits,
+      Iterable<ExecutionPolicy> policies,
+      Duration timeout,
+      @Nullable WorkFilesContext persistentWorkerFilesContext)
+      throws IOException, InterruptedException {
+    String executionName = executionContext.operation.getName();
+    Command command = executionContext.command;
+    Path workingDirectory = executionContext.execDir;
+    if (!command.getWorkingDirectory().isEmpty()) {
+      workingDirectory = workingDirectory.resolve(command.getWorkingDirectory());
+    }
+
+    // similar to the policy selection here
+    Map<String, Interpolator> interpolations =
+        createInterpolations(
+            executionContext.claim, executionContext.queueEntry.getPlatform().getPropertiesList());
+
+    ImmutableList.Builder<String> arguments = ImmutableList.builder();
+
+    // Apply custom PRIORITIZED execution policies BEFORE built-in wrappers
+    for (ExecutionPolicy policy : policies) {
+      if (policy.isPrioritized() && policy.getExecutionWrapper() != null) {
+        arguments.addAll(transformWrapper(policy.getExecutionWrapper(), interpolations));
+      }
+    }
+
+    UserPrincipal execOwner = null;
+    if (executionContext.claim.get(UserPrincipalLease.RESOURCE_NAME)
+        instanceof UserPrincipalLease ownerLease) {
+      execOwner = ownerLease.owner();
+    }
+
+    Code statusCode;
+    boolean usePersistentWorker = persistentWorkerFilesContext != null;
+    try (IOResource resource =
+        workerContext.limitExecution(
+            executionName,
+            execOwner,
+            arguments,
+            executionContext.command,
+            workingDirectory,
+            usePersistentWorker)) {
+      // Apply all other custom execution policies AFTER built-in wrappers
+      for (ExecutionPolicy policy : policies) {
+        if (!policy.isPrioritized() && policy.getExecutionWrapper() != null) {
+          arguments.addAll(transformWrapper(policy.getExecutionWrapper(), interpolations));
+        }
+      }
+
+      // Windows requires that relative command programs are absolutized
+      Iterator<String> argumentItr = command.getArgumentsList().iterator();
+      boolean absolutizeExe =
+          BuildfarmConfigs.getInstance().getWorker().isAbsolutizeCommandProgram()
+              && argumentItr.hasNext()
+              && Files.exists(workingDirectory.resolve(command.getArguments(0)));
+      if (absolutizeExe) {
+        Path exe =
+            workingDirectory.resolve(
+                argumentItr.next()); // Get first element, this is the executable
+        arguments.add(exe.toAbsolutePath().normalize().toString());
+      }
+      argumentItr.forEachRemaining(arguments::add);
+
+      statusCode =
+          executeCommand(
+              executionName,
+              workingDirectory,
+              arguments.build(),
+              command.getEnvironmentVariablesList(),
+              limits,
+              resource,
+              persistentWorkerFilesContext,
+              timeout,
+              // executingMetadata.getStdoutStreamName(),
+              // executingMetadata.getStderrStreamName(),
+              executionContext.executeResponse.getResultBuilder());
+      usedPersistentWorker = usePersistentWorker;
+
+      // From Bazel Test Encyclopedia:
+      // If the main process of a test exits, but some of its children are still running,
+      // the test runner should consider the run complete and count it as a success or failure
+      // based on the exit code observed from the main process. The test runner may kill any stray
+      // processes. Tests should not leak processes in this fashion.
+      // Based on configuration, we will decide whether remaining resources should be an error.
+      if (workerContext.shouldErrorOperationOnRemainingResources()
+          && resource.isReferenced()
+          && statusCode == Code.OK) {
+        // there should no longer be any references to the resource. Any references will be
+        // killed upon close, but we must error the operation due to improper execution
+        // per the gRPC spec: 'The operation was attempted past the valid range.' Seems
+        // appropriate
+        statusCode = Code.OUT_OF_RANGE;
+        executionContext
+            .executeResponse
+            .getStatusBuilder()
+            .setMessage("command resources were referenced after execution completed");
+      }
+    }
+    return statusCode;
+  }
+
   /**
    * Decide if this action should run on a Persistent Worker. <br>
    *
@@ -600,7 +662,8 @@ public class Executor {
   }
 
   @SuppressWarnings("ConstantConditions")
-  private Code executeCommand(
+  @VisibleForTesting
+  Code executeCommand(
       String executionName,
       Path execDir,
       List<String> arguments,
@@ -653,16 +716,25 @@ public class Executor {
               "usePersistentWorker (mnemonic=%s)",
               executionContext.metadata.getRequestMetadata().getActionMnemonic()));
 
-      usedPersistentWorker = true;
+      WorkerResources.Profile profile =
+          workerContext.persistentWorkerResources(executionContext.command);
+      // Keep a generation-guarded watchdog over setup and execution. The shared monitor can
+      // extend market execution once, so the watchdog must allow that same maximum duration.
+      Duration watchdogTimeout =
+          executionContext.marketExecution && profile != WorkerResources.Profile.NONE
+              ? add(timeout, timeout)
+              : timeout;
       return PersistentExecutor.runOnPersistentWorker(
           persistentWorkerFilesContext,
           executionName,
           ImmutableList.copyOf(processBuilder.command()),
           ImmutableMap.copyOf(processBuilder.environment()),
           limits,
-          timeout,
+          watchdogTimeout,
           PersistentExecutor.defaultWorkRootsDir,
-          resultBuilder);
+          resultBuilder,
+          profile,
+          (resources, work) -> executePersistentRequest(resources, work, timeout));
     }
 
     // run the action under docker
@@ -800,9 +872,14 @@ public class Executor {
     }
   }
 
+  @FunctionalInterface
+  interface Completion {
+    boolean await(long nanos) throws IOException, InterruptedException;
+  }
+
   private Code pollingExecution(
       String executionName,
-      Process process,
+      Completion completion,
       Duration timeout,
       IOResource resource,
       boolean marketExecution,
@@ -818,9 +895,8 @@ public class Executor {
       if (marketExecution || order.balance() != 0) {
         nsWait = Math.min(nsWait, SAMPLE_NANOS);
       }
-      if (process.waitFor(nsWait, TimeUnit.NANOSECONDS)) {
+      if (completion.await(Math.max(0, nsWait))) {
         recordUsage(periodShares, lastUsage.nrPeriods(), resource.sample());
-        exitCode = process.exitValue();
         return Code.OK;
       }
 
@@ -865,6 +941,12 @@ public class Executor {
 
       if (marketExecution) {
         Map<String, Long> sample = resource.sample();
+        if (!sample
+            .keySet()
+            .containsAll(
+                List.of(SAMPLE_CPU_NR_PERIODS, SAMPLE_CPU_USAGE_USEC, SAMPLE_CPU_THROTTLED_USEC))) {
+          throw new IOException("Missing cgroup CPU accounting samples");
+        }
         long nrPeriods = sample.get(SAMPLE_CPU_NR_PERIODS);
         long usCpuUsed = sample.get(SAMPLE_CPU_USAGE_USEC);
         long usCpuThrottled = sample.get(SAMPLE_CPU_THROTTLED_USEC);
@@ -879,6 +961,88 @@ public class Executor {
 
         lastUsage = usage;
       }
+    }
+  }
+
+  @VisibleForTesting
+  WorkResponse executePersistentRequest(
+      WorkerResources resources, Callable<WorkResponse> work, Duration timeout) throws Exception {
+    CPULease cpuLease = (CPULease) executionContext.claim.get(CPULease.RESOURCE_NAME);
+    shares = cpuLease.amount();
+    resources.setCpu(shares * 100);
+    Map<String, Long> baseline = resources.sample();
+    IOResource requestResource =
+        new IOResource() {
+          public void close() {}
+
+          public boolean isReferenced() {
+            return false;
+          }
+
+          public void setCpu(int micros) throws IOException {
+            resources.setCpu(micros);
+          }
+
+          public Map<String, Long> sample() {
+            Map<String, Long> delta = new HashMap<>(resources.sample());
+            for (String counter :
+                List.of(
+                    SAMPLE_CPU_USAGE_USEC,
+                    SAMPLE_CPU_THROTTLED_USEC,
+                    SAMPLE_CPU_NR_PERIODS,
+                    "cpu.nr_throttled",
+                    "cpu.user_usec",
+                    "cpu.system_usec")) {
+              if (delta.containsKey(counter)) {
+                delta.put(
+                    counter, Math.max(0, delta.get(counter) - baseline.getOrDefault(counter, 0L)));
+              }
+            }
+            return delta;
+          }
+        };
+    resources.resume();
+    FutureTask<WorkResponse> response = new FutureTask<>(work);
+    Thread reader = new Thread(response, "persistent-worker-request");
+    reader.setDaemon(true);
+    reader.start();
+    try {
+      Code status =
+          pollingExecution(
+              executionContext.operation.getName(),
+              nanos -> {
+                try {
+                  response.get(nanos, TimeUnit.NANOSECONDS);
+                  return true;
+                } catch (TimeoutException e) {
+                  return false;
+                } catch (ExecutionException e) {
+                  // Surface the original failure below, through the coordinator's invalidation
+                  // path.
+                  return true;
+                }
+              },
+              timeout,
+              requestResource,
+              executionContext.marketExecution && resources != WorkerResources.NONE,
+              cpuLease);
+      if (status != Code.OK) {
+        throw new TimeoutException("Persistent worker request timed out");
+      }
+      try {
+        WorkResponse result = response.get();
+        exitCode = result.getExitCode();
+        return result;
+      } catch (ExecutionException e) {
+        if (e.getCause() instanceof Exception cause) {
+          throw cause;
+        }
+        throw e;
+      }
+    } finally {
+      order.cancel();
+      response.cancel(true);
+      // The coordinator retires and terminates the process on failure, unblocking its reader.
     }
   }
 
@@ -948,7 +1112,16 @@ public class Executor {
         executionContext.workerExecutedMetadata.putAllUsage(resource.sample());
       } else {
         statusCode =
-            pollingExecution(executionName, process, timeout, resource, marketExecution, cpuLease);
+            pollingExecution(
+                executionName,
+                nanos -> process.waitFor(nanos, TimeUnit.NANOSECONDS),
+                timeout,
+                resource,
+                marketExecution,
+                cpuLease);
+        if (statusCode == Code.OK) {
+          exitCode = process.exitValue();
+        }
       }
       processCompleted = true;
     } finally {

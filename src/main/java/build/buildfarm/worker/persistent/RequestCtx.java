@@ -15,11 +15,22 @@
 package build.buildfarm.worker.persistent;
 
 import com.google.devtools.build.lib.worker.WorkerProtocol.WorkRequest;
+import com.google.devtools.build.lib.worker.WorkerProtocol.WorkResponse;
 import com.google.protobuf.Duration;
+import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicBoolean;
+import persistent.bazel.client.WorkerResources;
 import persistent.common.CtxAround;
 
 public class RequestCtx implements CtxAround<WorkRequest> {
+  /** Runs a request while its exclusive lifecycle lease is held. */
+  @FunctionalInterface
+  public interface Execution {
+    WorkResponse run(WorkerResources resources, Callable<WorkResponse> work) throws Exception;
+  }
+
+  public Execution execution = (resources, work) -> work.call();
+
   public final WorkRequest request;
 
   public final WorkFilesContext filesContext;
