@@ -173,6 +173,9 @@ worker:
   persistentWorkerActionMnemonicAllowlist:
   - '*'
   persistentWorkers:
+    # Temporary diagnostics: incoming Bazel key -> complete Buildfarm pool-key fingerprint.
+    # Includes component hashes, never raw startup arguments or environment values.
+    logKeyMappings: false
     # Fall back to native execution after this pool wait; zero means no waiting.
     poolWaitTimeoutMillis: 1000
     maxWorkersPerKey: 6

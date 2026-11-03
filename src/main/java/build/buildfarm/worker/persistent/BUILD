@@ -30,5 +30,7 @@ java_library(
         "@buildfarm_maven//:org_apache_commons_commons_pool2",
         "@buildfarm_maven//:org_jetbrains_annotations",
         "@buildfarm_maven//:org_projectlombok_lombok",
+        "@buildfarm_maven//:org_slf4j_slf4j_api",
+        "@remoteapis//build/bazel/remote/execution/v2:remote_execution_java_proto",
     ],
 )

@@ -734,7 +734,8 @@ public class Executor {
           PersistentExecutor.defaultWorkRootsDir,
           resultBuilder,
           profile,
-          (resources, work) -> executePersistentRequest(resources, work, timeout));
+          (resources, work) -> executePersistentRequest(resources, work, timeout),
+          executionContext.metadata.getRequestMetadata());
     }
 
     // run the action under docker

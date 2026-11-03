@@ -21,6 +21,36 @@ Execution Workers are responsible for matching their environments against operat
 * Concurrent pipelined execution of operations, with support for superscalar stages at input fetch and execution.
 * Operation exclusivity, preventing the same operation from running through the worker pipeline concurrently.
 
+### Persistent-worker key diagnostics
+
+To investigate how client-supplied persistent-worker keys map to Buildfarm pools, enable:
+
+```yaml
+worker:
+  persistentWorkers:
+    logKeyMappings: true
+```
+
+This setting defaults to `false`. When enabled, the worker emits one INFO event with
+`event_type=persistent_worker_key_mapping` after constructing the complete key and before tool setup
+or pool selection. An event describes an execution attempt; it does not imply that a process was
+created, reused, or successfully executed. An attempt can subsequently fall back to native execution.
+Cache hits and actions that are not eligible for persistent execution do not emit these events.
+
+The event pairs `action_mnemonic` and `bazel_worker_key` with `buildfarm_tools_hash` and
+`buildfarm_pool_key`. The latter is a SHA-256 fingerprint covering all pool compatibility fields,
+including the resource profile. Separate command, arguments, environment, execution-root, and
+resource-profile fingerprints help explain splits. Environment entries are sorted and strings are
+length-prefixed before hashing. Raw startup arguments, environment values, and tool manifests are
+not included. The actual action mnemonic is separate from Buildfarm's inferred
+`worker_execution_name`.
+
+Events also carry `operation_name`, `tool_invocation_id`, `action_id`, and `key_mapping_version`.
+The fields use SLF4J MDC; configure the logging encoder to include MDC fields (for example, the
+Logstash composite encoder's `<mdc/>` provider). The logger is
+`build.buildfarm.worker.persistent.PersistentWorkerKeyLogger`. Existing MDC is restored after each
+event. Disable the setting after collection and restart or replace workers to apply the change.
+
 ## CAS Shard
 
 Sharded workers interact with the shard backplane for both execution and CAS presentation. Their CAS FileCache serves a CAS gRPC interface as well as the execution root factory.

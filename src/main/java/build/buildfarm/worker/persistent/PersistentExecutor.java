@@ -17,6 +17,7 @@ package build.buildfarm.worker.persistent;
 import static java.lang.String.join;
 
 import build.bazel.remote.execution.v2.ActionResult;
+import build.bazel.remote.execution.v2.RequestMetadata;
 import build.buildfarm.common.config.BuildfarmConfigs;
 import build.buildfarm.common.config.PersistentWorkers;
 import build.buildfarm.worker.resources.ResourceLimits;
@@ -155,6 +156,33 @@ public class PersistentExecutor {
       WorkerResources.Profile resourceProfile,
       RequestCtx.Execution execution)
       throws IOException, InterruptedException {
+    return runOnPersistentWorker(
+        context,
+        operationName,
+        argsList,
+        envVars,
+        limits,
+        timeout,
+        workRootsDir,
+        resultBuilder,
+        resourceProfile,
+        execution,
+        RequestMetadata.getDefaultInstance());
+  }
+
+  public static Code runOnPersistentWorker(
+      WorkFilesContext context,
+      String operationName,
+      ImmutableList<String> argsList,
+      ImmutableMap<String, String> envVars,
+      ResourceLimits limits,
+      Duration timeout,
+      Path workRootsDir,
+      ActionResult.Builder resultBuilder,
+      WorkerResources.Profile resourceProfile,
+      RequestCtx.Execution execution,
+      RequestMetadata requestMetadata)
+      throws IOException, InterruptedException {
     // Pull out persistent worker start command from the overall action request
 
     log.log(Level.FINE, "executeCommandOnPersistentWorker[" + operationName + "]");
@@ -205,6 +233,11 @@ public class PersistentExecutor {
                 executionName,
                 workerFiles)
             .withResourceProfile(resourceProfile);
+
+    if (BuildfarmConfigs.getInstance().getWorker().getPersistentWorkers().isLogKeyMappings()) {
+      PersistentWorkerKeyLogger.log(
+          key, limits.persistentWorkerKey, operationName, requestMetadata);
+    }
 
     long persistentWorkerRequestStarted = PersistentWorkerMetrics.startTimer();
     long toolSetupStarted = PersistentWorkerMetrics.startTimer();

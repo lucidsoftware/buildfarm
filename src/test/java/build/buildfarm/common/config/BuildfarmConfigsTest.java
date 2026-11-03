@@ -455,6 +455,7 @@ public class BuildfarmConfigsTest {
     String yamlContent =
         "worker:\n"
             + "  persistentWorkers:\n"
+            + "    logKeyMappings: true\n"
             + "    poolWaitTimeoutMillis: 250\n"
             + "    maxWorkersPerKey: 4\n"
             + "    maxWorkersTotal: 40\n"
@@ -467,6 +468,7 @@ public class BuildfarmConfigsTest {
 
     BuildfarmConfigs configs = BuildfarmConfigs.loadConfigs(configFile);
     PersistentWorkers settings = configs.getWorker().getPersistentWorkers();
+    assertTrue(settings.isLogKeyMappings());
     assertEquals(250L, settings.getPoolWaitTimeoutMillis());
     assertEquals(4, settings.getMaxWorkersPerKey());
     assertEquals(40, settings.getMaxWorkersTotal());

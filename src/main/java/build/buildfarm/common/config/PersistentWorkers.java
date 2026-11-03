@@ -16,9 +16,12 @@ package build.buildfarm.common.config;
 
 import lombok.Data;
 
-/** Persistent-worker lifecycle settings. */
+/** Persistent-worker lifecycle and diagnostic settings. */
 @Data
 public class PersistentWorkers {
+  // Emit one structured INFO event per persistent execution attempt, before pool selection.
+  private boolean logKeyMappings = false;
+
   public enum IdleRetirementMode {
     DISABLED,
     SHADOW,
