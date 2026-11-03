@@ -33,6 +33,7 @@ public class ExecuteActionStage extends PipelineStage {
   private static final Histogram executionTime =
       Histogram.build()
           .name("execution_time_ms")
+          .labelNames("mnemonic", "persistent_worker")
           .help("Execution time in ms.")
           .buckets(
               100,
@@ -283,8 +284,16 @@ public class ExecuteActionStage extends PipelineStage {
     }
   }
 
-  void releaseExecutor(String executionName, long usecs, long stallUSecs, int exitCode) {
-    executionTime.observe(usecs / 1000.0);
+  void releaseExecutor(
+      String executionName,
+      String mnemonic,
+      boolean persistentWorker,
+      long usecs,
+      long stallUSecs,
+      int exitCode) {
+    executionTime
+        .labels(mnemonic.isEmpty() ? "unknown" : mnemonic, Boolean.toString(persistentWorker))
+        .observe(usecs / 1000.0);
     executionStallTime.observe(stallUSecs / 1000.0);
     complete(executionName, usecs, stallUSecs, String.format("exit code: %d", exitCode));
   }

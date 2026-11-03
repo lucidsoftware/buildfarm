@@ -238,6 +238,10 @@ public final class BuildfarmConfigs {
     if (settings == null) {
       throw new ConfigurationException("persistentWorkers must be configured");
     }
+    if (settings.getPoolWaitTimeoutMillis() < 0) {
+      throw new ConfigurationException(
+          "persistentWorkers.poolWaitTimeoutMillis must not be negative");
+    }
     if (settings.getMaxWorkersPerKey() <= 0) {
       throw new ConfigurationException("persistentWorkers.maxWorkersPerKey must be positive");
     }

@@ -25,12 +25,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Assert;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 import persistent.bazel.client.PersistentWorker;
 import persistent.bazel.client.WorkerKey;
+import persistent.bazel.client.WorkerResources;
 import persistent.common.processes.JavaProcessWrapper;
 import persistent.testutil.ProcessUtils;
 import persistent.testutil.WorkerUtils;
@@ -150,5 +152,47 @@ public class PersistentWorkerTest {
 
     assertThat(worker.terminate(Duration.ofSeconds(1))).isTrue();
     assertThat(worker.getExitValue()).isPresent();
+  }
+
+  @Test
+  public void resourceProfileSeparatesLimitsButNotIndividualProcessIdentity() throws Exception {
+    Path workDir = Files.createTempDirectory("test-workdir-");
+    WorkerKey base = WorkerUtils.emptyWorkerKey(workDir, ImmutableList.of("compiler"));
+    WorkerResources.Profile first = profile("memory=1024", new AtomicInteger());
+    WorkerResources.Profile second = profile("memory=1024", new AtomicInteger());
+    WorkerResources.Profile different = profile("memory=2048", new AtomicInteger());
+    assertThat(base.withResourceProfile(first)).isEqualTo(base.withResourceProfile(second));
+    assertThat(base.withResourceProfile(first).hashCode())
+        .isEqualTo(base.withResourceProfile(second).hashCode());
+    assertThat(base.withResourceProfile(first)).isNotEqualTo(base.withResourceProfile(different));
+  }
+
+  @Test
+  public void failedLaunchCleansUpProcessOwnedResources() throws Exception {
+    Path workDir = Files.createTempDirectory("test-workdir-");
+    AtomicInteger terminations = new AtomicInteger();
+    WorkerKey key =
+        WorkerUtils.emptyWorkerKey(
+                workDir, ImmutableList.of(workDir.resolve("missing-compiler").toString()))
+            .withResourceProfile(profile("test", terminations));
+    assertThrows(IOException.class, () -> new PersistentWorker(key, "process"));
+    assertThat(terminations.get()).isEqualTo(1);
+  }
+
+  private static WorkerResources.Profile profile(String identity, AtomicInteger terminations) {
+    return new WorkerResources.Profile() {
+      public String identity() {
+        return identity;
+      }
+
+      public WorkerResources create() {
+        return new WorkerResources() {
+          public boolean terminate(Duration grace) {
+            terminations.incrementAndGet();
+            return true;
+          }
+        };
+      }
+    };
   }
 }

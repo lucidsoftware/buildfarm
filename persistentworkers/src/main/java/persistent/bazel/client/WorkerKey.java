@@ -73,6 +73,8 @@ public final class WorkerKey {
    */
   private final int hash;
 
+  @Getter private final WorkerResources.Profile resourceProfile;
+
   public WorkerKey(
       ImmutableList<String> cmd,
       ImmutableList<String> args,
@@ -83,6 +85,31 @@ public final class WorkerKey {
       SortedMap<Path, HashCode> workerFilesWithHashes,
       boolean sandboxed,
       boolean cancellable) {
+    this(
+        cmd,
+        args,
+        env,
+        execRoot,
+        mnemonic,
+        workerFilesCombinedHash,
+        workerFilesWithHashes,
+        sandboxed,
+        cancellable,
+        WorkerResources.Profile.NONE);
+  }
+
+  private WorkerKey(
+      ImmutableList<String> cmd,
+      ImmutableList<String> args,
+      ImmutableMap<String, String> env,
+      Path execRoot,
+      String mnemonic,
+      HashCode workerFilesCombinedHash,
+      SortedMap<Path, HashCode> workerFilesWithHashes,
+      boolean sandboxed,
+      boolean cancellable,
+      WorkerResources.Profile resourceProfile) {
+    this.resourceProfile = Objects.requireNonNull(resourceProfile);
     // Part of hash
     this.cmd = Preconditions.checkNotNull(cmd);
     this.args = Preconditions.checkNotNull(args);
@@ -97,6 +124,20 @@ public final class WorkerKey {
     this.toolRoot = execRoot.resolve(workerFilesCombinedHash.toString());
 
     this.hash = calculateHashCode();
+  }
+
+  public WorkerKey withResourceProfile(WorkerResources.Profile profile) {
+    return new WorkerKey(
+        cmd,
+        args,
+        env,
+        execRoot,
+        mnemonic,
+        workerFilesCombinedHash,
+        workerFilesWithHashes,
+        sandboxed,
+        cancellable,
+        profile);
   }
 
   @Override
@@ -133,7 +174,8 @@ public final class WorkerKey {
     if (!workerFilesCombinedHash.equals(workerKey.workerFilesCombinedHash)) {
       return false;
     }
-    return mnemonic.equals(workerKey.mnemonic);
+    return mnemonic.equals(workerKey.mnemonic)
+        && resourceProfile.identity().equals(workerKey.resourceProfile.identity());
   }
 
   /** Since all fields involved in the {@code hashCode} are final, we cache the result. */
@@ -146,6 +188,14 @@ public final class WorkerKey {
     // Use the string representation of the protocolFormat because the hash of the same enum value
     // can vary across instances.
     return Objects.hash(
-        cmd, args, env, execRoot, mnemonic, cancellable, sandboxed, workerFilesCombinedHash);
+        cmd,
+        args,
+        env,
+        execRoot,
+        mnemonic,
+        cancellable,
+        sandboxed,
+        workerFilesCombinedHash,
+        resourceProfile.identity());
   }
 }

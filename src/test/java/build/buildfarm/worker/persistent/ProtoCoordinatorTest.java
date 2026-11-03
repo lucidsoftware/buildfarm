@@ -16,8 +16,11 @@ package build.buildfarm.worker.persistent;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.junit.Assert.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -41,10 +44,13 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.commons.pool2.PooledObject;
 import org.junit.After;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -52,6 +58,9 @@ import org.junit.runners.JUnit4;
 import persistent.bazel.client.CommonsWorkerPool;
 import persistent.bazel.client.PersistentWorker;
 import persistent.bazel.client.WorkerKey;
+import persistent.bazel.client.WorkerResources;
+import persistent.bazel.client.WorkerSupervisor;
+import persistent.common.PoolExhaustedException;
 
 @RunWith(JUnit4.class)
 public class ProtoCoordinatorTest {
@@ -97,6 +106,86 @@ public class ProtoCoordinatorTest {
               null);
     }
     return rootDir;
+  }
+
+  @Test(timeout = 5000)
+  public void exhaustedPoolTimesOutAndCanReuseReturnedWorker() throws Exception {
+    PersistentWorker worker = mock(PersistentWorker.class);
+    when(worker.getExitValue()).thenReturn(Optional.empty());
+    WorkerSupervisor supervisor =
+        new WorkerSupervisor() {
+          public PersistentWorker create(WorkerKey key) {
+            return worker;
+          }
+        };
+    try (CommonsWorkerPool pool = new CommonsWorkerPool(supervisor, 1)) {
+      WorkerKey key = mock(WorkerKey.class);
+      assertThat(pool.obtain(key, java.time.Duration.ZERO)).isSameInstanceAs(worker);
+      assertThrows(
+          PoolExhaustedException.class, () -> pool.obtain(key, java.time.Duration.ofMillis(10)));
+      assertThat(pool.getNumActive()).isEqualTo(1);
+      pool.release(key, worker);
+      assertThat(pool.obtain(key, java.time.Duration.ZERO)).isSameInstanceAs(worker);
+      pool.release(key, worker);
+    }
+  }
+
+  @Test(timeout = 5000)
+  public void globalPoolLimitBoundsWaitForDifferentKey() throws Exception {
+    PersistentWorker worker = mock(PersistentWorker.class);
+    when(worker.getExitValue()).thenReturn(Optional.empty());
+    WorkerSupervisor supervisor =
+        new WorkerSupervisor() {
+          public PersistentWorker create(WorkerKey key) {
+            return worker;
+          }
+        };
+    try (CommonsWorkerPool pool = new CommonsWorkerPool(supervisor, 1)) {
+      pool.setMaxTotal(1);
+      WorkerKey first = mock(WorkerKey.class);
+      assertThat(pool.obtain(first, java.time.Duration.ZERO)).isSameInstanceAs(worker);
+      assertThrows(
+          PoolExhaustedException.class,
+          () -> pool.obtain(mock(WorkerKey.class), java.time.Duration.ZERO));
+      pool.release(first, worker);
+    }
+  }
+
+  @Test
+  public void failedValidationIsNotPoolExhaustion() throws Exception {
+    PersistentWorker worker = mock(PersistentWorker.class);
+    WorkerSupervisor supervisor =
+        new WorkerSupervisor() {
+          public PersistentWorker create(WorkerKey key) {
+            return worker;
+          }
+
+          public boolean validateObject(WorkerKey key, PooledObject<PersistentWorker> value) {
+            return false;
+          }
+        };
+    try (CommonsWorkerPool pool = new CommonsWorkerPool(supervisor, 1)) {
+      IOException error =
+          assertThrows(
+              IOException.class, () -> pool.obtain(mock(WorkerKey.class), java.time.Duration.ZERO));
+      assertThat(error).isNotInstanceOf(PoolExhaustedException.class);
+    }
+  }
+
+  @Test
+  public void failedLaunchIsNotPoolExhaustion() throws Exception {
+    WorkerSupervisor supervisor =
+        new WorkerSupervisor() {
+          public PersistentWorker create(WorkerKey key) throws IOException {
+            throw new IOException("launch failed");
+          }
+        };
+    try (CommonsWorkerPool pool = new CommonsWorkerPool(supervisor, 1)) {
+      IOException error =
+          assertThrows(
+              IOException.class, () -> pool.obtain(mock(WorkerKey.class), java.time.Duration.ZERO));
+      assertThat(error).isNotInstanceOf(PoolExhaustedException.class);
+    }
   }
 
   @Test
@@ -547,5 +636,74 @@ public class ProtoCoordinatorTest {
 
     // Original file in the operation root should be untouched
     assertThat(Files.exists(inputFileInOpRoot)).isTrue();
+  }
+
+  @Test
+  public void sequentialOperationsQuiesceBeforeReturningTheSameWorker() throws Exception {
+    CommonsWorkerPool pool = mock(CommonsWorkerPool.class);
+    ProtoCoordinator coordinator = new ProtoCoordinator(pool);
+    coordinators.add(coordinator);
+    WorkerKey key = mock(WorkerKey.class);
+    PersistentWorker worker = mock(PersistentWorker.class);
+    Path root = Files.createTempDirectory("pw-leased-resources-");
+    AtomicBoolean idle = new AtomicBoolean(true);
+    WorkerResources resources =
+        new WorkerResources() {
+          public void resume() {
+            assertThat(idle.getAndSet(false)).isTrue();
+          }
+
+          public void idle() {
+            assertThat(idle.getAndSet(true)).isFalse();
+          }
+        };
+    when(worker.getResources()).thenReturn(resources);
+    when(worker.getExecRoot()).thenReturn(root);
+    when(worker.flushStdErr()).thenReturn("");
+    when(pool.obtain(org.mockito.ArgumentMatchers.eq(key), any(java.time.Duration.class)))
+        .thenReturn(worker);
+    when(worker.doWork(any()))
+        .thenAnswer(
+            invocation -> {
+              assertThat(idle.get()).isFalse();
+              return WorkResponse.newBuilder().setOutput("done").build();
+            });
+    doAnswer(
+            invocation -> {
+              assertThat(idle.get()).isTrue();
+              return null;
+            })
+        .when(pool)
+        .release(key, worker);
+    coordinator.lifecycle.register(worker);
+    for (String operation : List.of("operation-a", "operation-b")) {
+      Path opRoot = root.resolve(operation);
+      WorkFilesContext files =
+          new WorkFilesContext(
+              opRoot,
+              Tree.getDefaultInstance(),
+              ImmutableList.of(),
+              ImmutableList.of(),
+              ImmutableList.of());
+      WorkerInputs inputs =
+          new WorkerInputs(opRoot, ImmutableSet.of(), ImmutableSet.of(), ImmutableMap.of());
+      RequestCtx request =
+          new RequestCtx(
+              WorkRequest.getDefaultInstance(),
+              files,
+              inputs,
+              Duration.newBuilder().setSeconds(30).build());
+      request.execution =
+          (leasedResources, work) -> {
+            leasedResources.resume();
+            return work.call();
+          };
+      assertThat(coordinator.runRequest(key, request).response.getOutput()).isEqualTo("done");
+      assertThat(coordinator.hasPendingRequest(request)).isFalse();
+    }
+    verify(pool, times(2)).release(key, worker);
+    verify(worker, times(2)).doWork(any());
+    verify(pool, never()).invalidate(key, worker);
+    Files.delete(root);
   }
 }

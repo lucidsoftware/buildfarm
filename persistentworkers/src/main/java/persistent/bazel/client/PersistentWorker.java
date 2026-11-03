@@ -50,6 +50,7 @@ public class PersistentWorker implements Worker<WorkRequest, WorkResponse> {
   @Getter private final ImmutableList<String> initCmd;
   @Getter private final Path execRoot;
   private final ProtoWorkerRW workerRW;
+  @Getter private final WorkerResources resources;
 
   public PersistentWorker(WorkerKey key, String workerDir) throws IOException {
     this.key = key;
@@ -74,8 +75,23 @@ public class PersistentWorker implements Worker<WorkRequest, WorkResponse> {
       logger.log(logLevel, msg.toString());
     }
 
-    ProcessWrapper processWrapper = new ProcessWrapper(execRoot, initCmd, key.getEnv());
-    this.workerRW = new ProtoWorkerRW(processWrapper);
+    resources = key.getResourceProfile().create();
+    try {
+      ImmutableList<String> launchCmd =
+          ImmutableList.<String>builder().addAll(resources.launchPrefix()).addAll(initCmd).build();
+      ProcessWrapper processWrapper = new ProcessWrapper(execRoot, launchCmd, key.getEnv());
+      this.workerRW = new ProtoWorkerRW(processWrapper);
+    } catch (IOException | RuntimeException e) {
+      try {
+        resources.terminate(Duration.ZERO);
+      } catch (IOException | InterruptedException cleanup) {
+        if (cleanup instanceof InterruptedException) {
+          Thread.currentThread().interrupt();
+        }
+        e.addSuppressed(cleanup);
+      }
+      throw e;
+    }
   }
 
   @Override
@@ -145,10 +161,33 @@ public class PersistentWorker implements Worker<WorkRequest, WorkResponse> {
 
   @Override
   public void destroy() {
-    this.workerRW.getProcessWrapper().destroy();
+    boolean interrupted = Thread.interrupted();
+    try {
+      resources.terminate(Duration.ZERO);
+    } catch (IOException | InterruptedException e) {
+      interrupted |= e instanceof InterruptedException;
+      logger.log(Level.SEVERE, "Could not force terminate persistent worker resources", e);
+    } finally {
+      this.workerRW.getProcessWrapper().destroy();
+      if (interrupted) {
+        Thread.currentThread().interrupt();
+      }
+    }
   }
 
   public boolean terminate(Duration gracefulTermination) throws InterruptedException {
-    return this.workerRW.getProcessWrapper().terminate(gracefulTermination);
+    try {
+      // A managed group owns every descendant, including children whose parent already exited.
+      if (resources != WorkerResources.NONE) {
+        boolean groupTerminated = resources.terminate(gracefulTermination);
+        boolean processTerminated = this.workerRW.getProcessWrapper().terminate(Duration.ZERO);
+        return groupTerminated && processTerminated;
+      }
+      return this.workerRW.getProcessWrapper().terminate(gracefulTermination);
+    } catch (IOException e) {
+      logger.log(Level.SEVERE, "Could not terminate persistent worker resources", e);
+      this.workerRW.getProcessWrapper().destroy();
+      return false;
+    }
   }
 }

@@ -6,6 +6,7 @@ java_library(
     plugins = ["//src/main/java/build/buildfarm/common:lombok"],
     visibility = ["//visibility:public"],
     deps = [
+        "//persistentworkers/src/main/java/persistent/bazel:bazel-persistent-workers",
         "//src/main/java/build/buildfarm/worker",
         "@buildfarm_maven//:com_github_jnr_jnr_constants",
         "@buildfarm_maven//:com_github_jnr_jnr_posix",

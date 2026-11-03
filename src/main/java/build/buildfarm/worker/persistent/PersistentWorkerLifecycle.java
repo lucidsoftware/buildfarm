@@ -16,6 +16,7 @@ package build.buildfarm.worker.persistent;
 
 import static com.google.common.base.Preconditions.checkState;
 
+import java.io.IOException;
 import java.time.Duration;
 import java.util.IdentityHashMap;
 import java.util.Map;
@@ -23,6 +24,7 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 import lombok.extern.java.Log;
 import persistent.bazel.client.PersistentWorker;
+import persistent.bazel.client.WorkerResources;
 
 /** Authoritative request ownership and lifecycle state for persistent-worker processes. */
 @Log
@@ -127,6 +129,49 @@ final class PersistentWorkerLifecycle {
             ? Duration.ofNanos(Math.max(0, System.nanoTime() - entry.idleSinceNanos))
             : Duration.ZERO;
     return Optional.of(new Snapshot(entry.state, entry.generation, entry.requestId, idleDuration));
+  }
+
+  /** A request can adjust resources only while it owns this exact generation. */
+  WorkerResources resourcesFor(Lease lease) {
+    WorkerResources delegate = lease.worker().getResources();
+    if (delegate == WorkerResources.NONE) {
+      return delegate;
+    }
+    return new WorkerResources() {
+      private void checkLease() {
+        checkState(
+            matches(entries.get(lease.worker()), lease, State.LEASED),
+            "persistent worker resource lease is no longer current");
+      }
+
+      public Map<String, Long> sample() {
+        synchronized (PersistentWorkerLifecycle.this) {
+          checkLease();
+          return delegate.sample();
+        }
+      }
+
+      public void setCpu(int micros) throws IOException {
+        synchronized (PersistentWorkerLifecycle.this) {
+          checkLease();
+          delegate.setCpu(micros);
+        }
+      }
+
+      public void resume() throws IOException, InterruptedException {
+        synchronized (PersistentWorkerLifecycle.this) {
+          checkLease();
+          delegate.resume();
+        }
+      }
+
+      public void idle() throws IOException, InterruptedException {
+        synchronized (PersistentWorkerLifecycle.this) {
+          checkLease();
+          delegate.idle();
+        }
+      }
+    };
   }
 
   private Entry requireEntry(PersistentWorker worker) {

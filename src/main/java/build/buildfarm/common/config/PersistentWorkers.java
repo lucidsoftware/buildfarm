@@ -25,6 +25,8 @@ public class PersistentWorkers {
     ENABLED
   }
 
+  // Zero immediately falls back when the compatible pool is full.
+  private long poolWaitTimeoutMillis = 1000;
   private int maxWorkersPerKey = 6;
   private int maxWorkersTotal = 100;
   private int warmIdleWorkersPerKey = 0;

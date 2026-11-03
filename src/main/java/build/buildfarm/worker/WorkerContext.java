@@ -40,6 +40,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executor;
 import org.jspecify.annotations.Nullable;
+import persistent.bazel.client.WorkerResources;
 
 public interface WorkerContext {
   interface IOResource extends AutoCloseable {
@@ -148,6 +149,11 @@ public interface WorkerContext {
       Command command,
       Path workingDirectory,
       boolean runsOnPersistentWorker);
+
+  /** Process-owned limits; no operation-specific launcher arguments may enter the pool key. */
+  default WorkerResources.Profile persistentWorkerResources(Command command) {
+    return WorkerResources.Profile.NONE;
+  }
 
   int commandExecutionClaims(Command command);
 
