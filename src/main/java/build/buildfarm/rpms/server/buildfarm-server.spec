@@ -6,7 +6,7 @@ URL:            https://github.com/buildfarm/buildfarm
 
 License:        Apache License, v2.0
 
-Requires:       java-11-openjdk-headless
+Requires:       java-headless >= 25
 BuildRequires:  systemd
 %{?systemd_requires}
 

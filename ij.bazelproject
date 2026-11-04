@@ -20,7 +20,7 @@ targets:
 
 workspace_type: java
 
-java_language_level: 21
+java_language_level: 25
 
 test_sources:
   src/test/*
