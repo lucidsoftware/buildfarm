@@ -229,13 +229,13 @@ oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
 # Server base image
 oci.pull(
     name = "amazon_corretto_java_image_base",
-    digest = "sha256:53463affec61309c62bf118c2d8cbc5d1b4b11e6f456e9f2a71e4f0a4b27f037",
+    digest = "sha256:adec884ee20d63c6f81c2cb3b59dd065f518cc4976e38ee6538533fc456c05e3",
     image = "public.ecr.aws/amazoncorretto/amazoncorretto",
     platforms = [
         "linux/amd64",
         "linux/arm64/v8",
     ],
-    tag = "21",
+    tag = "25",
 )
 
 # Worker base image

@@ -34,26 +34,32 @@ Java_build_buildfarm_common_blake3_Blake3MessageDigest_hasher_1size(
   return (int)sizeof(blake3_hasher);
 }
 
+// Java byte arrays are not always properly aligned for a blake3_hasher, notably
+// with compact object headers. Copy the state into aligned native storage.
 extern "C" JNIEXPORT void JNICALL
 Java_build_buildfarm_common_blake3_Blake3MessageDigest_initialize_1hasher(
     JNIEnv *env, jobject obj, jbyteArray jhasher) {
-  blake3_hasher *hasher = (blake3_hasher *)get_byte_array(env, jhasher);
-  if (hasher) {
-    blake3_hasher_init(hasher);
-    release_byte_array(env, jhasher, (jbyte *)hasher);
-  }
+  blake3_hasher hasher;
+  // Initialize padding as well as fields before copying native storage to Java.
+  memset(&hasher, 0, sizeof(hasher));
+  blake3_hasher_init(&hasher);
+  env->SetByteArrayRegion(jhasher, 0, sizeof(hasher), (jbyte *)&hasher);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_build_buildfarm_common_blake3_Blake3MessageDigest_blake3_1hasher_1update(
     JNIEnv *env, jobject obj, jbyteArray jhasher, jbyteArray input, jint offset,
     jint input_len) {
-  blake3_hasher *hasher = (blake3_hasher *)get_byte_array(env, jhasher);
-  if (hasher) {
-    jbyte *input_addr = get_byte_array(env, input);
-    blake3_hasher_update(hasher, input_addr + offset, input_len);
+  blake3_hasher hasher;
+  env->GetByteArrayRegion(jhasher, 0, sizeof(hasher), (jbyte *)&hasher);
+  if (env->ExceptionCheck()) {
+    return;
+  }
+  jbyte *input_addr = get_byte_array(env, input);
+  if (input_addr) {
+    blake3_hasher_update(&hasher, input_addr + offset, input_len);
     release_byte_array(env, input, input_addr);
-    release_byte_array(env, jhasher, (jbyte *)hasher);
+    env->SetByteArrayRegion(jhasher, 0, sizeof(hasher), (jbyte *)&hasher);
   }
 }
 
@@ -61,12 +67,15 @@ extern "C" JNIEXPORT void JNICALL
 Java_build_buildfarm_common_blake3_Blake3MessageDigest_blake3_1hasher_1finalize(
     JNIEnv *env, jobject obj, jbyteArray jhasher, jbyteArray out,
     jint out_len) {
-  blake3_hasher *hasher = (blake3_hasher *)get_byte_array(env, jhasher);
-  if (hasher) {
-    jbyte *out_addr = get_byte_array(env, out);
-    blake3_hasher_finalize(hasher, (uint8_t *)out_addr, out_len);
+  blake3_hasher hasher;
+  env->GetByteArrayRegion(jhasher, 0, sizeof(hasher), (jbyte *)&hasher);
+  if (env->ExceptionCheck()) {
+    return;
+  }
+  jbyte *out_addr = get_byte_array(env, out);
+  if (out_addr) {
+    blake3_hasher_finalize(&hasher, (uint8_t *)out_addr, out_len);
     release_byte_array(env, out, out_addr);
-    release_byte_array(env, jhasher, (jbyte *)hasher);
   }
 }
 

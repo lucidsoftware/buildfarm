@@ -15,7 +15,10 @@ java_library(
             "//src/main/native:libblake3_jni.so",
         ],
     }),
-    visibility = ["//src/main/java/build/buildfarm/common:__pkg__"],
+    visibility = [
+        "//src/main/java/build/buildfarm/common:__pkg__",
+        "//src/test/java/build/buildfarm/common/blake3:__pkg__",
+    ],
     deps = [
         "//src/main/java/build/buildfarm/common/base",
         "@buildfarm_maven//:com_google_errorprone_error_prone_annotations",
