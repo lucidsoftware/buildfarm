@@ -95,6 +95,14 @@ public class BuildfarmExecutors {
     return Executors.newWorkStealingPool(nThreads);
   }
 
+  /**
+   * The worker gRPC server's executor: an unbounded cached pool, like grpc's default, sharded so
+   * that thread handoffs do not contend on a single queue head on many-core hosts.
+   */
+  public static ShardedCachedThreadPool getGrpcServerExecutor() {
+    return new ShardedCachedThreadPool("grpc-server-executor");
+  }
+
   public static ExecutorService getFetchBlobFailoverPool() {
     int nThreads = 64;
     String threadNameFormat = "fetch-blob-failover-pool-%d";
