@@ -27,8 +27,8 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 /**
- * An unbounded cached thread pool split into independent shards. Each shard is a plain
- * {@link Executors#newCachedThreadPool}.
+ * An unbounded cached thread pool split into independent shards. Each shard is a plain {@link
+ * Executors#newCachedThreadPool}.
  *
  * <p>This exists to prevent concurrency bottlenecks on machines with a very large number of
  * processors. The default {@link Executors#newCachedThreadPool} uses a SynchronousQueue, which can
@@ -39,9 +39,7 @@ public final class ShardedCachedThreadPool extends AbstractExecutorService {
 
   private final ExecutorService[] shards;
 
-  /**
-   * Creates a pool sized based on the numver of available processors.
-   */
+  /** Creates a pool sized based on the numver of available processors. */
   public ShardedCachedThreadPool(String namePrefix) {
     this(namePrefix, calculateShardCount(SystemProcessors.get()));
   }
@@ -59,9 +57,7 @@ public final class ShardedCachedThreadPool extends AbstractExecutorService {
     }
   }
 
-  /**
-   * One shard per 8 processors, rounded up. There's always at least one shard.
-   */
+  /** One shard per 8 processors, rounded up. There's always at least one shard. */
   public static int calculateShardCount(int processors) {
     return Math.max(1, Math.ceilDiv(processors, PROCESSORS_PER_SHARD));
   }
