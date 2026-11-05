@@ -21,7 +21,6 @@ import static com.google.common.base.Throwables.throwIfUnchecked;
 import build.buildfarm.common.io.FeedbackOutputStream;
 import com.github.luben.zstd.BufferPool;
 import com.github.luben.zstd.ZstdInputStreamNoFinalizer;
-import com.google.protobuf.ByteString;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -130,14 +129,20 @@ public final class ZstdDecompressingOutputStream extends FeedbackOutputStream {
   @Override
   public void write(byte[] b, int off, int len) throws IOException {
     inner = new ByteArrayInputStream(b, off, len);
-    byte[] data = ByteString.readFrom(zis).toByteArray();
-    out.write(data, 0, data.length);
+    zis.transferTo(out);
   }
 
   @Override
   public void close() throws IOException {
-    zis.close();
+    closeShallow();
     out.close();
+  }
+
+  /**
+   * Free resources related to decompression without closing the underlying {@link OutputStream}.
+   */
+  public void closeShallow() throws IOException {
+    zis.close();
   }
 
   @Override
