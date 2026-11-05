@@ -44,6 +44,7 @@ import build.buildfarm.common.FailoverInputStreamFactory;
 import build.buildfarm.common.InputStreamFactory;
 import build.buildfarm.common.LoggingMain;
 import build.buildfarm.common.Size;
+import build.buildfarm.common.ShardedCachedThreadPool;
 import build.buildfarm.common.ZstdDecompressingOutputStream.FixedBufferPool;
 import build.buildfarm.common.ZstdDecompressingOutputStream.ZstdFixedBufferPool;
 import build.buildfarm.common.config.BuildfarmConfigs;
@@ -192,6 +193,7 @@ public final class Worker extends LoggingMain {
   private final HealthStatusManager healthStatusManager = new HealthStatusManager();
 
   private Server server;
+  private ExecutorService grpcServerExecutor;
   private Path root;
   private ExecFileSystem execFileSystem;
   private Pipeline pipeline;
@@ -1007,6 +1009,13 @@ public final class Worker extends LoggingMain {
             executeActionStage,
             reportResultStage,
             completeStage);
+    ShardedCachedThreadPool executor = BuildfarmExecutors.getGrpcServerExecutor();
+    log.info(
+        String.format(
+            "gRPC server executor: sharded cached thread pool, %d shards",
+            executor.getShardCount()));
+    serverBuilder.executor(executor);
+    grpcServerExecutor = executor;
     server = createServer(serverBuilder, instance, workerProfileService);
     updateRegistrationAwareHealth();
 
@@ -1166,17 +1175,14 @@ public final class Worker extends LoggingMain {
     }
     if (server != null) {
       log.info("Shutting down the server");
-      server.shutdown();
-
       try {
-        server.awaitTermination(shutdownWaitTimeInSeconds, SECONDS);
+        shutdownServerAndExecutor(server, grpcServerExecutor, shutdownWaitTimeInSeconds, SECONDS);
       } catch (InterruptedException e) {
         interrupted = true;
         log.log(SEVERE, "interrupted while waiting for server shutdown", e);
-      } finally {
-        server.shutdownNow();
       }
       server = null;
+      grpcServerExecutor = null;
     }
     if (backplane != null) {
       try {
@@ -1195,6 +1201,39 @@ public final class Worker extends LoggingMain {
       throw new InterruptedException();
     }
     log.info("*** server shut down");
+  }
+
+  /**
+   * Shuts down the gRPC server, then the executor its calls ran on.
+   *
+   * <p>The server's shutdownNow cancels calls still in flight, and their cancellation callbacks run
+   * on the executor, so the executor is shut down only once the server has terminated. The shutdown
+   * is bounded by the timeout and executor tasks still running after the timeout are interrupted.
+   *
+   * <p>If this thread is interrupted, both server and executor are stopped immediately before the
+   * exception propagates.
+   */
+  static void shutdownServerAndExecutor(
+      Server server, ExecutorService executor, long timeout, TimeUnit unit)
+      throws InterruptedException {
+    try {
+      server.shutdown();
+      try {
+        server.awaitTermination(timeout, unit);
+      } finally {
+        server.shutdownNow();
+      }
+      // shutdownNow() is asynchronous; wait for forced shutdown while cancellation callbacks can
+      // still run on the executor.
+      server.awaitTermination(timeout, unit);
+      executor.shutdown();
+      if (!executor.awaitTermination(timeout, unit)) {
+        executor.shutdownNow();
+      }
+    } catch (InterruptedException e) {
+      executor.shutdownNow();
+      throw e;
+    }
   }
 
   public static void main(String[] args) throws Exception {
