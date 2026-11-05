@@ -35,8 +35,8 @@ public class Blake3MessageDigestTest {
    * These hashes come from BLAKE3's test vectors:
    * https://github.com/BLAKE3-team/BLAKE3/blob/1.8.2/test_vectors/test_vectors.json
    *
-   * These vectors cover various test cases, which is why they're here. Please see the details
-   * in the BLAKE3 test_vectors.json file for more info.
+   * <p>These vectors cover various test cases, which is why they're here. Please see the details in
+   * the BLAKE3 test_vectors.json file for more info.
    */
   private static final List<Vector> VECTORS =
       List.of(
