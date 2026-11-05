@@ -899,15 +899,13 @@ public abstract class CASFileCache implements ContentAddressableStorage {
         InputStream input = null;
         try {
           // Capture the FIS so the wrap can't leak it: if compressorInputStream's ctor
-          // throws (e.g. Zstd pipe setup), Files.newInputStream's FD would dangle until GC.
+          // throws (e.g. zstd initialization), Files.newInputStream's FD would dangle until GC.
           InputStream fis = Files.newInputStream(getPath(digest, key));
           try {
+            // Skip uncompressed bytes before wrapping: the compressor's skip consumes
+            // compressed output. Keep both operations inside the same cleanup handler.
+            fis.skip(offset);
             input = compressorInputStream(compressor, fis);
-            // input.skip is inside the same Throwable handler as the wrap: a non-IOException
-            // throw from skip (e.g. a RuntimeException from a compressor wrapper's
-            // skip implementation) would otherwise escape the IOException-only outer
-            // catch with refcount + stream still held, pinning the entry LIVE forever.
-            input.skip(offset);
           } catch (Exception t) {
             try {
               if (input != null) {
@@ -923,7 +921,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
               t.addSuppressed(closeEx);
             }
             // The outer catch is IOException-only; a non-IOException RuntimeException (e.g.
-            // from ZstdCompressingInputStream's JNI ctor or from input.skip) would escape
+            // from ZstdCompressingInputStream's JNI ctor or from fis.skip) would escape
             // with the refcount taken by tryAcquire still held, pinning the entry LIVE and
             // unevictable. Release before rethrow so the only invariant breach is the
             // unexpected exception itself. An Error (OutOfMemoryError, LinkageError, ...) is
@@ -957,7 +955,7 @@ public abstract class CASFileCache implements ContentAddressableStorage {
             evictStaleEntry(e);
             e = null;
           }
-          // input.skip may have left a partially-read stream we no longer hold a refcount
+          // A failed read setup may have left a stream we no longer hold a refcount
           // on; close it before returning so the caller doesn't get bare data outside the
           // RefcountedInputStream wrapper.
           if (input != null) {

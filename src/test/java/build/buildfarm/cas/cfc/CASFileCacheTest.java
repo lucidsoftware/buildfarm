@@ -56,10 +56,12 @@ import build.buildfarm.common.DigestUtil.HashFunction;
 import build.buildfarm.common.InputStreamFactory;
 import build.buildfarm.common.Write;
 import build.buildfarm.common.Write.NullWrite;
+import build.buildfarm.common.ZstdDecompressingOutputStream.FixedBufferPool;
 import build.buildfarm.common.io.Directories;
 import build.buildfarm.common.io.EvenMoreFiles;
 import build.buildfarm.common.io.FeedbackOutputStream;
 import build.buildfarm.v1test.Digest;
+import com.github.luben.zstd.Zstd;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
@@ -67,6 +69,7 @@ import com.google.common.collect.Maps;
 import com.google.common.io.ByteStreams;
 import com.google.common.jimfs.Configuration;
 import com.google.common.jimfs.Jimfs;
+import com.google.common.primitives.Bytes;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -74,6 +77,7 @@ import com.google.common.util.concurrent.SettableFuture;
 import com.google.protobuf.ByteString;
 import io.grpc.Deadline;
 import io.grpc.Status;
+import io.grpc.stub.ServerCallStreamObserver;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -90,6 +94,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
@@ -127,6 +132,8 @@ class CASFileCacheTest {
   @Mock private Consumer<Iterable<Digest>> onExpire;
 
   @Mock private ContentAddressableStorage delegate;
+
+  private final FixedBufferPool zstdBufferPool = new FixedBufferPool(2);
 
   private ExecutorService expireService;
 
@@ -179,7 +186,7 @@ class CASFileCacheTest {
             expireService,
             /* accessRecorder= */ directExecutor(),
             storage,
-            /* zstdBufferPool= */ null,
+            zstdBufferPool,
             onPut,
             onExpire,
             delegate,
@@ -225,6 +232,7 @@ class CASFileCacheTest {
       throw new RuntimeException("could not shut down expire service");
     }
     Directories.remove(root, fileStore);
+    zstdBufferPool.close();
   }
 
   @Test
@@ -736,6 +744,136 @@ class CASFileCacheTest {
     assertThat(fileCache.size()).isEqualTo(estimateSizeOnDisk(digest.getSize()));
     assertThat(cancellingWrite.getCommittedSize()).isEqualTo(digest.getSize());
     assertThat(cancellingWrite.isComplete()).isTrue();
+  }
+
+  // Blob content that compresses, but not to nothing: half random bytes, half a repeated pattern.
+  private static byte[] zstdTestContent(int size, long seed) {
+    byte[] content = new byte[size];
+    new Random(seed).nextBytes(content);
+    for (int i = size / 2; i < size; i++) {
+      content[i] = (byte) (i % 7);
+    }
+    return content;
+  }
+
+  // Reads a blob through get(), driving its onReady handler, and returns the bytes it sent.
+  private byte[] getBlob(Compressor.Value compressor, Digest digest, long offset) throws Exception {
+    ByteString.Output output = ByteString.newOutput();
+    AtomicReference<Runnable> onReady = new AtomicReference<>();
+    SettableFuture<Void> completed = SettableFuture.create();
+    ServerCallStreamObserver<ByteString> observer =
+        new ServerCallStreamObserver<>() {
+          @Override
+          public boolean isCancelled() {
+            return false;
+          }
+
+          @Override
+          public void setOnCancelHandler(Runnable onCancelHandler) {}
+
+          @Override
+          public void setCompression(String compression) {}
+
+          @Override
+          public boolean isReady() {
+            return true;
+          }
+
+          @Override
+          public void setOnReadyHandler(Runnable onReadyHandler) {
+            onReady.set(onReadyHandler);
+          }
+
+          @Override
+          public void disableAutoInboundFlowControl() {}
+
+          @Override
+          public void request(int count) {}
+
+          @Override
+          public void setMessageCompression(boolean enable) {}
+
+          @Override
+          public void onNext(ByteString value) {
+            output.write(value.toByteArray(), 0, value.size());
+          }
+
+          @Override
+          public void onError(Throwable t) {
+            completed.setException(t);
+          }
+
+          @Override
+          public void onCompleted() {
+            completed.set(null);
+          }
+        };
+    fileCache.get(
+        compressor, digest, offset, /* count= */ 0, observer, RequestMetadata.getDefaultInstance());
+    assertThat(completed.isDone()).isFalse();
+    onReady.get().run();
+    completed.get(5, SECONDS);
+    return output.toByteString().toByteArray();
+  }
+
+  @Test
+  public void newInputWithZstdAtOffsetDecodesSuffix() throws IOException {
+    // A compressed read at an offset is one frame containing the suffix.
+    byte[] content = zstdTestContent(12 * 1024, 16);
+    ByteString blob = ByteString.copyFrom(content);
+    Digest digest = DIGEST_UTIL.compute(blob);
+    try (OutputStream out = getWrite(digest).getOutput(1, SECONDS, () -> {})) {
+      blob.writeTo(out);
+    }
+
+    for (int offset : new int[] {0, 1, 4097, content.length - 1, content.length}) {
+      byte[] compressed;
+      try (InputStream in = fileCache.newInput(Compressor.Value.ZSTD, digest, offset)) {
+        compressed = ByteStreams.toByteArray(in);
+      }
+      byte[] suffix = Arrays.copyOfRange(content, offset, content.length);
+      assertThat(Zstd.findFrameCompressedSize(compressed)).isEqualTo(compressed.length);
+      assertThat(Zstd.decompress(compressed, suffix.length)).isEqualTo(suffix);
+    }
+  }
+
+  @Test
+  public void getWriteWithZstdSplitFramesCommitsBlob() throws Exception {
+    // A zstd upload of two frames, split mid-frame across writes, commits the decoded blob.
+    byte[] content = zstdTestContent(16 * 1024, 17);
+    ByteString blob = ByteString.copyFrom(content);
+    Digest digest = DIGEST_UTIL.compute(blob);
+    int half = content.length / 2;
+    byte[] frames =
+        Bytes.concat(
+            Zstd.compress(Arrays.copyOfRange(content, 0, half)),
+            Zstd.compress(Arrays.copyOfRange(content, half, content.length)));
+
+    Write write =
+        fileCache.getWrite(
+            Compressor.Value.ZSTD, digest, UUID.randomUUID(), RequestMetadata.getDefaultInstance());
+    try (OutputStream out = write.getOutput(1, SECONDS, () -> {})) {
+      assertThat(zstdBufferPool.getNumActive()).isEqualTo(1);
+      int chunk = 1000;
+      for (int off = 0; off < frames.length; off += chunk) {
+        out.write(frames, off, Math.min(chunk, frames.length - off));
+      }
+    }
+    assertThat(zstdBufferPool.getNumActive()).isEqualTo(0);
+    assertThat(write.getFuture().get(5, SECONDS)).isEqualTo(digest.getSize());
+    String key = fileCache.getKey(digest, false);
+    try (InputStream in = Files.newInputStream(fileCache.getPath(digest, key))) {
+      assertThat(ByteString.readFrom(in)).isEqualTo(blob);
+    }
+
+    // The committed blob reads back compressed, from the start and from an offset.
+    for (int offset : new int[] {0, 3000}) {
+      byte[] compressed = getBlob(Compressor.Value.ZSTD, digest, offset);
+      byte[] suffix = Arrays.copyOfRange(content, offset, content.length);
+      assertWithMessage("offset %s", offset)
+          .that(Zstd.decompress(compressed, suffix.length))
+          .isEqualTo(suffix);
+    }
   }
 
   @Test
