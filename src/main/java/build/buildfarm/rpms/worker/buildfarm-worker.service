@@ -8,6 +8,7 @@ Group=root
 Restart=always
 WorkingDirectory=/usr/local/buildfarm-worker
 ExecStart=/bin/sh -c 'exec /usr/bin/java -Dlogging.config=file:/usr/local/buildfarm-worker/logging.properties \
+          -XX:+UseCompactObjectHeaders --sun-misc-unsafe-memory-access=allow --enable-native-access=ALL-UNNAMED \
           -jar /usr/local/buildfarm-worker/buildfarm-shard-worker_deploy.jar \
           /etc/buildfarm-worker/config/worker.config >>/var/log/buildfarm-worker/worker.log 2>&1'
 Restart=on-abort

@@ -1,8 +1,12 @@
-build --java_language_version=21
-build --java_runtime_version=remotejdk_21
+build --java_language_version=25
+build --java_runtime_version=remotejdk_25
 
-build --tool_java_language_version=21
-build --tool_java_runtime_version=remotejdk_21
+build --tool_java_language_version=25
+build --tool_java_runtime_version=remotejdk_25
+
+# While we have jni and unsafe calls and are using JDK 25+, use these to prevent a bunch of warnings
+test --jvmopt=--sun-misc-unsafe-memory-access=allow
+test --jvmopt=--enable-native-access=ALL-UNNAMED
 
 
 common --enable_platform_specific_config

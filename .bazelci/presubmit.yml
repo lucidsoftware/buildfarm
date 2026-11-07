@@ -42,6 +42,22 @@ tasks:
     - ./generate_coverage.sh
 
   # Typical unit tests that run across a variety of operating systems.
+  compact_object_headers:
+    name: Native Hashing and Object Layout with Compact Headers
+    platform: ubuntu2404
+    test_flags:
+    - --jvmopt=-XX:+UseCompactObjectHeaders
+    test_targets:
+    - //src/test/java/build/buildfarm/common/blake3:tests
+    - //src/test/java/build/buildfarm/cas:tests
+  standard_object_headers:
+    name: Native Hashing and Object Layout with Standard Headers
+    platform: ubuntu2404
+    test_flags:
+    - --jvmopt=-XX:-UseCompactObjectHeaders
+    test_targets:
+    - //src/test/java/build/buildfarm/common/blake3:tests
+    - //src/test/java/build/buildfarm/cas:tests
   ubuntu2404:
     name: Unit Tests
     build_targets:

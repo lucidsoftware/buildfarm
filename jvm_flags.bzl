@@ -22,7 +22,18 @@ WORKER_TELEMETRY_JVM_FLAGS = [
     "-Dotel.instrumentation.http.capture-headers.server.response",
 ]
 
-RECOMMENDED_JVM_FLAGS = [
+JAVA_RUNTIME_FLAGS = [
+    # Reduce object-header size on JDK 25 without experimental VM options.
+    "-XX:+UseCompactObjectHeaders",
+
+    # Protobuf and other dependencies still use sun.misc.Unsafe memory-access methods.
+    "--sun-misc-unsafe-memory-access=allow",
+
+    # Buildfarm and its dependencies load JNI libraries from the classpath.
+    "--enable-native-access=ALL-UNNAMED",
+]
+
+RECOMMENDED_JVM_FLAGS = JAVA_RUNTIME_FLAGS + [
     # Enables the JVM to detect if it is running inside a container and automatically adjusts
     # its behavior to optimize performance. This flag can help ensure that the JVM is
     # configured optimally for containerized environments.

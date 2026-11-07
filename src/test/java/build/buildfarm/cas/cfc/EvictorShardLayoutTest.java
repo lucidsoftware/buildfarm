@@ -30,8 +30,8 @@ import org.openjdk.jol.info.FieldLayout;
  * future field-addition or JDK-layout-heuristic regressions that would silently undo the padding.
  *
  * <p>JOL imports {@code sun.misc.Unsafe} to inspect object layout, so it is confined to this test
- * target — no production code path loads it. The project builds and runs tests on JDK 21 (see
- * {@code .bazelrc}); on a newer JDK any JEP 471 sun.misc.Unsafe warnings here are cosmetic.
+ * target — no production code path loads it. Run this test with both standard and compact object
+ * headers when changing the JDK or the shard's field layout.
  */
 @RunWith(JUnit4.class)
 public class EvictorShardLayoutTest {
