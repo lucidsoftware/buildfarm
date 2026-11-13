@@ -25,6 +25,7 @@ server:
   runDispatchedMonitor: true
   dispatchedMonitorIntervalSeconds: 1
   runOperationQueuer: true
+  operationTransformThreads: 24
   ensureOutputsPresent: true
   mergeExecutions: true
   runFailsafeOperation: true

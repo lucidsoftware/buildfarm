@@ -34,6 +34,7 @@ public class Server {
   private int dispatchedMonitorIntervalSeconds = 1;
   private boolean runFailsafeOperation = true;
   private boolean runOperationQueuer = true;
+  private int operationTransformThreads = 24;
   private boolean ensureOutputsPresent = true;
   private boolean mergeExecutions = true;
   private int maxRequeueAttempts = 3;

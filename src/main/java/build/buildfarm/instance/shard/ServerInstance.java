@@ -271,7 +271,8 @@ public class ServerInstance extends NodeInstance {
   private final int maxRequeueAttempts;
 
   private final ListeningExecutorService operationTransformService =
-      BuildfarmExecutors.getTransformServicePool();
+      BuildfarmExecutors.getTransformServicePool(
+          configs.getServer().getOperationTransformThreads());
   private final ListeningExecutorService actionCacheFetchService;
   private final ScheduledExecutorService contextDeadlineScheduler =
       newSingleThreadScheduledExecutor();

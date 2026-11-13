@@ -14,6 +14,7 @@
 
 package build.buildfarm.common;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.util.concurrent.MoreExecutors.listeningDecorator;
 
 import com.google.common.util.concurrent.ListeningExecutorService;
@@ -72,8 +73,8 @@ public class BuildfarmExecutors {
         nThreads, new ThreadFactoryBuilder().setNameFormat(threadNameFormat).build());
   }
 
-  public static ListeningExecutorService getTransformServicePool() {
-    int nThreads = 24;
+  public static ListeningExecutorService getTransformServicePool(int nThreads) {
+    checkArgument(nThreads > 0, "operationTransformThreads must be positive, got %s", nThreads);
     String threadNameFormat = "transform-service-pool-%d";
     ExecutorService pool =
         Executors.newFixedThreadPool(

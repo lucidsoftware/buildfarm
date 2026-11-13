@@ -9,6 +9,7 @@ java_test(
     test_class = "build.buildfarm.AllTests",
     deps = [
         "//src/main/java/build/buildfarm/common",
+        "//src/main/java/build/buildfarm/common:BuildfarmExecutors",
         "//src/main/protobuf/build/buildfarm/v1test:buildfarm_java_proto",
         "//src/test/java/build/buildfarm:test_runner",
         "@buildfarm_maven//:com_github_luben_zstd_jni",

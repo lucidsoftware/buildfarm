@@ -80,6 +80,22 @@ public class BuildfarmConfigsTest {
   }
 
   @Test
+  public void operationTransformThreadsDefaultsTo24() {
+    assertEquals(24, new Server().getOperationTransformThreads());
+  }
+
+  @Test
+  public void loadConfigsWithOperationTransformThreadsShouldLoadValue() throws IOException {
+    Path configFile = tempDir.resolve("transform-threads.yaml");
+    String yaml =
+        "server:\n  operationTransformThreads: 96\nbackplane:\n  redisUri: redis://localhost:6379";
+    Files.write(configFile, yaml.getBytes());
+
+    BuildfarmConfigs configs = BuildfarmConfigs.loadConfigs(configFile);
+    assertEquals(96, configs.getServer().getOperationTransformThreads());
+  }
+
+  @Test
   public void validateCasStorageSizeConfig_bothSet_throws() {
     Cas cas = new Cas();
     cas.setMaxSizeBytes(1000);
