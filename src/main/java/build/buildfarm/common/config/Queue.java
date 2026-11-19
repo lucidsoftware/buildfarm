@@ -13,6 +13,8 @@ public class Queue {
   }
 
   private String name;
+  // Optional requirement on the action's request metadata when enqueuing.
+  private String actionMnemonic = "";
   private boolean allowUnmatched = true;
   private List<Property> properties = new ArrayList<>();
 

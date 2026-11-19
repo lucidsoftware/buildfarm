@@ -108,6 +108,20 @@ public class ProtoCoordinatorTest {
     return rootDir;
   }
 
+  @Test
+  public void markedExecutableCanUseRelativeDotPrefix() {
+    Path opRoot = jimFsRoot();
+    Path executable = opRoot.resolve("tool");
+    WorkerInputs inputs =
+        new WorkerInputs(
+            opRoot,
+            ImmutableSet.of(),
+            ImmutableSet.of(executable),
+            ImmutableMap.of(executable, Input.getDefaultInstance()));
+
+    assertThat(inputs.containsTool(opRoot.getFileSystem().getPath("./tool"))).isTrue();
+  }
+
   @Test(timeout = 5000)
   public void exhaustedPoolTimesOutAndCanReuseReturnedWorker() throws Exception {
     PersistentWorker worker = mock(PersistentWorker.class);

@@ -38,6 +38,7 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import lombok.extern.java.Log;
 import redis.clients.jedis.AbstractPipeline;
 import redis.clients.jedis.UnifiedJedis;
@@ -225,7 +226,7 @@ public class ExecutionQueue {
    */
   public void push(
       UnifiedJedis jedis, List<Platform.Property> provisions, QueueEntry val, int priority) {
-    BalancedRedisQueue<QueueEntry> queue = chooseEligibleQueue(provisions);
+    BalancedRedisQueue<QueueEntry> queue = chooseEligibleQueue(provisions, val);
     queue.offer(jedis, val, (double) priority);
   }
 
@@ -382,8 +383,16 @@ public class ExecutionQueue {
    * @note Suggested return identifier: queue.
    */
   private BalancedRedisQueue<QueueEntry> chooseEligibleQueue(List<Platform.Property> provisions) {
+    return chooseEligibleQueue(provisions, null);
+  }
+
+  private BalancedRedisQueue<QueueEntry> chooseEligibleQueue(
+      List<Platform.Property> provisions, @Nullable QueueEntry entry) {
+    SetMultimap<String, String> properties = toMultimap(provisions);
     for (ProvisionedRedisQueue<QueueEntry> provisionedQueue : queues) {
-      if (provisionedQueue.isEligible(toMultimap(provisions))) {
+      if (entry == null
+          ? provisionedQueue.isEligible(properties)
+          : provisionedQueue.isEligibleForEnqueue(properties, entry)) {
         return provisionedQueue.queue();
       }
     }

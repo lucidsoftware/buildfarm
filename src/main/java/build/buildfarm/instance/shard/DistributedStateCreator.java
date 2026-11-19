@@ -119,13 +119,19 @@ public class DistributedStateCreator {
     ImmutableList.Builder<ProvisionedRedisQueue<QueueEntry>> provisionedQueues =
         new ImmutableList.Builder<>();
     for (Queue queueConfig : configs.getBackplane().getQueues()) {
+      String actionMnemonic = queueConfig.getActionMnemonic();
       ProvisionedRedisQueue<QueueEntry> provisionedQueue =
           new ProvisionedRedisQueue<QueueEntry>(
               getQueueName(queueConfig),
               new TranslatedQueueDecorator<>(getQueueDecorator(), translator),
               getQueueHashes(jedis, getQueueName(queueConfig)),
               toMultimap(queueConfig.getPlatform().getPropertiesList()),
-              queueConfig.isAllowUnmatched());
+              queueConfig.isAllowUnmatched(),
+              entry ->
+                  actionMnemonic == null
+                      || actionMnemonic.isEmpty()
+                      || actionMnemonic.equals(
+                          entry.getExecuteEntry().getRequestMetadata().getActionMnemonic()));
       provisionedQueues.add(provisionedQueue);
     }
     // If there is no configuration for provisioned queues, we might consider that an error.

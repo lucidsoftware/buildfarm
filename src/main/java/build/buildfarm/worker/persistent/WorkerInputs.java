@@ -70,7 +70,7 @@ public class WorkerInputs {
   }
 
   public boolean containsTool(Path tool) {
-    return allToolInputs.contains(opRoot.resolve(tool));
+    return allToolInputs.contains(opRoot.resolve(tool).normalize());
   }
 
   public Path relativizeInput(Path newRoot, Path input) {

@@ -16,8 +16,10 @@ package build.buildfarm.common.redis;
 
 import static com.google.common.truth.Truth.assertThat;
 
+import build.buildfarm.v1test.QueueEntry;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSetMultimap;
 import com.google.common.collect.SetMultimap;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -56,6 +58,27 @@ public class ProvisionedRedisQueueTest {
   @Test
   public void provisionedRedisQueueCanConstructOverload() throws Exception {
     new ProvisionedRedisQueue("name", ImmutableList.of(), HashMultimap.create(), true);
+  }
+
+  @Test
+  public void enqueueFilterAppliesInAdditionToPlatformRequirements() {
+    var x86 = ImmutableSetMultimap.of("cpu-architecture", "x86_64");
+    var arm = ImmutableSetMultimap.of("cpu-architecture", "aarch64");
+    var queue =
+        new ProvisionedRedisQueue<QueueEntry>(
+            "scala-x86",
+            RedisQueue::decorate,
+            ImmutableList.of(),
+            x86,
+            true,
+            QueueEntry::hasExecuteEntry);
+    var accepted = QueueEntry.newBuilder();
+    accepted.getExecuteEntryBuilder();
+
+    assertThat(queue.isEligible(x86)).isTrue();
+    assertThat(queue.isEligibleForEnqueue(x86, QueueEntry.getDefaultInstance())).isFalse();
+    assertThat(queue.isEligibleForEnqueue(x86, accepted.build())).isTrue();
+    assertThat(queue.isEligibleForEnqueue(arm, accepted.build())).isFalse();
   }
 
   // Function under test: explainEligibility

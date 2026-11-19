@@ -25,6 +25,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 
 /**
  * @class ProvisionedRedisQueue
@@ -74,6 +75,8 @@ public class ProvisionedRedisQueue<E extends Message> {
    * @details The provisions are filtered by wildcard.
    */
   private final FilteredProvisions provisions;
+
+  private final Predicate<E> enqueueFilter;
 
   /**
    * @field queue
@@ -147,10 +150,25 @@ public class ProvisionedRedisQueue<E extends Message> {
       List<String> hashtags,
       SetMultimap<String, String> filterProvisions,
       boolean allowUserUnmatched) {
+    this(name, queueDecorator, hashtags, filterProvisions, allowUserUnmatched, entry -> true);
+  }
+
+  public ProvisionedRedisQueue(
+      String name,
+      QueueDecorator<E> queueDecorator,
+      List<String> hashtags,
+      SetMultimap<String, String> filterProvisions,
+      boolean allowUserUnmatched,
+      Predicate<E> enqueueFilter) {
     this.queue = new BalancedRedisQueue(name, hashtags, queueDecorator);
     isFullyWildcard = filterProvisions.containsKey(WILDCARD_VALUE);
     provisions = filterProvisionsByWildcard(filterProvisions, isFullyWildcard);
     this.allowUserUnmatched = allowUserUnmatched;
+    this.enqueueFilter = enqueueFilter;
+  }
+
+  public boolean isEligibleForEnqueue(SetMultimap<String, String> properties, E entry) {
+    return enqueueFilter.test(entry) && isEligible(properties);
   }
 
   public boolean isExhausted(Set<String> exhausted) {
